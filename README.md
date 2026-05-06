@@ -41,8 +41,8 @@ make format
 # Run linter (uses golangci-lint via container locally, directly in CI)
 make lint
 
-# Verify vendor directory is up to date
-make validate-vendor
+# Verify Go modules are tidy
+make validate-modules
 ```
 
 ## Container images
@@ -63,6 +63,4 @@ internal/               Repo-private shared packages
   retester/             Retester logic and caches
 images/                 Dockerfiles per tool
 hack/                   Build and CI scripts
-vendor/                 Vendored dependencies
-ci-operator/            CI configuration for openshift/release
 ```

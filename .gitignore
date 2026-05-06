@@ -2,3 +2,4 @@ _output/
 .gopath/
 .gocache/
 .gotmp/
+vendor/

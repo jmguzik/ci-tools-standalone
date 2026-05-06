@@ -1,6 +1,6 @@
-TOOLS := backport-verifier ci-scheduling-webhook determinize-peribolos gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
+TOOLS := backport-verifier commenter ci-scheduling-webhook determinize-peribolos gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
 
-.PHONY: build-all test clean format gofmt lint validate-vendor $(addprefix build-,$(TOOLS)) $(addprefix image-,$(TOOLS))
+.PHONY: build-all test clean format gofmt lint validate-modules $(addprefix build-,$(TOOLS)) $(addprefix image-,$(TOOLS))
 
 build-all: $(addprefix build-,$(TOOLS))
 
@@ -28,13 +28,12 @@ lint:
 	./hack/lint.sh
 .PHONY: lint
 
-validate-vendor:
+validate-modules:
 	go mod tidy
-	go mod vendor
-	@if ! git diff --exit-code go.mod go.sum vendor/; then \
-		echo "vendor is out of date, run 'go mod tidy && go mod vendor'"; exit 1; \
+	@if ! git diff --exit-code go.mod go.sum; then \
+		echo "modules are out of date, run 'go mod tidy'"; exit 1; \
 	fi
-.PHONY: validate-vendor
+.PHONY: validate-modules
 
 clean:
 	rm -rf _output
