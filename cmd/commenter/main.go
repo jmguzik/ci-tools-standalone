@@ -20,7 +20,7 @@ limitations under the License.
 
 // Commenter searches for issues (--query) and appends a comment (--comment).
 // Authenticate with a PAT (--github-token-path) or a GitHub App
-// (--github-app-id and --github-app-private-key-path).
+// (--github-app-id, --github-app-private-key-path, and --github-org).
 // Without --confirm, runs in dry-run mode.
 package main
 
@@ -69,6 +69,7 @@ func flagOptions() options {
 	flag.BoolVar(&o.useTemplate, "template", false, templateHelp)
 	flag.IntVar(&o.ceiling, "ceiling", 3, "Maximum number of issues to modify, 0 for infinite")
 	flag.BoolVar(&o.random, "random", false, "Choose random issues to comment on from the query")
+	flag.StringVar(&o.githubOrg, "github-org", "openshift", "GitHub org for App auth installation resolution")
 	o.github.AddFlags(flag.CommandLine)
 	flag.Parse()
 	return o
@@ -92,6 +93,7 @@ type options struct {
 	updated         time.Duration
 	confirm         bool
 	random          bool
+	githubOrg       string
 	github          flagutil.GitHubOptions
 }
 
@@ -146,7 +148,7 @@ func makeQuery(query string, includeArchived, includeClosed, includeLocked bool,
 
 type client interface {
 	CreateComment(owner, repo string, number int, comment string) error
-	FindIssues(query, sort string, asc bool) ([]github.Issue, error)
+	FindIssuesWithOrg(org, query, sort string, asc bool) ([]github.Issue, error)
 }
 
 func main() {
@@ -161,6 +163,9 @@ func main() {
 	}
 	if o.github.TokenPath == "" && o.github.AppPrivateKeyPath == "" {
 		log.Fatal("set --github-token-path (PAT) or --github-app-id and --github-app-private-key-path (GitHub App)")
+	}
+	if o.github.AppPrivateKeyPath != "" && o.githubOrg == "" {
+		log.Fatal("--github-org is required when using GitHub App auth (defaults to 'openshift')")
 	}
 
 	if err := o.github.Validate(!o.confirm); err != nil {
@@ -183,7 +188,7 @@ func main() {
 		asc = true
 	}
 	commenter := makeCommenter(o.comment, o.useTemplate)
-	if err := run(c, query, sort, asc, o.random, commenter, o.ceiling); err != nil {
+	if err := run(c, o.githubOrg, query, sort, asc, o.random, commenter, o.ceiling); err != nil {
 		log.Fatalf("failed run: %v", err)
 	}
 }
@@ -202,9 +207,9 @@ func makeCommenter(comment string, useTemplate bool) func(meta) (string, error) 
 	}
 }
 
-func run(c client, query, sort string, asc, random bool, commenter func(meta) (string, error), ceiling int) error {
+func run(c client, org, query, sort string, asc, random bool, commenter func(meta) (string, error), ceiling int) error {
 	log.Printf("Searching: %s", query)
-	issues, err := c.FindIssues(query, sort, asc)
+	issues, err := c.FindIssuesWithOrg(org, query, sort, asc)
 	if err != nil {
 		return fmt.Errorf("search failed: %w", err)
 	}
