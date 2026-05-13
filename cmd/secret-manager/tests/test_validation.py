@@ -110,7 +110,9 @@ def main():
         ("_group/sub", False),
         ("group/sub_", False),
         ("group__sub", False),
-        ("TEST", False),
+        ("TEST", True),
+        ("--dot--awscred", True),  # for backwards compatibility with Vault secrets
+        ("-group", False),
         ("test@value", False),
     ]
 

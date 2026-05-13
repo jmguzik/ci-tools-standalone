@@ -109,7 +109,7 @@ def validate_group_name(_ctx, _param, value):
     - Cannot contain double underscores (__)
     - Cannot start or end with underscore
     - Can contain forward slashes (/) for hierarchy
-    - Only lowercase letters, numbers, dashes, underscores, slashes
+    - Only letters, numbers, dashes, underscores, slashes
     """
     if not value:
         raise click.BadParameter("Group name is required")
@@ -122,14 +122,17 @@ def validate_group_name(_ctx, _param, value):
     if value.startswith("_"):
         raise click.BadParameter("Cannot start with an underscore")
 
+    if value.startswith("-") and not value.startswith("--dot--"):
+        raise click.BadParameter("Cannot start with a hyphen")
+
     if value.endswith("_"):
         raise click.BadParameter("Cannot end with an underscore")
 
-    # Allow: a-z, 0-9, -, _, /
-    if not re.fullmatch(r"[a-z0-9_/-]+", value):
-        invalid_chars = set(re.findall(r"[^a-z0-9_/-]", value))
+    # Allow: a-z, A-Z, 0-9, -, _, /
+    if not re.fullmatch(r"[a-zA-Z0-9_/-]+", value):
+        invalid_chars = set(re.findall(r"[^a-zA-Z0-9_/-]", value))
         raise click.BadParameter(
-            f"May only contain lowercase letters, numbers, dashes, an underscore, or slashes. "
+            f"May only contain letters, numbers, dashes, an underscore, or slashes. "
             f"Invalid characters: {', '.join(repr(c) for c in sorted(invalid_chars))}"
         )
 
