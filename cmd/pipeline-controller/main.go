@@ -479,11 +479,41 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		if err := cw.ghc.CreateComment(org, repo, number, comment); err != nil {
 			logger.WithError(err).Error("failed to create confirmation comment")
 		}
-		return
+
+		// Check if first-stage tests have already completed for the current SHA.
+		// The reconciler is event-driven and only fires on ProwJob updates, so if
+		// all first-stage tests completed before the label was added, no future
+		// event will trigger second-stage tests. In that case, fall through to
+		// trigger second-stage tests immediately.
+		firstStageComplete := false
+		if cw.pjLister != nil && pr.Head.SHA != "" {
+			prowJob := &v1.ProwJob{
+				Spec: v1.ProwJobSpec{
+					Refs: &v1.Refs{
+						Org:     org,
+						Repo:    repo,
+						BaseRef: pr.Base.Ref,
+						Pulls: []v1.Pull{
+							{Number: number, SHA: pr.Head.SHA},
+						},
+					},
+				},
+			}
+			var err error
+			firstStageComplete, err = checkFirstStageComplete(context.Background(), cw.pjLister, prowJob, presubmits)
+			if err != nil {
+				logger.WithError(err).Error("failed to check first-stage test status")
+			}
+		}
+		if !firstStageComplete {
+			logger.Info("First-stage tests not yet complete, reconciler will trigger second-stage when ready")
+			return
+		}
+		logger.Info("All first-stage tests already passed, triggering second-stage tests immediately")
 	}
 
-	// For /pipeline required, trigger tests immediately
-	// Create a fake ProwJob to reuse existing logic
+	// For /pipeline required (or /pipeline auto when first-stage already passed),
+	// trigger tests immediately. Create a ProwJob to reuse existing logic.
 	prowJob := &v1.ProwJob{
 		Spec: v1.ProwJobSpec{
 			Refs: &v1.Refs{

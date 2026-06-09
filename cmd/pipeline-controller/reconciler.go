@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
-	"sigs.k8s.io/prow/pkg/kube"
 )
 
 const (
@@ -253,60 +251,11 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 }
 
 func (r *reconciler) reportSuccessOnPR(ctx context.Context, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
-	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
-		return false, nil
-	}
-	selector := map[string]string{}
-	for _, l := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.BaseRefLabel} {
-		selector[l] = pj.Labels[l]
-	}
-	// Only list presubmit jobs - postsubmits, periodics, and batch jobs are not relevant
-	selector[kube.ProwJobTypeLabel] = string(v1.PresubmitJob)
-	var pjs v1.ProwJobList
-	if err := r.lister.List(ctx, &pjs, ctrlruntimeclient.MatchingLabels(selector)); err != nil {
-		return false, fmt.Errorf("cannot list prowjob using selector %v", selector)
+	complete, err := checkFirstStageComplete(ctx, r.lister, pj, presubmits)
+	if err != nil || !complete {
+		return false, err
 	}
 
-	latestBatch := make(map[string]v1.ProwJob)
-	for _, pjob := range pjs.Items {
-		// Skip jobs with missing refs or pulls to avoid nil pointer dereference
-		if pjob.Spec.Refs == nil || len(pjob.Spec.Refs.Pulls) == 0 {
-			continue
-		}
-		if pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
-			if existing, ok := latestBatch[pjob.Spec.Job]; !ok {
-				latestBatch[pjob.Spec.Job] = pjob
-			} else if pjob.CreationTimestamp.After(existing.CreationTimestamp.Time) {
-				latestBatch[pjob.Spec.Job] = pjob
-			}
-		}
-	}
-
-	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
-	for _, presubmit := range presubmits.protected {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
-			continue
-		}
-		if _, ok := latestBatch[presubmit.Name]; ok {
-			return false, nil
-		}
-	}
-	for _, presubmit := range presubmits.alwaysRequired {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
-			continue
-		}
-		if pjob, ok := latestBatch[presubmit.Name]; !ok || (ok && pjob.Status.State != v1.SuccessState) {
-			return false, nil
-		}
-	}
-	for _, presubmit := range presubmits.conditionallyRequired {
-		if !strings.Contains(presubmit.Name, repoBaseRef) {
-			continue
-		}
-		if pjob, ok := latestBatch[presubmit.Name]; ok && pjob.Status.State != v1.SuccessState {
-			return false, nil
-		}
-	}
 	if closed, err := r.closedPRsCache.isPRClosed(pj.Spec.Refs); err != nil || closed {
 		return false, err
 	}
