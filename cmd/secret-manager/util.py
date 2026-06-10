@@ -355,6 +355,27 @@ def get_secrets_from_index(
     return secret_list if secret_list is not None else []
 
 
+def destroy_previous_versions(
+    client: secretmanager.SecretManagerServiceClient,
+    secret_path: str,
+    current_version_name: str,
+):
+    """
+    Destroys all enabled secret versions except the current one to prevent cost accumulation.
+
+    Args:
+        client (secretmanager.SecretManagerServiceClient): Secret Manager client.
+        secret_path (str): Full resource path of the secret.
+        current_version_name (str): Name of the version to keep.
+    """
+    for v in client.list_secret_versions(
+        request={"parent": secret_path, "filter": "state:ENABLED"}
+    ):
+        if v.name == current_version_name:
+            continue
+        client.destroy_secret_version(request={"name": v.name})
+
+
 def update_index_secret(
     client: secretmanager.SecretManagerServiceClient,
     collection: str,
@@ -372,8 +393,9 @@ def update_index_secret(
     name = client.secret_path(PROJECT_ID, get_index_secret_for_collection(collection))
     payload = yaml.safe_dump(sorted(secret_names))
     try:
-        client.add_secret_version(
+        new_version = client.add_secret_version(
             parent=name, payload=SecretPayload(data=payload.encode("utf-8"))
         )
+        destroy_previous_versions(client, name, new_version.name)
     except Exception as e:
         raise click.ClickException(f"Error while updating index: '{e}'.")
