@@ -186,3 +186,75 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 	}
 	return testCommands, "", nil
 }
+
+// checkFirstStageComplete checks if all first-stage tests have completed
+// successfully for the given ProwJob's SHA. This is used by the /pipeline auto
+// handler to trigger second-stage tests immediately when first-stage is already
+// done, since the event-driven reconciler won't fire if all ProwJob updates
+// occurred before the pipeline-auto label was added.
+func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
+	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
+		return false, nil
+	}
+
+	selector := map[string]string{
+		kube.OrgLabel:         pj.Spec.Refs.Org,
+		kube.RepoLabel:        pj.Spec.Refs.Repo,
+		kube.PullLabel:        fmt.Sprintf("%d", pj.Spec.Refs.Pulls[0].Number),
+		kube.BaseRefLabel:     pj.Spec.Refs.BaseRef,
+		kube.ProwJobTypeLabel: string(v1.PresubmitJob),
+	}
+
+	var pjs v1.ProwJobList
+	if err := pjLister.List(ctx, &pjs, ctrlruntimeclient.MatchingLabels(selector)); err != nil {
+		return false, fmt.Errorf("cannot list prowjobs: %w", err)
+	}
+
+	latestBatch := make(map[string]v1.ProwJob)
+	for _, pjob := range pjs.Items {
+		if pjob.Spec.Refs == nil || len(pjob.Spec.Refs.Pulls) == 0 {
+			continue
+		}
+		if pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
+			if existing, ok := latestBatch[pjob.Spec.Job]; !ok {
+				latestBatch[pjob.Spec.Job] = pjob
+			} else if pjob.CreationTimestamp.After(existing.CreationTimestamp.Time) {
+				latestBatch[pjob.Spec.Job] = pjob
+			}
+		}
+	}
+
+	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
+
+	// Second-stage (protected) jobs must not already be running
+	for _, presubmit := range presubmits.protected {
+		if !strings.Contains(presubmit.Name, repoBaseRef) {
+			continue
+		}
+		if _, ok := latestBatch[presubmit.Name]; ok {
+			return false, nil
+		}
+	}
+
+	// All always-required first-stage jobs must have succeeded
+	for _, presubmit := range presubmits.alwaysRequired {
+		if !strings.Contains(presubmit.Name, repoBaseRef) {
+			continue
+		}
+		if pjob, ok := latestBatch[presubmit.Name]; !ok || pjob.Status.State != v1.SuccessState {
+			return false, nil
+		}
+	}
+
+	// Conditionally-required first-stage jobs, if present, must have succeeded
+	for _, presubmit := range presubmits.conditionallyRequired {
+		if !strings.Contains(presubmit.Name, repoBaseRef) {
+			continue
+		}
+		if pjob, ok := latestBatch[presubmit.Name]; ok && pjob.Status.State != v1.SuccessState {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
