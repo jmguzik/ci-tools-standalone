@@ -1,15 +1,22 @@
-TOOLS := backport-verifier commenter ci-scheduling-webhook determinize-peribolos gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
+TOOLS := backport-verifier cluster-manifest-verifier commenter ci-scheduling-webhook determinize-peribolos gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
 
 .PHONY: build-all test clean format gofmt lint validate-modules $(addprefix build-,$(TOOLS)) $(addprefix image-,$(TOOLS))
 
 build-all: $(addprefix build-,$(TOOLS))
+
+build-cluster-manifest-verifier:
+	cd cmd/cluster-manifest-verifier && go build -o $(CURDIR)/_output/cluster-manifest-verifier .
 
 build-%:
 	go build -o _output/$* ./cmd/$*/
 
 production-install:
 	for tool in $(TOOLS); do \
-		go install ./cmd/$$tool/; \
+		if [ "$$tool" = "cluster-manifest-verifier" ]; then \
+			(cd cmd/cluster-manifest-verifier && go install .); \
+		else \
+			go install ./cmd/$$tool/; \
+		fi; \
 	done
 .PHONY: production-install
 
