@@ -7,6 +7,7 @@ Standalone CI tools extracted from [openshift/ci-tools](https://github.com/opens
 | Tool | Description |
 |------|-------------|
 | `backport-verifier` | Prow plugin that verifies backport PRs carry the correct labels and approvals |
+| `cluster-manifest-verifier` | Validates openshift/release cluster manifest PRs against Argo CD (generate + dry-run sync) |
 | `ci-scheduling-webhook` | Kubernetes mutating admission webhook for CI workload scheduling and prioritization |
 | `determinize-peribolos` | Deterministically formats Peribolos org configuration YAML |
 | `gpu-scheduling-webhook` | Kubernetes mutating admission webhook for GPU/KVM workload scheduling |
@@ -49,7 +50,7 @@ make validate-modules
 
 ```bash
 # Build a container image for a specific tool
-make image-publicize
+make image-cluster-manifest-verifier
 ```
 
 ## Repository layout
