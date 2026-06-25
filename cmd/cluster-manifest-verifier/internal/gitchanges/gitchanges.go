@@ -23,16 +23,15 @@ type RepoChanges struct {
 }
 
 func (r *RepoChanges) List(ctx context.Context) ([]FileChange, error) {
-	cmd := exec.CommandContext(ctx, "git", "diff", "--name-status",
-		fmt.Sprintf("%s..%s", r.BaseRevision, r.HeadRevision), "--", clustersPrefix)
+	cmd := exec.CommandContext(ctx, "git", "diff", "--name-status", fmt.Sprintf("%s...%s", r.BaseRevision, r.HeadRevision), "--", clustersPrefix)
 	cmd.Dir = r.RepoDir
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("git diff %s..%s: %s", r.BaseRevision, r.HeadRevision, strings.TrimSpace(string(exitErr.Stderr)))
+			return nil, fmt.Errorf("git diff %s...%s: %s", r.BaseRevision, r.HeadRevision, strings.TrimSpace(string(exitErr.Stderr)))
 		}
-		return nil, fmt.Errorf("git diff %s..%s: %w", r.BaseRevision, r.HeadRevision, err)
+		return nil, fmt.Errorf("git diff %s...%s: %w", r.BaseRevision, r.HeadRevision, err)
 	}
 
 	var changes []FileChange
