@@ -81,7 +81,7 @@ func (v *Verifier) Run(ctx context.Context) error {
 
 	generated, err := v.argo.GenerateApplications(ctx, apps.ApplicationSets)
 	if err != nil {
-		errs = append(errs, err)
+		return fmt.Errorf("generate applications from ApplicationSets: %w", err)
 	}
 
 	changes, err := v.repoChanges.List(ctx)
