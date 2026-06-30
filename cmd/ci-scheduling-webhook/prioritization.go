@@ -13,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -43,6 +44,20 @@ const (
 
 	// NodeDisableScaleDownAnnotationKey makes the autoscaler ignore a node for scale down consideration.
 	NodeDisableScaleDownAnnotationKey = "cluster-autoscaler.kubernetes.io/scale-down-disabled"
+
+	// EnableDSEvictionAnnotationKey is honored on dns-default pods (see cluster-dns-operator).
+	// Cluster autoscaler respects it; the machine API drain path does not.
+	EnableDSEvictionAnnotationKey = "cluster-autoscaler.kubernetes.io/enable-ds-eviction"
+
+	gracefulDNSDrainTaintKey = "ci-scheduling.ci.openshift.io/graceful-dns-drain"
+
+	openshiftDNSNamespace         = "openshift-dns"
+	dnsDefaultDaemonSetLabelKey   = "dns.operator.openshift.io/daemonset-dns"
+	dnsDefaultDaemonSetLabelValue = "default"
+
+	// dnsLameduckWait covers CoreDNS health.lameduck (20s) plus endpoint propagation slack.
+	dnsLameduckWait    = 25 * time.Second
+	dnsDrainPollPeriod = 2 * time.Second
 
 	// NodeMachineAnnotationKey Value is the machine name associated with this node
 	NodeMachineAnnotationKey = "machine.openshift.io/machine"
@@ -966,17 +981,16 @@ func (p *Prioritization) scaleDown(podClass PodClass, node *corev1.Node) (machin
 		return machineSetNamespace, machineSetName, machineName, fmt.Errorf("unable to get machineset %v: %#w", machineSetName, err)
 	}
 
-	// setting this Taint is the point of no return -- if successful, we will try to scale down indefinitely.
-	// This taint is set to work around a DNS bug where DNS pods need time to gracefully shutdown before a
-	// drain operation. Draining without a graceful termination period causes brief outages in DNS.
-	// https://issues.redhat.com/browse/OCPBUGS-488 is intended to fix this behavior.
+	// gracefullyDrainClusterDNS runs before NoExecute so dns-default gets a NoSchedule taint
+	// and graceful eviction while the node is still serving CI drain via the later taint.
+	if err := p.gracefullyDrainClusterDNS(node.Name); err != nil {
+		return machineSetNamespace, machineSetName, machineName, fmt.Errorf("graceful cluster DNS drain on node %v: %w", node.Name, err)
+	}
+
 	err = p.setNoExecuteTaint(node.Name, podClass)
 	if err != nil {
 		return machineSetNamespace, machineSetName, machineName, fmt.Errorf("unable to set NoExecute node %v: %#w", node.Name, err)
 	}
-
-	klog.Infof("Sleeping to allow graceful DNS pod termination on %v / %v", machineName, node.Name)
-	time.Sleep(40 * time.Second)
 
 	attempt := 0
 	for {
@@ -1240,6 +1254,156 @@ func (p *Prioritization) setNodeAvoidanceState(node *corev1.Node, podClass PodCl
 		klog.Infof("Avoidance taint state changed (old effect [%v]) to %v for node: %v", foundEffect, desiredEffect, node.Name)
 	}
 
+	return nil
+}
+
+func (p *Prioritization) listDNSDefaultPods(nodeName string) (*corev1.PodList, error) {
+	return p.k8sClientSet.CoreV1().Pods(openshiftDNSNamespace).List(p.context, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+		LabelSelector: fmt.Sprintf("%s=%s", dnsDefaultDaemonSetLabelKey, dnsDefaultDaemonSetLabelValue),
+	})
+}
+
+func (p *Prioritization) gracefullyDrainClusterDNS(nodeName string) (err error) {
+	if err = p.patchGracefulDNSDrainTaint(nodeName, true); err != nil {
+		return fmt.Errorf("setting graceful DNS drain taint: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if removeErr := p.patchGracefulDNSDrainTaint(nodeName, false); removeErr != nil {
+				klog.Warningf("Unable to remove graceful DNS drain taint from node %v: %v", nodeName, removeErr)
+			}
+		}
+	}()
+
+	podList, err := p.listDNSDefaultPods(nodeName)
+	if err != nil {
+		return fmt.Errorf("listing dns-default pods on node %s: %w", nodeName, err)
+	}
+
+	evicted := false
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Annotations[EnableDSEvictionAnnotationKey] == "false" {
+			continue
+		}
+
+		gracePeriodSeconds := int64(30)
+		if pod.Spec.TerminationGracePeriodSeconds != nil {
+			gracePeriodSeconds = *pod.Spec.TerminationGracePeriodSeconds
+		}
+
+		evictionErr := p.k8sClientSet.PolicyV1().Evictions(pod.Namespace).Evict(p.context, &policyv1.Eviction{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace},
+			DeleteOptions: &metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriodSeconds,
+			},
+		})
+		if evictionErr != nil {
+			if kerrors.IsNotFound(evictionErr) {
+				continue
+			}
+			if kerrors.IsForbidden(evictionErr) {
+				return fmt.Errorf("evicting dns-default pod %s: %w", pod.Name, evictionErr)
+			}
+			klog.Warningf("Unable to evict dns-default pod %s on node %v: %v", pod.Name, nodeName, evictionErr)
+			continue
+		}
+
+		klog.Infof("Evicted dns-default pod %s from node %v for graceful shutdown", pod.Name, nodeName)
+		evicted = true
+	}
+
+	if !evicted {
+		return nil
+	}
+
+	deadline := time.Now().Add(dnsLameduckWait)
+	for time.Now().Before(deadline) {
+		podList, listErr := p.listDNSDefaultPods(nodeName)
+		if listErr != nil {
+			klog.Warningf("Unable to check dns-default drain on node %v: %v", nodeName, listErr)
+			return nil
+		}
+
+		ready := false
+		for i := range podList.Items {
+			if podServingDNS(&podList.Items[i]) {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			klog.Infof("dns-default pods drained on node %v", nodeName)
+			return nil
+		}
+		time.Sleep(dnsDrainPollPeriod)
+	}
+
+	klog.Warningf("Timed out waiting for dns-default lameduck on node %v after %v", nodeName, dnsLameduckWait)
+	return nil
+}
+
+func podServingDNS(pod *corev1.Pod) bool {
+	if pod.DeletionTimestamp != nil {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Prioritization) patchGracefulDNSDrainTaint(nodeName string, add bool) error {
+	node, err := p.k8sClientSet.CoreV1().Nodes().Get(p.context, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("getting node %s: %w", nodeName, err)
+	}
+
+	taintIndex := -1
+	for i, taint := range node.Spec.Taints {
+		if taint.Key == gracefulDNSDrainTaintKey {
+			taintIndex = i
+			break
+		}
+	}
+
+	var patch []map[string]interface{}
+	switch {
+	case add && taintIndex >= 0:
+		return nil
+	case add:
+		patch = []map[string]interface{}{{
+			"op":    "add",
+			"path":  "/spec/taints/-",
+			"value": corev1.Taint{Key: gracefulDNSDrainTaintKey, Value: "true", Effect: corev1.TaintEffectNoSchedule},
+		}}
+	case taintIndex < 0:
+		return nil
+	default:
+		patch = []map[string]interface{}{{
+			"op":   "remove",
+			"path": fmt.Sprintf("/spec/taints/%d", taintIndex),
+		}}
+	}
+
+	payload, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshaling taint patch: %w", err)
+	}
+
+	_, err = p.k8sClientSet.CoreV1().Nodes().Patch(p.context, nodeName, types.JSONPatchType, payload, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("patching node %s: %w", nodeName, err)
+	}
+
+	if add {
+		klog.Infof("Set graceful DNS drain taint on node %v", nodeName)
+	} else {
+		klog.Infof("Removed graceful DNS drain taint from node %v", nodeName)
+	}
 	return nil
 }
 
