@@ -281,8 +281,7 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 	if podClass == PodClassTests {
 		// Segmenting long run tests onto their own node set helps normal tests nodes scale down
 		// more effectively.
-		if strings.HasPrefix(podName, "release-images-") ||
-			strings.HasPrefix(podName, "release-analysis-aggregator-") ||
+		if strings.HasPrefix(podName, "release-analysis-aggregator-") ||
 			strings.HasPrefix(podName, "e2e-aws-upgrade") ||
 			strings.HasPrefix(podName, "rpm-repo") ||
 			strings.HasPrefix(podName, "osde2e-stage") ||
