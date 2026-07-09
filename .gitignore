@@ -1,3 +1,10 @@
+#intellij
+*.iml
+.idea/
+
+# vscode
+.vscode/
+
 _output/
 .gopath/
 .gocache/
