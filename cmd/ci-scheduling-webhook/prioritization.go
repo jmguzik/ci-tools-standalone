@@ -1131,6 +1131,10 @@ func (p *Prioritization) scaleDown(podClass PodClass, node *corev1.Node) (machin
 
 const TaintEffectNone corev1.TaintEffect = "None"
 
+func avoidanceUpdateAllowed(node *corev1.Node, desiredEffect corev1.TaintEffect) bool {
+	return !node.Spec.Unschedulable || desiredEffect == TaintEffectNone
+}
+
 func (p *Prioritization) getNodeAvoidanceState(node *corev1.Node) corev1.TaintEffect {
 	avoidanceState := TaintEffectNone
 
@@ -1184,16 +1188,17 @@ func (p *Prioritization) setNodeAvoidanceState(node *corev1.Node, podClass PodCl
 		foundEffect = corev1.TaintEffectNoSchedule
 	}
 
-	if foundEffect == corev1.TaintEffectNoSchedule {
-		// Never uncordon nodes. This gets really complex if someone is manually cordoning nodes.
-		// Just avoid the complexity.
+	if !avoidanceUpdateAllowed(node, desiredEffect) {
 		klog.Errorf("Attempt to new avoidance state %v for node %v targeted for scale down", desiredEffect, node.Name)
 		return nil
 	}
 
 	// We enforce NoSchedule avoidance with cordon. CiWorkloadPreferNoScheduleTaintName
-	// will be set to unless desiredEffect == TaintEffectNone
-	_ = p.setNodeCordoned(node, desiredEffect == corev1.TaintEffectNoSchedule)
+	// will be set to unless desiredEffect == TaintEffectNone. Skip cordon changes when the
+	// node is already cordoned externally so MCP drains are not disrupted.
+	if !node.Spec.Unschedulable {
+		_ = p.setNodeCordoned(node, desiredEffect == corev1.TaintEffectNoSchedule)
+	}
 
 	// PreferNoSchedule is implemented as a custom taint. Depending on
 	// caller's request, add or remove that taint.
