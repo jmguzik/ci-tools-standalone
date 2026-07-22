@@ -76,10 +76,11 @@ const (
 )
 
 var (
-	nodesInformer      cache.SharedIndexInformer
-	podsInformer       cache.SharedIndexInformer
-	machineSetResource = schema.GroupVersionResource{Group: "machine.openshift.io", Version: "v1beta1", Resource: "machinesets"}
-	machineResource    = schema.GroupVersionResource{Group: "machine.openshift.io", Version: "v1beta1", Resource: "machines"}
+	nodesInformer        cache.SharedIndexInformer
+	podsInformer         cache.SharedIndexInformer
+	runtimeClassInformer cache.SharedIndexInformer
+	machineSetResource   = schema.GroupVersionResource{Group: "machine.openshift.io", Version: "v1beta1", Resource: "machinesets"}
+	machineResource      = schema.GroupVersionResource{Group: "machine.openshift.io", Version: "v1beta1", Resource: "machines"}
 
 	// If a node name exists in this map, scale down operations are being attempted for it.
 	scalingDownNodesByClass = map[PodClass]*sync.Map{
@@ -167,6 +168,8 @@ func (p *Prioritization) initializePrioritization() error {
 	if err != nil {
 		return fmt.Errorf("unable to create new node informer index: %w", err)
 	}
+
+	runtimeClassInformer = informerFactory.Node().V1().RuntimeClasses().Informer()
 
 	podsInformer = informerFactory.Core().V1().Pods().Informer()
 
@@ -1486,4 +1489,41 @@ func (p *Prioritization) findHostnamesToPreclude(podClass PodClass) []string {
 	}
 	klog.Infof("Precluding hostnames for podClass %v: %v", podClass, hostnamesToPreclude)
 	return hostnamesToPreclude
+}
+
+// archSpecificRuntimeClassExists checks whether an architecture-specific
+// RuntimeClass variant exists for the given workload class and CPU
+// architecture, following the naming convention:
+//
+//	ci-scheduler-runtime-{podClass}-{arch}
+//
+// For example, ci-scheduler-runtime-builds-s390x. When present, the
+// webhook assigns the arch-specific RuntimeClass and defers scheduling
+// constraints to it, instead of applying the generic RuntimeClass with
+// the ci-workload nodeSelector.
+func archSpecificRuntimeClassExists(podClass PodClass, arch string) bool {
+	if runtimeClassInformer == nil {
+		return false
+	}
+	name := fmt.Sprintf("ci-scheduler-runtime-%s-%s", podClass, arch)
+	_, exists, err := runtimeClassInformer.GetStore().GetByKey(name)
+	if err != nil {
+		klog.Errorf("Error looking up RuntimeClass %s: %v", name, err)
+		return false
+	}
+	return exists
+}
+
+// anyArchSpecificRuntimeClassExists returns true if at least one
+// arch-specific RuntimeClass exists for the given architecture across
+// any workload class (builds, tests, longtests, prowjobs). Used by
+// mutateNode to decide whether a non-amd64 CI node should be
+// auto-tainted.
+func anyArchSpecificRuntimeClassExists(arch string) bool {
+	for _, pc := range []PodClass{PodClassBuilds, PodClassTests, PodClassLongTests, PodClassProwJobs} {
+		if archSpecificRuntimeClassExists(pc, arch) {
+			return true
+		}
+	}
+	return false
 }
