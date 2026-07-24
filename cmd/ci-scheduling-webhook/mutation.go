@@ -22,6 +22,7 @@ const (
 	CiNamepsace                 = "ci"
 	CiCreatedByProwLabelName    = "created-by-prow"
 	KubernetesHostnameLabelName = "kubernetes.io/hostname"
+	KubernetesArchLabelName     = "kubernetes.io/arch"
 )
 
 var (
@@ -347,24 +348,35 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Setup toleration appropriate for podClass so that it can only land on desired machineset.
-		// This is achieved by virtue of using a RuntimeClass object which specifies the necessary
-		// tolerations for each workload.
-		addPatchEntry("add", "/spec/runtimeClassName", "ci-scheduler-runtime-"+podClass)
-
-		// Set a nodeSelector to ensure this finds our desired machineset nodes
+		// Check whether an arch-specific RuntimeClass variant exists for
+		// this pod's target architecture (e.g. ci-scheduler-runtime-builds-s390x).
+		// When present, the arch-specific RuntimeClass defines the scheduling
+		// constraints for that architecture, so the webhook defers to it
+		// instead of applying the generic workload-segregated RuntimeClass
+		// and ci-workload nodeSelector.
 		nodeSelector := pod.Spec.NodeSelector
 		if nodeSelector == nil {
 			nodeSelector = make(map[string]string)
 		}
-		nodeSelector[CiWorkloadLabelName] = string(podClass)
-		addPatchEntry("add", "/spec/nodeSelector", nodeSelector)
+		arch := nodeSelector[KubernetesArchLabelName]
+		hasArchSpecificRC := arch != "" && archSpecificRuntimeClassExists(podClass, arch)
 
-		precludedHostnames := prioritization.findHostnamesToPreclude(podClass)
+		if hasArchSpecificRC {
+			// Use the arch-specific RuntimeClass variant, which defines
+			// its own scheduling constraints for this architecture.
+			archRuntimeClass := fmt.Sprintf("ci-scheduler-runtime-%s-%s", podClass, arch)
+			klog.Infof("Pod %s using arch-specific RuntimeClass %s", podName, archRuntimeClass)
+			addPatchEntry("add", "/spec/runtimeClassName", archRuntimeClass)
+			addPatchEntry("add", "/spec/nodeSelector", nodeSelector)
+		} else {
+			// Generic path: use the workload-segregated RuntimeClass and
+			// add ci-workload nodeSelector for workload-type isolation.
+			addPatchEntry("add", "/spec/runtimeClassName", "ci-scheduler-runtime-"+podClass)
+			nodeSelector[CiWorkloadLabelName] = string(podClass)
+			addPatchEntry("add", "/spec/nodeSelector", nodeSelector)
+		}
 
-		// Preserve existing affinity rules (e.g. podAntiAffinity from pod-scaler)
-		// by merging our nodeAffinity into the pod's existing affinity rather than
-		// replacing it entirely.
+		affinityChanged := false
 		affinity := pod.Spec.Affinity
 		if affinity == nil {
 			affinity = &corev1.Affinity{}
@@ -372,11 +384,13 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 		if affinity.NodeAffinity == nil {
 			affinity.NodeAffinity = &corev1.NodeAffinity{}
 		}
-		affinityChanged := false
-		if err == nil {
+
+		if !hasArchSpecificRC {
+			// Node preclusion and spot-instance preference apply to the
+			// generic RuntimeClass path with workload-segregated node pools.
+			precludedHostnames := prioritization.findHostnamesToPreclude(podClass)
+
 			if len(precludedHostnames) > 0 {
-				// Use MatchExpressions here because MatchFields because MatchExpressions
-				// only allows one value in the Values list.
 				requiredNoSchedulingSelector := corev1.NodeSelector{
 					NodeSelectorTerms: []corev1.NodeSelectorTerm{
 						{
@@ -393,12 +407,10 @@ func mutatePod(w http.ResponseWriter, r *http.Request) {
 				affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &requiredNoSchedulingSelector
 				affinityChanged = true
 			}
-		} else {
-			klog.Errorf("No node precludes will be set in pod due to error: %v", err)
 		}
 
 		highPerfPod := false
-		if podClass == PodClassBuilds {
+		if podClass == PodClassBuilds && !hasArchSpecificRC {
 			// Use high performance nodes for large pods
 			for _, container := range pod.Spec.Containers {
 				if container.Resources.Requests.Memory().Cmp(memoryThreshold) >= 0 || container.Resources.Requests.Cpu().Cmp(cpuThreshold) >= 0 {
@@ -636,6 +648,41 @@ func mutateNode(admissionReviewRequest *admissionv1.AdmissionReview, w http.Resp
 			// https://github.com/kubernetes/autoscaler/blob/a13c59c2430e5fe0e07d8233a536326394e0c925/cluster-autoscaler/FAQ.md#how-can-i-prevent-cluster-autoscaler-from-scaling-down-a-particular-node
 			escapedKey := strings.ReplaceAll(NodeDisableScaleDownAnnotationKey, "/", "~1")
 			addPatchEntry("add", "/metadata/annotations/"+escapedKey, "true")
+		}
+
+		// Auto-taint CI nodes when arch-specific RuntimeClasses are
+		// deployed. This prevents non-CI workloads (operators, monitoring,
+		// etc.) from scheduling onto nodes where a single node must serve
+		// both builds and tests (e.g. s390x, ppc64le). The taint is
+		// arch-agnostic — the arch-specific RuntimeClass already handles
+		// architecture routing via nodeSelector; the taint's only job is
+		// to keep non-CI pods off. Whether an architecture needs this is
+		// determined entirely by the presence of arch-specific
+		// RuntimeClasses — no architectures are hardcoded.
+		arch := labels[KubernetesArchLabelName]
+		if arch != "" && anyArchSpecificRuntimeClassExists(arch) {
+			hasTaint := false
+			for _, t := range node.Spec.Taints {
+				if t.Key == CIWorkerTaintKey {
+					hasTaint = true
+					break
+				}
+			}
+			if !hasTaint {
+				klog.Infof("Auto-tainting CI node %s (arch=%s) with %s=%s:NoSchedule",
+					nodeName, arch, CIWorkerTaintKey, CIWorkerTaintValue)
+				newTaint := map[string]interface{}{
+					"key":    CIWorkerTaintKey,
+					"value":  CIWorkerTaintValue,
+					"effect": string(corev1.TaintEffectNoSchedule),
+				}
+				if len(node.Spec.Taints) == 0 {
+					addPatchEntry("add", "/spec/taints", []interface{}{newTaint})
+				} else {
+					// RFC 6902: "-" appends to an existing array.
+					addPatchEntry("add", "/spec/taints/-", newTaint)
+				}
+			}
 		}
 	}
 

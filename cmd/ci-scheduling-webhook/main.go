@@ -32,6 +32,12 @@ const (
 	CiWorkloadPreferNoScheduleTaintName = "ci-workload-avoid"
 	CiWorkloadPreferNoExecuteTaintName  = "ci-workload-evict"
 	CiWorkloadNamespaceLabelName        = "ci-workload-namespace"
+
+	// CIWorkerTaintKey and CIWorkerTaintValue define the taint applied to
+	// CI nodes to keep non-CI pods off. The arch-specific RuntimeClasses
+	// include a toleration for this taint.
+	CIWorkerTaintKey   = "node-role.kubernetes.io/ci-worker"
+	CIWorkerTaintValue = "ci-worker"
 )
 
 var (
