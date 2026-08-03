@@ -14,6 +14,8 @@ import (
 	"github.com/argoproj/argo-cd/v3/pkg/apiclient/applicationset"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/openshift/ci-tools-standalone/cmd/cluster-manifest-verifier/internal/syncplanner"
 )
@@ -115,7 +117,11 @@ func (c *Client) DryRunSync(ctx context.Context, plan *syncplanner.Plan) error {
 		AppNamespace: new(gitopsNamespace),
 	})
 	if err != nil {
-		return err
+		if status.Code(err) == codes.PermissionDenied {
+			logrus.Warnf("Application %q does not exist in Argo CD yet; skipping dry-run sync (new apps cannot be dry-run synced until the ApplicationSet controller creates them)", plan.Name)
+			return nil
+		}
+		return fmt.Errorf("get application: %w", err)
 	}
 
 	if plan.FullSync {
