@@ -68,10 +68,17 @@ func (p *Planner) Build(apps map[string]argov1alpha1.Application, changes []gitc
 }
 
 func (p *Planner) coversPath(app argov1alpha1.Application, changedPath string) bool {
-	if app.Spec.Source == nil || app.Spec.Source.Path == "" {
-		return false
+	if app.Spec.Source != nil && app.Spec.Source.Path != "" {
+		if strings.HasPrefix(changedPath, strings.TrimSuffix(app.Spec.Source.Path, "/")+"/") {
+			return true
+		}
 	}
-	return strings.HasPrefix(changedPath, strings.TrimSuffix(app.Spec.Source.Path, "/")+"/")
+	for _, source := range app.Spec.Sources {
+		if source.Path != "" && strings.HasPrefix(changedPath, strings.TrimSuffix(source.Path, "/")+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Planner) applyChange(plan *Plan, change gitchanges.FileChange) error {
