@@ -40,7 +40,7 @@ func New(cfg Config) (*Verifier, error) {
 	baseRevision := spec.Refs.BaseSHA
 	argocdRevision := fmt.Sprintf("refs/pull/%d/merge", pull.Number)
 
-	argo, err := argocd.New(argocd.Config{Server: cfg.ArgoCDServer, Revision: argocdRevision})
+	argo, err := argocd.New(argocd.Config{Server: cfg.ArgoCDServer, Revision: argocdRevision, PullNumber: pull.Number})
 	if err != nil {
 		return nil, err
 	}
@@ -93,13 +93,15 @@ func (v *Verifier) Run(ctx context.Context) error {
 		return utilerrors.NewAggregate(errs)
 	}
 
-	plans, err := v.planner.Build(apps.AllApplications(generated), changes)
+	appsByName := apps.AllApplications(generated)
+
+	plans, err := v.planner.Build(appsByName, changes)
 	if err != nil {
 		errs = append(errs, err)
 	}
 
 	for name, plan := range plans {
-		if err := v.argo.DryRunSync(ctx, plan); err != nil {
+		if err := v.argo.DryRunSync(ctx, appsByName[name], plan); err != nil {
 			errs = append(errs, fmt.Errorf("application %q: %w", name, err))
 		}
 	}

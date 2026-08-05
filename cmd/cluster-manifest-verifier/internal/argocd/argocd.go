@@ -14,25 +14,27 @@ import (
 	"github.com/argoproj/argo-cd/v3/pkg/apiclient/applicationset"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/openshift/ci-tools-standalone/cmd/cluster-manifest-verifier/internal/syncplanner"
 )
 
 const (
-	gitopsNamespace  = "openshift-gitops"
-	syncPollInterval = 2 * time.Second
-	syncTimeout      = 5 * time.Minute
+	gitopsNamespace   = "openshift-gitops"
+	syncPollInterval  = 2 * time.Second
+	syncTimeout       = 5 * time.Minute
+	tempAppNamePrefix = "cmv-pr-"
 )
 
 type Config struct {
-	Server   string
-	Revision string
+	Server     string
+	Revision   string
+	PullNumber int
 }
 
 type Client struct {
 	revision     string
+	pullNumber   int
 	appsetClient applicationset.ApplicationSetServiceClient
 	appClient    application.ApplicationServiceClient
 	close        func() error
@@ -65,6 +67,7 @@ func New(cfg Config) (*Client, error) {
 
 	return &Client{
 		revision:     cfg.Revision,
+		pullNumber:   cfg.PullNumber,
 		appsetClient: appsetClient,
 		appClient:    appClient,
 		close: func() error {
@@ -111,29 +114,56 @@ func (c *Client) GenerateApplications(ctx context.Context, applicationSets []arg
 	return generated, genErr
 }
 
-func (c *Client) DryRunSync(ctx context.Context, plan *syncplanner.Plan) error {
-	app, err := c.appClient.Get(ctx, &application.ApplicationQuery{
-		Name:         &plan.Name,
-		AppNamespace: new(gitopsNamespace),
-	})
-	if err != nil {
-		if status.Code(err) == codes.PermissionDenied {
-			logrus.Warnf("Application %q does not exist in Argo CD yet; skipping dry-run sync (new apps cannot be dry-run synced until the ApplicationSet controller creates them)", plan.Name)
-			return nil
-		}
-		return fmt.Errorf("get application: %w", err)
-	}
+// DryRunSync creates a temporary Application from source (PR revision, unique name),
+// dry-run syncs it, then deletes it. The live Application is never touched.
+func (c *Client) DryRunSync(ctx context.Context, source argov1alpha1.Application, plan *syncplanner.Plan) error {
+	temp := c.temporaryApplication(source)
 
 	if plan.FullSync {
-		logrus.Infof("Application %q: dry-run syncing full application (non-resource change in PR)", plan.Name)
+		logrus.Infof("Application %q: dry-run syncing full application as %q (non-resource change in PR)", source.Name, temp.Name)
 	} else {
-		logrus.Infof("Application %q: dry-run syncing %d changed resource(s)", plan.Name, len(plan.Resources))
+		logrus.Infof("Application %q: dry-run syncing %d changed resource(s) as %q", source.Name, len(plan.Resources), temp.Name)
 	}
 
-	if _, err := c.appClient.Sync(ctx, c.syncRequest(app, plan)); err != nil {
+	validate := true
+	if _, err := c.appClient.Create(ctx, &application.ApplicationCreateRequest{
+		Application: &temp,
+		Validate:    &validate,
+	}); err != nil {
+		return fmt.Errorf("create temporary application %q: %w", temp.Name, err)
+	}
+
+	defer func() {
+		cascade := false
+		if _, err := c.appClient.Delete(ctx, &application.ApplicationDeleteRequest{
+			Name:         &temp.Name,
+			AppNamespace: new(gitopsNamespace),
+			Cascade:      &cascade,
+		}); err != nil {
+			logrus.WithError(err).Warnf("delete temporary application %q", temp.Name)
+		} else {
+			logrus.Infof("deleted temporary application %q", temp.Name)
+		}
+	}()
+
+	if _, err := c.appClient.Sync(ctx, c.syncRequest(&temp, plan)); err != nil {
 		return fmt.Errorf("start dry-run sync: %w", err)
 	}
-	return c.waitForSyncOperation(ctx, plan.Name)
+	return c.waitForSyncOperation(ctx, temp.Name)
+}
+
+func (c *Client) temporaryApplication(source argov1alpha1.Application) argov1alpha1.Application {
+	app := *source.DeepCopy()
+	app.ObjectMeta = metav1.ObjectMeta{
+		Name:      fmt.Sprintf("%s%d-%s", tempAppNamePrefix, c.pullNumber, source.Name),
+		Namespace: gitopsNamespace,
+	}
+	app.Status = argov1alpha1.ApplicationStatus{}
+	app.Operation = nil
+	app.Spec.SyncPolicy = nil
+
+	app.Spec.Source.TargetRevision = c.revision
+	return app
 }
 
 func (c *Client) applicationSetForGenerate(appset argov1alpha1.ApplicationSet) (argov1alpha1.ApplicationSet, error) {
@@ -143,12 +173,7 @@ func (c *Client) applicationSetForGenerate(appset argov1alpha1.ApplicationSet) (
 	for i := range appset.Spec.Generators {
 		appset.Spec.Generators[i] = c.setGeneratorRevision(appset.Spec.Generators[i])
 	}
-	if appset.Spec.Template.Spec.Source != nil {
-		appset.Spec.Template.Spec.Source.TargetRevision = c.revision
-	}
-	for i := range appset.Spec.Template.Spec.Sources {
-		appset.Spec.Template.Spec.Sources[i].TargetRevision = c.revision
-	}
+	appset.Spec.Template.Spec.Source.TargetRevision = c.revision
 	return appset, nil
 }
 
@@ -188,17 +213,6 @@ func (c *Client) syncRequest(app *argov1alpha1.Application, plan *syncplanner.Pl
 		AppNamespace: new(gitopsNamespace),
 		DryRun:       &dryRun,
 		Revision:     &c.revision,
-	}
-	if app.Spec.HasMultipleSources() {
-		n := len(app.Spec.Sources)
-		revisions := make([]string, n)
-		positions := make([]int64, n)
-		for i := range n {
-			revisions[i] = c.revision
-			positions[i] = int64(i + 1)
-		}
-		req.Revisions = revisions
-		req.SourcePositions = positions
 	}
 	if !plan.FullSync {
 		for i := range plan.Resources {
