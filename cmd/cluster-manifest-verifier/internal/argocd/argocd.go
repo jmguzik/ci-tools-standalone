@@ -162,7 +162,12 @@ func (c *Client) temporaryApplication(source argov1alpha1.Application) argov1alp
 	app.Operation = nil
 	app.Spec.SyncPolicy = nil
 
-	app.Spec.Source.TargetRevision = c.revision
+	if app.Spec.Source != nil {
+		app.Spec.Source.TargetRevision = c.revision
+	}
+	for i := range app.Spec.Sources {
+		app.Spec.Sources[i].TargetRevision = c.revision
+	}
 	return app
 }
 
@@ -173,7 +178,12 @@ func (c *Client) applicationSetForGenerate(appset argov1alpha1.ApplicationSet) (
 	for i := range appset.Spec.Generators {
 		appset.Spec.Generators[i] = c.setGeneratorRevision(appset.Spec.Generators[i])
 	}
-	appset.Spec.Template.Spec.Source.TargetRevision = c.revision
+	if appset.Spec.Template.Spec.Source != nil {
+		appset.Spec.Template.Spec.Source.TargetRevision = c.revision
+	}
+	for i := range appset.Spec.Template.Spec.Sources {
+		appset.Spec.Template.Spec.Sources[i].TargetRevision = c.revision
+	}
 	return appset, nil
 }
 
