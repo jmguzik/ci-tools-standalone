@@ -31,10 +31,10 @@ func New(repoDir string) *Planner {
 	return &Planner{repoDir: repoDir}
 }
 
-func (p *Planner) Build(apps []argov1alpha1.Application, changes []gitchanges.FileChange) (map[string]*Plan, error) {
+func (p *Planner) Build(apps map[string]argov1alpha1.Application, changes []gitchanges.FileChange) (map[string]*Plan, error) {
 	plans := make(map[string]*Plan, len(apps))
-	for _, app := range apps {
-		plans[app.Name] = &Plan{Name: app.Name}
+	for name := range apps {
+		plans[name] = &Plan{Name: name}
 	}
 
 	var planErr error
@@ -43,14 +43,14 @@ func (p *Planner) Build(apps []argov1alpha1.Application, changes []gitchanges.Fi
 			continue
 		}
 		matched := false
-		for _, app := range apps {
+		for name, app := range apps {
 			if !p.coversPath(app, change.Path) {
 				continue
 			}
-			logrus.Infof("change %q -> Application %q", change.Path, app.Name)
+			logrus.Infof("change %q -> Application %q", change.Path, name)
 			matched = true
-			if err := p.applyChange(plans[app.Name], change); err != nil {
-				planErr = errors.Join(planErr, fmt.Errorf("%s (Application %q): %w", change.Path, app.Name, err))
+			if err := p.applyChange(plans[name], change); err != nil {
+				planErr = errors.Join(planErr, fmt.Errorf("%s (Application %q): %w", change.Path, name, err))
 			}
 		}
 		if !matched {
@@ -68,18 +68,10 @@ func (p *Planner) Build(apps []argov1alpha1.Application, changes []gitchanges.Fi
 }
 
 func (p *Planner) coversPath(app argov1alpha1.Application, changedPath string) bool {
-	if app.Spec.HasMultipleSources() {
-		for _, source := range app.Spec.Sources {
-			if source.Path != "" && strings.HasPrefix(changedPath, strings.TrimSuffix(source.Path, "/")+"/") {
-				return true
-			}
-		}
+	if app.Spec.Source == nil || app.Spec.Source.Path == "" {
 		return false
 	}
-	if app.Spec.Source != nil && app.Spec.Source.Path != "" {
-		return strings.HasPrefix(changedPath, strings.TrimSuffix(app.Spec.Source.Path, "/")+"/")
-	}
-	return false
+	return strings.HasPrefix(changedPath, strings.TrimSuffix(app.Spec.Source.Path, "/")+"/")
 }
 
 func (p *Planner) applyChange(plan *Plan, change gitchanges.FileChange) error {

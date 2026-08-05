@@ -118,19 +118,21 @@ metadata:
 func TestPlannerBuild(t *testing.T) {
 	testCases := []struct {
 		name      string
-		apps      []argov1alpha1.Application
+		apps      map[string]argov1alpha1.Application
 		changes   []gitchanges.FileChange
 		wantErr   bool
 		wantPlans map[string]*Plan
 	}{
 		{
 			name: "orphan changed file fails",
-			apps: []argov1alpha1.Application{{
-				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
-				Spec: argov1alpha1.ApplicationSpec{
-					Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+			apps: map[string]argov1alpha1.Application{
+				"foo": {
+					ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+					Spec: argov1alpha1.ApplicationSpec{
+						Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+					},
 				},
-			}},
+			},
 			changes: []gitchanges.FileChange{
 				{Path: "clusters/orphan/config.yaml", Status: 'A'},
 			},
@@ -138,12 +140,14 @@ func TestPlannerBuild(t *testing.T) {
 		},
 		{
 			name: "covered deleted file plans full sync",
-			apps: []argov1alpha1.Application{{
-				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
-				Spec: argov1alpha1.ApplicationSpec{
-					Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+			apps: map[string]argov1alpha1.Application{
+				"foo": {
+					ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+					Spec: argov1alpha1.ApplicationSpec{
+						Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+					},
 				},
-			}},
+			},
 			changes: []gitchanges.FileChange{
 				{Path: "clusters/build-clusters/foo/config.yaml", Status: 'D'},
 			},
@@ -153,12 +157,14 @@ func TestPlannerBuild(t *testing.T) {
 		},
 		{
 			name: "gitops app change is ignored",
-			apps: []argov1alpha1.Application{{
-				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
-				Spec: argov1alpha1.ApplicationSpec{
-					Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+			apps: map[string]argov1alpha1.Application{
+				"foo": {
+					ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+					Spec: argov1alpha1.ApplicationSpec{
+						Source: &argov1alpha1.ApplicationSource{Path: "clusters/build-clusters/foo"},
+					},
 				},
-			}},
+			},
 			changes: []gitchanges.FileChange{
 				{Path: "clusters/gitops/apps/appset.yaml", Status: 'M'},
 			},

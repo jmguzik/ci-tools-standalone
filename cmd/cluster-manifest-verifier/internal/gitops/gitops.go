@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/yaml"
 )
 
@@ -82,24 +81,22 @@ func loadAppFile(filePath string, apps *Apps) error {
 	return nil
 }
 
-func (g *Apps) AllApplications(generated []argov1alpha1.Application) []argov1alpha1.Application {
-	seen := sets.New[string]()
-	var apps []argov1alpha1.Application
-	add := func(app argov1alpha1.Application) {
-		if app.Name == "" {
-			return
-		}
-		if seen.Has(app.Name) {
-			return
-		}
-		seen.Insert(app.Name)
-		apps = append(apps, app)
-	}
+func (g *Apps) AllApplications(generated []argov1alpha1.Application) map[string]argov1alpha1.Application {
+	apps := make(map[string]argov1alpha1.Application, len(generated)+len(g.Applications))
 	for _, app := range generated {
-		add(app)
+		if app.Name == "" {
+			continue
+		}
+		apps[app.Name] = app
 	}
 	for _, app := range g.Applications {
-		add(app)
+		if app.Name == "" {
+			continue
+		}
+		if _, exists := apps[app.Name]; exists {
+			continue
+		}
+		apps[app.Name] = app
 	}
 	return apps
 }
