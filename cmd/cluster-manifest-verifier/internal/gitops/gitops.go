@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
-	"strings"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"sigs.k8s.io/yaml"
@@ -30,7 +30,8 @@ func LoadApps(dir string) (*Apps, error) {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+		ext := path.Ext(name)
+		if ext != ".yaml" && ext != ".yml" {
 			continue
 		}
 		if err := loadAppFile(filepath.Join(dir, name), apps); err != nil {
@@ -99,4 +100,93 @@ func (g *Apps) AllApplications(generated []argov1alpha1.Application) map[string]
 		apps[app.Name] = app
 	}
 	return apps
+}
+
+// ApplicationSetsForChanges copies appsets and sets each git directories path to the
+// concrete app dirs under that glob that changedPaths touch. Unrelated appsets are dropped.
+func ApplicationSetsForChanges(appsets []argov1alpha1.ApplicationSet, changedPaths []string) []argov1alpha1.ApplicationSet {
+	var paths []string
+	for _, p := range changedPaths {
+		if rel, err := filepath.Rel("clusters/gitops/apps", path.Clean(p)); err == nil && (rel == "." || filepath.IsLocal(rel)) {
+			continue
+		}
+		paths = append(paths, p)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+
+	var out []argov1alpha1.ApplicationSet
+	for _, appset := range appsets {
+		as := appset.DeepCopy()
+		if !setDirectoriesToChangedApps(as, paths) {
+			continue
+		}
+		out = append(out, *as)
+	}
+	return out
+}
+
+func setDirectoriesToChangedApps(as *argov1alpha1.ApplicationSet, paths []string) bool {
+	var gits []*argov1alpha1.GitGenerator
+	for _, g := range as.Spec.Generators {
+		if g.Git != nil {
+			gits = append(gits, g.Git)
+		}
+		if g.Matrix == nil {
+			continue
+		}
+		for _, nested := range g.Matrix.Generators {
+			if nested.Git != nil {
+				gits = append(gits, nested.Git)
+			}
+		}
+	}
+	if len(gits) == 0 {
+		return true
+	}
+
+	for _, git := range gits {
+		if setGitDirectoryPaths(git, paths) {
+			return true
+		}
+	}
+	return false
+}
+
+// setGitDirectoryPaths replaces globs like "clusters/foo/*" with the changed app dirs under them.
+func setGitDirectoryPaths(git *argov1alpha1.GitGenerator, paths []string) bool {
+	var dirs []argov1alpha1.GitDirectoryGeneratorItem
+	seen := map[string]struct{}{}
+	for _, d := range git.Directories {
+		pattern := path.Clean(d.Path)
+		base := pattern
+		glob := path.Base(pattern) == "*"
+		if glob {
+			base = path.Dir(pattern)
+		}
+		for _, p := range paths {
+			rel, err := filepath.Rel(base, path.Clean(p))
+			if err != nil || !filepath.IsLocal(rel) {
+				continue
+			}
+			appDir := base
+			if glob {
+				appDir = path.Join(base, filepath.ToSlash(rel))
+				for path.Dir(appDir) != base {
+					appDir = path.Dir(appDir)
+				}
+			}
+			if _, ok := seen[appDir]; ok {
+				continue
+			}
+			seen[appDir] = struct{}{}
+			dirs = append(dirs, argov1alpha1.GitDirectoryGeneratorItem{Path: appDir, Exclude: d.Exclude})
+		}
+	}
+	if len(dirs) == 0 {
+		return false
+	}
+	git.Directories = dirs
+	return true
 }

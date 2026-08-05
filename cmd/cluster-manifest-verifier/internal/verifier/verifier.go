@@ -79,11 +79,6 @@ func (v *Verifier) Run(ctx context.Context) error {
 		"argocdGitRevision": v.argo.Revision(),
 	}).Info("loaded gitops apps")
 
-	generated, err := v.argo.GenerateApplications(ctx, apps.ApplicationSets)
-	if err != nil {
-		return fmt.Errorf("generate applications from ApplicationSets: %w", err)
-	}
-
 	changes, err := v.repoChanges.List(ctx)
 	if err != nil {
 		return fmt.Errorf("list PR changes: %w", err)
@@ -91,6 +86,18 @@ func (v *Verifier) Run(ctx context.Context) error {
 	if len(changes) == 0 {
 		logrus.Info("no changes under clusters/, skipping verification")
 		return utilerrors.NewAggregate(errs)
+	}
+
+	changedPaths := make([]string, len(changes))
+	for i := range changes {
+		changedPaths[i] = changes[i].Path
+	}
+	appsets := gitops.ApplicationSetsForChanges(apps.ApplicationSets, changedPaths)
+	logrus.Infof("generating %d of %d ApplicationSet(s)", len(appsets), len(apps.ApplicationSets))
+
+	generated, err := v.argo.GenerateApplications(ctx, appsets)
+	if err != nil {
+		return fmt.Errorf("generate applications from ApplicationSets: %w", err)
 	}
 
 	appsByName := apps.AllApplications(generated)
