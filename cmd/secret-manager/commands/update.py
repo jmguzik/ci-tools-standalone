@@ -8,11 +8,13 @@ from google.cloud.secretmanager import SecretPayload
 from util import (
     PROJECT_ID,
     create_payload,
+    destroy_previous_versions,
+    ensure_authentication,
     get_secret_name,
     get_secrets_from_index,
     validate_collection,
     validate_path,
-    validate_secret_source, ensure_authentication,
+    validate_secret_source,
 )
 
 
@@ -81,11 +83,10 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
 
     # Secret exists in both places - proceed with the update
     try:
-        client.add_secret_version(
+        new_version = client.add_secret_version(
             parent=full_secret_path,
             payload=SecretPayload(data=create_payload(from_file, from_literal)),
         )
-        click.echo(f"Secret '{secret_path}' updated successfully.")
     except PermissionDenied:
         raise click.ClickException(
             f"You don't have permission to update secrets in collection '{collection}'"
@@ -93,4 +94,14 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
     except Exception as e:
         raise click.ClickException(
             f"Failed to update secret '{secret_path}': {e}."
+        )
+
+    click.echo(f"Secret '{secret_path}' updated successfully.")
+
+    try:
+        destroy_previous_versions(client, full_secret_path, new_version.name)
+    except Exception as e:
+        click.echo(
+            f"Warning: secret '{secret_path}' was updated, but failed to clean up previous versions: {e}",
+            err=True,
         )

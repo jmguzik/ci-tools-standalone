@@ -355,6 +355,32 @@ def get_secrets_from_index(
     return secret_list if secret_list is not None else []
 
 
+def destroy_previous_versions(
+    client: secretmanager.SecretManagerServiceClient,
+    secret_path: str,
+    current_version_name: str,
+):
+    """
+    Destroys enabled secret versions to prevent cost accumulation, keeping only the
+    current version and the one immediately preceding it as a rollback fallback.
+
+    Args:
+        client (secretmanager.SecretManagerServiceClient): Secret Manager client.
+        secret_path (str): Full resource path of the secret.
+        current_version_name (str): Name of the version to keep.
+    """
+    previous_versions = []
+    for v in client.list_secret_versions(
+        request={"parent": secret_path, "filter": "state:ENABLED"}
+    ):
+        if v.name != current_version_name:
+            previous_versions.append(v)
+
+    previous_versions.sort(key=lambda version: version.create_time, reverse=True)
+    for v in previous_versions[1:]:
+        client.destroy_secret_version(request={"name": v.name})
+
+
 def update_index_secret(
     client: secretmanager.SecretManagerServiceClient,
     collection: str,
@@ -372,8 +398,16 @@ def update_index_secret(
     name = client.secret_path(PROJECT_ID, get_index_secret_for_collection(collection))
     payload = yaml.safe_dump(sorted(secret_names))
     try:
-        client.add_secret_version(
+        new_version = client.add_secret_version(
             parent=name, payload=SecretPayload(data=payload.encode("utf-8"))
         )
     except Exception as e:
         raise click.ClickException(f"Error while updating index: '{e}'.")
+
+    try:
+        destroy_previous_versions(client, name, new_version.name)
+    except Exception as e:
+        click.echo(
+            f"Warning: index for collection '{collection}' was updated, but failed to clean up previous versions: {e}",
+            err=True,
+        )
