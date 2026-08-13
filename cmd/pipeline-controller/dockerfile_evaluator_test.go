@@ -1,15 +1,25 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"testing"
 
+	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
+
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
+	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/github"
 )
 
 type fakeGhClient struct {
-	files map[string][]byte
+	files      map[string][]byte
+	fileErrors map[string]error
+	refs       []string
+	changes    []github.PullRequestChange
+	statuses   []github.Status
+	statusRefs []string
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
@@ -19,18 +29,26 @@ func (f *fakeGhClient) CreateComment(org, repo string, number int, comment strin
 	return nil
 }
 func (f *fakeGhClient) GetPullRequestChanges(org, repo string, number int) ([]github.PullRequestChange, error) {
-	return nil, nil
+	return f.changes, nil
 }
-func (f *fakeGhClient) CreateStatus(org, repo, ref string, s github.Status) error { return nil }
+func (f *fakeGhClient) CreateStatus(org, repo, ref string, s github.Status) error {
+	f.statusRefs = append(f.statusRefs, ref)
+	f.statuses = append(f.statuses, s)
+	return nil
+}
 func (f *fakeGhClient) AddLabel(org, repo string, number int, label string) error { return nil }
 func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.Label, error) {
 	return nil, nil
 }
 func (f *fakeGhClient) GetFile(org, repo, filepath, commit string) ([]byte, error) {
+	f.refs = append(f.refs, commit)
+	if err, ok := f.fileErrors[filepath]; ok {
+		return nil, err
+	}
 	if content, ok := f.files[filepath]; ok {
 		return content, nil
 	}
-	return nil, fmt.Errorf("file not found: %s", filepath)
+	return nil, github.NewNotFound()
 }
 
 func testProwJob() *v1.ProwJob {
@@ -40,6 +58,8 @@ func testProwJob() *v1.ProwJob {
 				Org:     "openshift",
 				Repo:    "hypershift",
 				BaseRef: "main",
+				BaseSHA: "base-sha",
+				Pulls:   []v1.Pull{{Number: 42}},
 			},
 		},
 	}
@@ -57,6 +77,30 @@ func TestParseDockerfileSources(t *testing.T) {
 			content:   "FROM golang:1.21\nCOPY go.mod go.sum ./\nCOPY cmd/ cmd/\nCOPY pkg/ pkg/\n",
 			wantSrcs:  []string{"go.mod", "go.sum", "cmd", "pkg"},
 			wantBroad: false,
+		},
+		{
+			name:      "normalized COPY sources",
+			content:   "FROM scratch\nCOPY ./cmd/ /cmd/\nCOPY /pkg/ /pkg/\nCOPY ../../internal/ /internal/\n",
+			wantSrcs:  []string{"cmd", "pkg", "internal"},
+			wantBroad: false,
+		},
+		{
+			name:      "wildcard COPY source",
+			content:   "FROM scratch\nCOPY config/*.json /app/\n",
+			wantSrcs:  []string{"config/*.json"},
+			wantBroad: false,
+		},
+		{
+			name:      "variable COPY source is conservative",
+			content:   "FROM scratch\nARG SOURCE\nCOPY ${SOURCE}/ /app/\n",
+			wantSrcs:  nil,
+			wantBroad: true,
+		},
+		{
+			name:      "globstar COPY source is conservative",
+			content:   "FROM scratch\nCOPY src/**/*.go /app/\n",
+			wantSrcs:  nil,
+			wantBroad: true,
 		},
 		{
 			name:      "broad COPY dot",
@@ -101,10 +145,10 @@ func TestParseDockerfileSources(t *testing.T) {
 			wantBroad: false,
 		},
 		{
-			name:      "only COPY --from, no build context copies",
+			name:      "COPY from named context is conservative",
 			content:   "FROM scratch\nCOPY --from=builder /bin/app /app\n",
-			wantSrcs:  []string{},
-			wantBroad: false,
+			wantSrcs:  nil,
+			wantBroad: true,
 		},
 		{
 			name:      "COPY --from=0 numeric stage",
@@ -121,6 +165,30 @@ func TestParseDockerfileSources(t *testing.T) {
 		{
 			name:      "broad COPY in builder stage propagates despite --from in final stage",
 			content:   "FROM golang:1.21 AS build\nCOPY . .\nRUN go build -o /app\nFROM scratch\nCOPY --from=build /app /app\n",
+			wantSrcs:  nil,
+			wantBroad: true,
+		},
+		{
+			name:      "RUN bind mount source",
+			content:   "FROM golang:1.21\nRUN --mount=type=bind,source=tools,target=/tools /tools/build.sh\n",
+			wantSrcs:  []string{"tools"},
+			wantBroad: false,
+		},
+		{
+			name:      "RUN bind mount defaults to whole context",
+			content:   "FROM golang:1.21\nRUN --mount=type=bind,target=/src make -C /src\n",
+			wantSrcs:  nil,
+			wantBroad: true,
+		},
+		{
+			name:      "RUN bind mount from previous stage is skipped",
+			content:   "FROM golang:1.21 AS build\nCOPY cmd/ cmd/\nFROM scratch\nRUN --mount=type=bind,from=build,source=/out,target=/out cp /out/app /app\n",
+			wantSrcs:  []string{"cmd"},
+			wantBroad: false,
+		},
+		{
+			name:      "RUN bind mount from named context is conservative",
+			content:   "FROM scratch\nRUN --mount=type=bind,from=source,source=/,target=/src cp /src/app /app\n",
 			wantSrcs:  nil,
 			wantBroad: true,
 		},
@@ -164,6 +232,14 @@ func TestPathMatchesSource(t *testing.T) {
 		{"go.mod", "go.mod", true},
 		{"cmd", "cmd", true},
 		{"command/foo.go", "cmd", false},
+		{"cmd/main.go", "./cmd/", true},
+		{"/cmd/main.go", "/cmd", true},
+		{"home.txt", "hom*", true},
+		{"foobar/nested.txt", "foo*", true},
+		{"config/app.json", "config/*.json", true},
+		{"config/nested/app.json", "config/*.json", false},
+		{"docs/readme.md", "*.json", false},
+		{"anything", "src/**", true},
 	}
 
 	for _, tt := range tests {
@@ -185,6 +261,7 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 		entries      []dockerfileEntry
 		changedFiles []string
 		files        map[string][]byte
+		fileErrors   map[string]error
 		want         bool
 	}{
 		{
@@ -226,10 +303,83 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 			want: false,
 		},
 		{
+			name:         "Dockerfile-specific ignore takes precedence over root",
+			entries:      []dockerfileEntry{{Path: "docker/build.Dockerfile"}},
+			changedFiles: []string{"src/main.go"},
+			files: map[string][]byte{
+				"docker/build.Dockerfile":              []byte("FROM scratch\nCOPY src/ src/\n"),
+				"docker/build.Dockerfile.dockerignore": []byte{},
+				".dockerignore":                        []byte("src/\n"),
+			},
+			want: true,
+		},
+		{
+			name:         "Dockerfile-specific ignore excludes copied source",
+			entries:      []dockerfileEntry{{Path: "docker/build.Dockerfile"}},
+			changedFiles: []string{"src/main.go"},
+			files: map[string][]byte{
+				"docker/build.Dockerfile":              []byte("FROM scratch\nCOPY src/ src/\n"),
+				"docker/build.Dockerfile.dockerignore": []byte("src/\n"),
+			},
+			want: false,
+		},
+		{
+			name:         "trigger on Dockerfile-specific ignore change",
+			entries:      []dockerfileEntry{{Path: "docker/build.Dockerfile"}},
+			changedFiles: []string{"docker/build.Dockerfile.dockerignore"},
+			files: map[string][]byte{
+				"docker/build.Dockerfile": []byte("FROM scratch\nCOPY src/ src/\n"),
+			},
+			want: true,
+		},
+		{
+			name:         "conservatively trigger when ignore lookup fails",
+			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
+			changedFiles: []string{"docs/README.md"},
+			files: map[string][]byte{
+				"Dockerfile": selectiveDockerfile,
+			},
+			fileErrors: map[string]error{
+				"Dockerfile.dockerignore": errors.New("GitHub unavailable"),
+			},
+			want: true,
+		},
+		{
+			name:         "conservatively trigger on malformed ignore pattern",
+			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
+			changedFiles: []string{"docs/README.md"},
+			files: map[string][]byte{
+				"Dockerfile":    selectiveDockerfile,
+				".dockerignore": []byte("[\n"),
+			},
+			want: true,
+		},
+		{
 			name:         "trigger on .dockerignore change",
 			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
 			changedFiles: []string{".dockerignore"},
 			files:        map[string][]byte{"Dockerfile": selectiveDockerfile},
+			want:         true,
+		},
+		{
+			name:         "trigger on normalized COPY source",
+			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
+			changedFiles: []string{"cmd/main.go"},
+			files:        map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY ./cmd/ /cmd/\n")},
+			want:         true,
+		},
+		{
+			name:         "normalize configured Dockerfile path",
+			entries:      []dockerfileEntry{{Path: "./docker/build.Dockerfile"}},
+			changedFiles: []string{"src/main.go"},
+			files:        map[string][]byte{"docker/build.Dockerfile": []byte("FROM scratch\nCOPY src/ src/\n")},
+			want:         true,
+		},
+		{
+			name:         "trigger on wildcard COPY source",
+			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
+			changedFiles: []string{"config/app.json"},
+			files:        map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY config/*.json /app/\n")},
 			want:         true,
 		},
 		{
@@ -283,11 +433,211 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ghc := &fakeGhClient{files: tt.files}
+			ghc := &fakeGhClient{files: tt.files, fileErrors: tt.fileErrors}
 			got := evaluateDockerfileChanges(tt.entries, tt.changedFiles, testProwJob(), ghc)
 			if got != tt.want {
 				t.Errorf("evaluateDockerfileChanges() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEvaluatePipelineRunCondition(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		changed     []string
+		files       map[string][]byte
+		want        bool
+		wantErr     bool
+	}{
+		{
+			name: "Dockerfile input matches",
+			annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`,
+			},
+			changed: []string{"cmd/main.go"},
+			files:   map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n")},
+			want:    true,
+		},
+		{
+			name: "Dockerfile input does not match",
+			annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`,
+			},
+			changed: []string{"docs/README.md"},
+			files:   map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n")},
+			want:    false,
+		},
+		{
+			name: "malformed Dockerfile annotation blocks conservatively",
+			annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[{`,
+			},
+			changed: []string{"docs/README.md"},
+			want:    true,
+			wantErr: true,
+		},
+		{
+			name: "empty Dockerfile annotation blocks conservatively",
+			annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[]`,
+			},
+			changed: []string{"docs/README.md"},
+			want:    true,
+			wantErr: true,
+		},
+		{
+			name: "run-if-changed takes precedence",
+			annotations: map[string]string{
+				"pipeline_run_if_changed":            `^docs/`,
+				"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`,
+			},
+			changed: []string{"cmd/main.go"},
+			files:   map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n")},
+			want:    false,
+		},
+		{
+			name:        "no pipeline condition",
+			annotations: map[string]string{},
+			changed:     []string{"cmd/main.go"},
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ghc := &fakeGhClient{files: tt.files}
+			got, err := evaluatePipelineRunCondition(tt.annotations, tt.changed, testProwJob(), ghc)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("evaluatePipelineRunCondition() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("evaluatePipelineRunCondition() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAcquireConditionalContextsSchedulesMalformedDockerfileAnnotation(t *testing.T) {
+	presubmit := config.Presubmit{
+		JobBase: config.JobBase{
+			Name: "pull-ci-openshift-hypershift-main-e2e",
+			Annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[{`,
+			},
+		},
+		RerunCommand: "/test e2e",
+	}
+	commands, manualMessage, err := acquireConditionalContexts(
+		context.Background(),
+		testProwJob(),
+		[]config.Presubmit{presubmit},
+		&fakeGhClient{},
+		func() {},
+		nil,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("acquireConditionalContexts() error = %v", err)
+	}
+	if commands != "\n/test e2e" {
+		t.Errorf("commands = %q, want %q", commands, "\n/test e2e")
+	}
+	if manualMessage != "" {
+		t.Errorf("manual message = %q, want empty", manualMessage)
+	}
+}
+
+func TestFetchFileUsesImmutableBaseSHA(t *testing.T) {
+	ghc := &fakeGhClient{files: map[string][]byte{"Dockerfile": []byte("FROM scratch\n")}}
+	if _, err := fetchFile(ghc, testProwJob(), "Dockerfile"); err != nil {
+		t.Fatalf("fetchFile() error = %v", err)
+	}
+	if len(ghc.refs) != 1 || ghc.refs[0] != "base-sha" {
+		t.Errorf("GetFile refs = %v, want [base-sha]", ghc.refs)
+	}
+}
+
+func TestChangedFilePathsIncludesRenameSource(t *testing.T) {
+	changes := []github.PullRequestChange{
+		{Filename: "cmd/new.go", Status: github.PullRequestFileRenamed, PreviousFilename: "pkg/old.go"},
+		{Filename: "README.md", Status: string(github.PullRequestFileModified)},
+	}
+	want := []string{"cmd/new.go", "pkg/old.go", "README.md"}
+	got := changedFilePaths(changes)
+	if len(got) != len(want) {
+		t.Fatalf("changedFilePaths() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("changedFilePaths()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestHandlePipelineContextCreationDockerfileCondition(t *testing.T) {
+	var enabled enabledConfig
+	if err := yaml.Unmarshal([]byte(`
+orgs:
+- org: openshift
+  repos:
+  - name: hypershift
+    branches:
+    - main
+`), &enabled); err != nil {
+		t.Fatalf("failed to create enabled config: %v", err)
+	}
+
+	ghc := &fakeGhClient{
+		files: map[string][]byte{
+			"Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n"),
+		},
+		changes: []github.PullRequestChange{{Filename: "cmd/main.go", Status: string(github.PullRequestFileModified)}},
+	}
+	provider := &ConfigDataProvider{updatedPresubmits: map[string]presubmitTests{
+		"openshift/hypershift": {
+			pipelineConditionallyRequired: []config.Presubmit{{
+				JobBase: config.JobBase{
+					Name: "pull-ci-openshift-hypershift-main-e2e",
+					Annotations: map[string]string{
+						"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`,
+					},
+				},
+				Reporter: config.Reporter{Context: "ci/prow/e2e"},
+			}},
+		},
+	}}
+	cw := &clientWrapper{
+		ghc:                ghc,
+		configDataProvider: provider,
+		watcher:            &watcher{config: enabled},
+		lgtmWatcher:        &watcher{},
+	}
+	event := github.PullRequestEvent{
+		Action: github.PullRequestActionOpened,
+		Repo:   github.Repo{Owner: github.User{Login: "openshift"}, Name: "hypershift"},
+		PullRequest: github.PullRequest{
+			Number: 42,
+			Base:   github.PullRequestBranch{Ref: "main", SHA: "base-sha"},
+			Head:   github.PullRequestBranch{SHA: "head-sha"},
+		},
+	}
+
+	cw.handlePipelineContextCreation(logrus.NewEntry(logrus.New()), event)
+
+	if len(ghc.statuses) != 1 {
+		t.Fatalf("created statuses = %v, want exactly one", ghc.statuses)
+	}
+	if ghc.statusRefs[0] != "head-sha" {
+		t.Errorf("status ref = %q, want head-sha", ghc.statusRefs[0])
+	}
+	if got := ghc.statuses[0]; got.Context != "ci/prow/e2e" || got.State != "pending" || got.Description != PipelinePendingMessage {
+		t.Errorf("status = %#v, want pending ci/prow/e2e pipeline status", got)
+	}
+	for _, ref := range ghc.refs {
+		if ref != "base-sha" {
+			t.Errorf("GetFile ref = %q, want immutable base-sha", ref)
+		}
 	}
 }

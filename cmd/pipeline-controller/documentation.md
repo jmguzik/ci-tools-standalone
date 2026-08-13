@@ -167,15 +167,15 @@ Add the annotation to your test configuration in the ci-operator config file:
 
 ### `pipeline_run_if_dockerfile_changed`
 
-This annotation specifies that a test should run **only if** files that feed into the specified Dockerfile(s) have changed. Instead of hand-maintaining regex patterns, the pipeline controller automatically determines which files matter by parsing the Dockerfile's `COPY` and `ADD` instructions.
+This annotation specifies that a test should run **only if** files that feed into the specified Dockerfile(s) have changed. Instead of hand-maintaining regex patterns, the pipeline controller automatically determines which files matter by parsing the Dockerfile's `COPY`/`ADD` instructions and `RUN` bind mounts.
 
 **How it works:**
-- The controller fetches each listed Dockerfile from the base branch and parses its `COPY`/`ADD` instructions
-- If any changed file falls within a source path referenced by a `COPY` or `ADD` instruction, the test will be triggered
+- The controller fetches each listed Dockerfile from the base commit and parses its `COPY`/`ADD` instructions and `RUN --mount=type=bind` sources
+- If any changed file falls within a referenced build-context source path, the test will be triggered
 - The test always runs if any of these files changed: the Dockerfile itself, `.dockerignore`, `go.mod`, `go.sum`, or `Makefile`
-- `COPY --from=<stage>` instructions (inter-stage copies) are ignored — only copies from the build context are considered
-- `.dockerignore` rules are applied: files excluded by `.dockerignore` will not trigger the test
-- If the Dockerfile contains `COPY . .` (broad copy), the test is conservatively triggered for any file change
+- `COPY --from=<stage>` and bind mounts from an earlier Dockerfile stage are ignored because that stage's inputs are evaluated separately; unknown named contexts trigger the test conservatively
+- Dockerfile-specific ignore rules (`<Dockerfile>.dockerignore`) take precedence over the root `.dockerignore`, matching Docker behavior
+- If the Dockerfile uses the whole build context or an input cannot be evaluated safely, the test is conservatively triggered for any file change
 
 **How to add it:**
 
@@ -226,4 +226,3 @@ To enroll repository with the pipeline controller, you need to add it to the app
 ### For Manual or Automatic Mode
 
 Repository needs to be added to the main pipeline controller configuration file. Contact your platform team or CI/CD administrators to have your repository added with the desired mode (`manual` or `auto`).
-

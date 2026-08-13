@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
@@ -137,17 +138,16 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				}
 				shouldRun = shouldRunResult
 			} else if dockerfileAnnotation, ok := presubmit.Annotations["pipeline_run_if_dockerfile_changed"]; ok && dockerfileAnnotation != "" {
-				var entries []dockerfileEntry
-				if err := json.Unmarshal([]byte(dockerfileAnnotation), &entries); err != nil {
-					deleteIds()
-					return "", "", fmt.Errorf("failed to parse pipeline_run_if_dockerfile_changed annotation: %w", err)
-				}
 				changedFiles, err := cfp()
 				if err != nil {
 					deleteIds()
 					return "", "", err
 				}
-				shouldRun = evaluateDockerfileChanges(entries, changedFiles, pj, ghc)
+				shouldRunResult, err := evaluateDockerfileAnnotation(dockerfileAnnotation, changedFiles, pj, ghc)
+				if err != nil {
+					logrus.WithError(err).WithField("test", presubmit.Name).Error("failed to evaluate Dockerfile condition, conservatively scheduling test")
+				}
+				shouldRun = shouldRunResult
 			} else {
 				shouldRun = true
 			}

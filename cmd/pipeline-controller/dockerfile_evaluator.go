@@ -2,6 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path"
+	"strconv"
 	"strings"
 
 	"github.com/moby/buildkit/frontend/dockerfile/command"
@@ -11,6 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
+	"sigs.k8s.io/prow/pkg/github"
 )
 
 type dockerfileEntry struct {
@@ -25,7 +31,22 @@ var alwaysTriggerFiles = map[string]bool{
 	".dockerignore": true,
 }
 
+func evaluateDockerfileAnnotation(annotation string, changedFiles []string, pj *v1.ProwJob, ghc minimalGhClient) (bool, error) {
+	var entries []dockerfileEntry
+	if err := json.Unmarshal([]byte(annotation), &entries); err != nil {
+		return true, fmt.Errorf("failed to parse pipeline_run_if_dockerfile_changed annotation: %w", err)
+	}
+	if len(entries) == 0 {
+		return true, fmt.Errorf("pipeline_run_if_dockerfile_changed annotation must contain at least one Dockerfile")
+	}
+	return evaluateDockerfileChanges(entries, changedFiles, pj, ghc), nil
+}
+
 func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string, pj *v1.ProwJob, ghc minimalGhClient) bool {
+	if len(entries) == 0 {
+		return true
+	}
+
 	for _, f := range changedFiles {
 		if alwaysTriggerFiles[f] {
 			return true
@@ -33,8 +54,14 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 	}
 
 	for _, entry := range entries {
+		dockerfilePath := normalizeBuildContextPath(entry.Path)
+		if dockerfilePath == "" {
+			return true
+		}
+
 		for _, f := range changedFiles {
-			if f == entry.Path {
+			changedPath := normalizeBuildContextPath(f)
+			if changedPath == dockerfilePath || changedPath == dockerfilePath+".dockerignore" {
 				return true
 			}
 		}
@@ -45,9 +72,9 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 			return true
 		}
 
-		dockerfileContent, err := fetchFile(ghc, pj, entry.Path)
+		dockerfileContent, err := fetchFile(ghc, pj, dockerfilePath)
 		if err != nil {
-			logrus.WithError(err).WithField("dockerfile", entry.Path).Warn("Failed to fetch Dockerfile, conservatively triggering test")
+			logrus.WithError(err).WithField("dockerfile", dockerfilePath).Warn("Failed to fetch Dockerfile, conservatively triggering test")
 			return true
 		}
 
@@ -56,12 +83,24 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 			return true
 		}
 
-		dockerignoreContent, _ := fetchFile(ghc, pj, ".dockerignore")
-		pm := buildIgnoreMatcher(dockerignoreContent)
+		dockerignoreContent, err := fetchDockerignore(ghc, pj, dockerfilePath)
+		if err != nil {
+			logrus.WithError(err).WithField("dockerfile", dockerfilePath).Warn("Failed to fetch Docker ignore rules, conservatively triggering test")
+			return true
+		}
+		pm, err := buildIgnoreMatcher(dockerignoreContent)
+		if err != nil {
+			logrus.WithError(err).WithField("dockerfile", dockerfilePath).Warn("Failed to parse Docker ignore rules, conservatively triggering test")
+			return true
+		}
 
 		for _, changedFile := range changedFiles {
 			if pm != nil {
-				excluded, _ := pm.MatchesOrParentMatches(changedFile)
+				excluded, err := pm.MatchesOrParentMatches(changedFile)
+				if err != nil {
+					logrus.WithError(err).WithField("dockerfile", dockerfilePath).Warn("Failed to match Docker ignore rules, conservatively triggering test")
+					return true
+				}
 				if excluded {
 					continue
 				}
@@ -80,12 +119,35 @@ func fetchFile(ghc minimalGhClient, pj *v1.ProwJob, path string) ([]byte, error)
 	if pj.Spec.Refs == nil {
 		return nil, nil
 	}
-	return ghc.GetFile(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, path, pj.Spec.Refs.BaseRef)
+	ref := pj.Spec.Refs.BaseSHA
+	if ref == "" {
+		ref = pj.Spec.Refs.BaseRef
+	}
+	return ghc.GetFile(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, path, ref)
 }
 
-// parseDockerfileSources uses the buildkit parser to extract COPY/ADD source
-// paths from a Dockerfile. It returns the list of source paths and whether a
-// broad copy (COPY . .) was detected.
+func fetchDockerignore(ghc minimalGhClient, pj *v1.ProwJob, dockerfilePath string) ([]byte, error) {
+	for _, ignorePath := range []string{dockerfilePath + ".dockerignore", ".dockerignore"} {
+		content, err := fetchFile(ghc, pj, ignorePath)
+		if err == nil {
+			return content, nil
+		}
+		if isFileNotFound(err) {
+			continue
+		}
+		return nil, fmt.Errorf("failed to fetch %s: %w", ignorePath, err)
+	}
+	return nil, nil
+}
+
+func isFileNotFound(err error) bool {
+	var fileNotFound *github.FileNotFound
+	return errors.As(err, &fileNotFound) || github.IsNotFound(err)
+}
+
+// parseDockerfileSources uses the buildkit parser to extract build-context
+// paths from COPY/ADD instructions and RUN bind mounts. It returns the list of
+// source paths and whether an input could not be narrowed safely.
 func parseDockerfileSources(content []byte) (sources []string, broadCopy bool) {
 	if content == nil {
 		return nil, true
@@ -97,10 +159,23 @@ func parseDockerfileSources(content []byte) (sources []string, broadCopy bool) {
 		return nil, true
 	}
 
+	stages := make(map[string]int)
+	currentStage := -1
 	for _, child := range result.AST.Children {
 		switch strings.ToLower(child.Value) {
+		case command.From:
+			currentStage++
+			if alias := dockerfileStageAlias(child); alias != "" {
+				stages[strings.ToLower(alias)] = currentStage
+			}
 		case command.Copy, command.Add:
-			srcs, isBroad := extractCopySources(child)
+			srcs, isBroad := extractCopySources(child, stages, currentStage)
+			if isBroad {
+				return nil, true
+			}
+			sources = append(sources, srcs...)
+		case command.Run:
+			srcs, isBroad := extractRunMountSources(child, stages, currentStage)
 			if isBroad {
 				return nil, true
 			}
@@ -111,13 +186,28 @@ func parseDockerfileSources(content []byte) (sources []string, broadCopy bool) {
 	return sources, false
 }
 
+func dockerfileStageAlias(node *parser.Node) string {
+	for arg := node.Next; arg != nil && arg.Next != nil; arg = arg.Next {
+		if strings.EqualFold(arg.Value, "as") {
+			return arg.Next.Value
+		}
+	}
+	return ""
+}
+
 // extractCopySources extracts the source paths from a COPY or ADD AST node.
-// Returns nil, true if the instruction copies from "." (broad copy).
-// Returns empty slice for --from=<stage> instructions (inter-stage copies).
-func extractCopySources(node *parser.Node) ([]string, bool) {
+// Returns nil, true if the instruction copies from "." or an external context.
+// Returns an empty slice for copies from an earlier Dockerfile stage.
+func extractCopySources(node *parser.Node, stages map[string]int, currentStage int) ([]string, bool) {
 	for _, flag := range node.Flags {
 		if strings.HasPrefix(flag, "--from=") {
-			return nil, false
+			from := strings.TrimPrefix(flag, "--from=")
+			if isPreviousDockerfileStage(from, stages, currentStage) {
+				return nil, false
+			}
+			// --from can also name an additional build context. Its local inputs
+			// cannot be derived from the Dockerfile alone.
+			return nil, true
 		}
 	}
 
@@ -134,8 +224,14 @@ func extractCopySources(node *parser.Node) ([]string, bool) {
 	srcs := args[:len(args)-1]
 	var result []string
 	for _, src := range srcs {
-		cleaned := strings.TrimRight(src, "/")
-		if cleaned == "." || cleaned == "" {
+		// Build arguments cannot be resolved without the build invocation, and
+		// path.Match does not support Docker's globstar extension. Run the test
+		// conservatively instead of risking a false negative.
+		if strings.Contains(src, "$") || strings.Contains(src, "**") {
+			return nil, true
+		}
+		cleaned := normalizeBuildContextPath(src)
+		if cleaned == "" {
 			return nil, true
 		}
 		result = append(result, cleaned)
@@ -143,25 +239,102 @@ func extractCopySources(node *parser.Node) ([]string, bool) {
 	return result, false
 }
 
-func buildIgnoreMatcher(dockerignoreContent []byte) *patternmatcher.PatternMatcher {
+func extractRunMountSources(node *parser.Node, stages map[string]int, currentStage int) ([]string, bool) {
+	var sources []string
+	for _, flag := range node.Flags {
+		if !strings.HasPrefix(flag, "--mount=") {
+			continue
+		}
+		options := make(map[string]string)
+		for _, option := range strings.Split(strings.TrimPrefix(flag, "--mount="), ",") {
+			key, value, found := strings.Cut(option, "=")
+			if found {
+				options[strings.ToLower(key)] = value
+			}
+		}
+		mountType := strings.ToLower(options["type"])
+		if mountType != "" && mountType != "bind" {
+			continue
+		}
+		if from := options["from"]; from != "" {
+			if isPreviousDockerfileStage(from, stages, currentStage) {
+				continue
+			}
+			return nil, true
+		}
+		source := options["source"]
+		if source == "" {
+			source = options["src"]
+		}
+		if source == "" || strings.Contains(source, "$") || strings.Contains(source, "**") {
+			return nil, true
+		}
+		source = normalizeBuildContextPath(source)
+		if source == "" {
+			return nil, true
+		}
+		sources = append(sources, source)
+	}
+	return sources, false
+}
+
+func isPreviousDockerfileStage(from string, stages map[string]int, currentStage int) bool {
+	if index, err := strconv.Atoi(from); err == nil {
+		return index >= 0 && index < currentStage
+	}
+	index, ok := stages[strings.ToLower(from)]
+	return ok && index < currentStage
+}
+
+// normalizeBuildContextPath applies BuildKit's treatment of COPY/ADD sources:
+// sources are rooted in the build context, leading slashes and parent traversal
+// are removed, and trailing slashes are insignificant.
+func normalizeBuildContextPath(source string) string {
+	return strings.TrimPrefix(path.Clean("/"+source), "/")
+}
+
+func buildIgnoreMatcher(dockerignoreContent []byte) (*patternmatcher.PatternMatcher, error) {
 	if dockerignoreContent == nil {
-		return nil
+		return nil, nil
 	}
 	patterns, err := ignorefile.ReadAll(bytes.NewReader(dockerignoreContent))
 	if err != nil {
-		logrus.WithError(err).Warn("Failed to parse .dockerignore")
-		return nil
+		return nil, fmt.Errorf("failed to read .dockerignore: %w", err)
 	}
 	pm, err := patternmatcher.New(patterns)
 	if err != nil {
-		logrus.WithError(err).Warn("Failed to compile .dockerignore patterns")
-		return nil
+		return nil, fmt.Errorf("failed to compile .dockerignore patterns: %w", err)
 	}
-	return pm
+	return pm, nil
 }
 
 // pathMatchesSource checks whether a changed file falls within a COPY source path.
 func pathMatchesSource(changedFile, source string) bool {
+	changedFile = normalizeBuildContextPath(changedFile)
+	source = normalizeBuildContextPath(source)
+	if source == "" || strings.Contains(source, "**") {
+		return true
+	}
+
+	if strings.ContainsAny(source, "*?[") {
+		// A wildcard may select either the changed file or a parent directory
+		// whose contents are copied recursively.
+		for candidate := changedFile; candidate != "" && candidate != "."; candidate = path.Dir(candidate) {
+			matched, err := path.Match(source, candidate)
+			if err != nil {
+				return true
+			}
+			if matched {
+				return true
+			}
+			parent := path.Dir(candidate)
+			if parent == candidate || parent == "." {
+				break
+			}
+		}
+		return false
+	}
+
 	if changedFile == source {
 		return true
 	}

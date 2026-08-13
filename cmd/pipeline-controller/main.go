@@ -610,30 +610,34 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		return
 	}
 
-	filenames := make([]string, 0, len(changedFiles))
-	for _, change := range changedFiles {
-		filenames = append(filenames, change.Filename)
-	}
+	filenames := changedFilePaths(changedFiles)
 
 	// Filter tests by branch - only process tests that match the target branch
 	repoBaseRef := repo + "-" + baseBranch
 
-	// Evaluate pipeline_run_if_changed tests
+	pipelineProwJob := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: &v1.Refs{
+		Org:     org,
+		Repo:    repo,
+		BaseRef: baseBranch,
+		BaseSHA: event.PullRequest.Base.SHA,
+	}}}
+
+	// Evaluate pipeline_run_if_changed and pipeline_run_if_dockerfile_changed tests
 	for _, presubmit := range presubmits.pipelineConditionallyRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if pattern, ok := presubmit.Annotations["pipeline_run_if_changed"]; ok && pattern != "" {
-			if shouldRun, err := matchesPattern(pattern, filenames); err != nil {
-				logger.WithError(err).WithField("test", presubmit.Name).WithField("pattern", pattern).Error("failed to evaluate pattern")
-				continue
-			} else if shouldRun {
-				if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
-					logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
-				} else {
-					logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
-				}
-			}
+		shouldRun, err := evaluatePipelineRunCondition(presubmit.Annotations, filenames, pipelineProwJob, cw.ghc)
+		if err != nil {
+			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to evaluate pipeline run condition")
+		}
+		if !shouldRun {
+			continue
+		}
+		if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
+			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
+		} else {
+			logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
 		}
 	}
 
@@ -677,6 +681,27 @@ func (cw *clientWrapper) createContext(org, repo, sha, context, state, descripti
 		State:       state,
 		Description: description,
 	})
+}
+
+func evaluatePipelineRunCondition(annotations map[string]string, changedFiles []string, pj *v1.ProwJob, ghc minimalGhClient) (bool, error) {
+	if pattern := annotations["pipeline_run_if_changed"]; pattern != "" {
+		return matchesPattern(pattern, changedFiles)
+	}
+	if annotation := annotations["pipeline_run_if_dockerfile_changed"]; annotation != "" {
+		return evaluateDockerfileAnnotation(annotation, changedFiles, pj, ghc)
+	}
+	return false, nil
+}
+
+func changedFilePaths(changes []github.PullRequestChange) []string {
+	paths := make([]string, 0, len(changes))
+	for _, change := range changes {
+		paths = append(paths, change.Filename)
+		if change.Status == github.PullRequestFileRenamed && change.PreviousFilename != "" {
+			paths = append(paths, change.PreviousFilename)
+		}
+	}
+	return paths
 }
 
 // matchesPattern checks if any of the filenames match the given regex pattern
