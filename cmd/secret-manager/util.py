@@ -401,6 +401,13 @@ def update_index_secret(
         new_version = client.add_secret_version(
             parent=name, payload=SecretPayload(data=payload.encode("utf-8"))
         )
-        destroy_previous_versions(client, name, new_version.name)
     except Exception as e:
         raise click.ClickException(f"Error while updating index: '{e}'.")
+
+    try:
+        destroy_previous_versions(client, name, new_version.name)
+    except Exception as e:
+        click.echo(
+            f"Warning: index for collection '{collection}' was updated, but failed to clean up previous versions: {e}",
+            err=True,
+        )

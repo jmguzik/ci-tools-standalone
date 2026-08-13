@@ -87,8 +87,6 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
             parent=full_secret_path,
             payload=SecretPayload(data=create_payload(from_file, from_literal)),
         )
-        destroy_previous_versions(client, full_secret_path, new_version.name)
-        click.echo(f"Secret '{secret_path}' updated successfully.")
     except PermissionDenied:
         raise click.ClickException(
             f"You don't have permission to update secrets in collection '{collection}'"
@@ -96,4 +94,14 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
     except Exception as e:
         raise click.ClickException(
             f"Failed to update secret '{secret_path}': {e}."
+        )
+
+    click.echo(f"Secret '{secret_path}' updated successfully.")
+
+    try:
+        destroy_previous_versions(client, full_secret_path, new_version.name)
+    except Exception as e:
+        click.echo(
+            f"Warning: secret '{secret_path}' was updated, but failed to clean up previous versions: {e}",
+            err=True,
         )
