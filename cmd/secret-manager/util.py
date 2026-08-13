@@ -361,18 +361,23 @@ def destroy_previous_versions(
     current_version_name: str,
 ):
     """
-    Destroys all enabled secret versions except the current one to prevent cost accumulation.
+    Destroys enabled secret versions to prevent cost accumulation, keeping only the
+    current version and the one immediately preceding it as a rollback fallback.
 
     Args:
         client (secretmanager.SecretManagerServiceClient): Secret Manager client.
         secret_path (str): Full resource path of the secret.
         current_version_name (str): Name of the version to keep.
     """
+    previous_versions = []
     for v in client.list_secret_versions(
         request={"parent": secret_path, "filter": "state:ENABLED"}
     ):
-        if v.name == current_version_name:
-            continue
+        if v.name != current_version_name:
+            previous_versions.append(v)
+
+    previous_versions.sort(key=lambda version: version.create_time, reverse=True)
+    for v in previous_versions[1:]:
         client.destroy_secret_version(request={"name": v.name})
 
 
