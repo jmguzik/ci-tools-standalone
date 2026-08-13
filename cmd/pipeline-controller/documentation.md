@@ -176,6 +176,7 @@ This annotation specifies that a test should run **only if** files that feed int
 - `COPY --from=<stage>` and bind mounts from an earlier Dockerfile stage are ignored because that stage's inputs are evaluated separately; unknown named contexts trigger the test conservatively
 - Dockerfile-specific ignore rules (`<Dockerfile>.dockerignore`) take precedence over the root `.dockerignore`, matching Docker behavior
 - If the Dockerfile uses the whole build context or an input cannot be evaluated safely, the test is conservatively triggered for any file change
+- Inputs introduced by an `ONBUILD` instruction inherited from a base image cannot be discovered from the Dockerfile text; do not use this condition for Dockerfiles based on images with inherited `ONBUILD COPY`, `ADD`, or bind-mount triggers
 
 **How to add it:**
 

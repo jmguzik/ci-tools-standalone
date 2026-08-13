@@ -24,6 +24,51 @@ type minimalGhClient interface {
 	GetFile(org, repo, filepath, commit string) ([]byte, error)
 }
 
+type cachedFileResult struct {
+	content []byte
+	err     error
+}
+
+type fileCachingGhClient struct {
+	minimalGhClient
+	files map[string]cachedFileResult
+}
+
+func newFileCachingGhClient(ghc minimalGhClient) minimalGhClient {
+	return &fileCachingGhClient{minimalGhClient: ghc, files: make(map[string]cachedFileResult)}
+}
+
+func (c *fileCachingGhClient) GetFile(org, repo, filepath, commit string) ([]byte, error) {
+	key := org + "\x00" + repo + "\x00" + filepath + "\x00" + commit
+	if result, ok := c.files[key]; ok {
+		return result.content, result.err
+	}
+	content, err := c.minimalGhClient.GetFile(org, repo, filepath, commit)
+	c.files[key] = cachedFileResult{content: content, err: err}
+	return content, err
+}
+
+func newDeferredChangedFilesProvider(ghc minimalGhClient, org, repo string, number int) config.ChangedFilesProvider {
+	var (
+		fetched bool
+		files   []string
+		err     error
+	)
+	return func() ([]string, error) {
+		if !fetched {
+			fetched = true
+			var changes []github.PullRequestChange
+			changes, err = ghc.GetPullRequestChanges(org, repo, number)
+			if err != nil {
+				err = fmt.Errorf("error getting pull request changes: %w", err)
+			} else {
+				files = changedFilePaths(changes)
+			}
+		}
+		return files, err
+	}
+}
+
 func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader) error {
 	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, false)
 }
@@ -81,7 +126,7 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 
 	// If no tests matched, send an informative comment instead of staying silent
 	if comment == "" {
-		comment = fmt.Sprintf("**Pipeline controller notification**\n\nNo second-stage tests were triggered for this PR.\n\nThis can happen when:\n- The changed files don't match any `pipeline_run_if_changed` patterns\n- All files match `pipeline_skip_if_only_changed` patterns\n- No pipeline-controlled jobs are defined for the `%s` branch\n\nUse `/test ?` to see all available tests.", pj.Spec.Refs.BaseRef)
+		comment = fmt.Sprintf("**Pipeline controller notification**\n\nNo second-stage tests were triggered for this PR.\n\nThis can happen when:\n- The changed files don't match any `pipeline_run_if_changed` patterns\n- The changed files don't feed into any configured `pipeline_run_if_dockerfile_changed` Dockerfiles\n- All files match `pipeline_skip_if_only_changed` patterns\n- No pipeline-controlled jobs are defined for the `%s` branch\n\nUse `/test ?` to see all available tests.", pj.Spec.Refs.BaseRef)
 	}
 
 	if err := ghc.CreateComment(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, comment); err != nil {
@@ -99,7 +144,8 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 	var testCommands string
 	if len(pipelineConditionallyRequired) != 0 {
-		cfp := config.NewGitHubDeferredChangedFilesProvider(ghc, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
+		cfp := newDeferredChangedFilesProvider(ghc, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
+		fileClient := newFileCachingGhClient(ghc)
 
 		// First, determine which tests should run based on file changes
 		var testsToRun []config.Presubmit
@@ -143,7 +189,7 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 					deleteIds()
 					return "", "", err
 				}
-				shouldRunResult, err := evaluateDockerfileAnnotation(dockerfileAnnotation, changedFiles, pj, ghc)
+				shouldRunResult, err := evaluateDockerfileAnnotation(dockerfileAnnotation, changedFiles, pj, fileClient)
 				if err != nil {
 					logrus.WithError(err).WithField("test", presubmit.Name).Error("failed to evaluate Dockerfile condition, conservatively scheduling test")
 				}

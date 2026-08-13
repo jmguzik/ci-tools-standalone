@@ -78,37 +78,33 @@ func (c *ConfigDataProvider) gatherDataForRepos(orgRepos []string) {
 
 		for _, p := range presubmits {
 			if !p.AlwaysRun && p.RunIfChanged == "" && p.SkipIfOnlyChanged == "" {
-				if val, ok := p.Annotations["pipeline_run_if_changed"]; ok && val != "" {
+				if p.Annotations["pipeline_run_if_changed"] != "" {
 					pre := updatedPresubmits[orgRepo]
 					pre.pipelineConditionallyRequired = append(pre.pipelineConditionallyRequired, p)
 					updatedPresubmits[orgRepo] = pre
 					continue
 				}
 				// Also check for pipeline_skip_if_only_changed annotation
-				if val, ok := p.Annotations["pipeline_skip_if_only_changed"]; ok && val != "" {
+				if p.Annotations["pipeline_skip_if_only_changed"] != "" {
 					pre := updatedPresubmits[orgRepo]
 					pre.pipelineSkipOnlyRequired = append(pre.pipelineSkipOnlyRequired, p)
 					updatedPresubmits[orgRepo] = pre
 					continue
 				}
 				// Check for pipeline_run_if_dockerfile_changed annotation
-				if val, ok := p.Annotations["pipeline_run_if_dockerfile_changed"]; ok && val != "" {
+				if p.Annotations["pipeline_run_if_dockerfile_changed"] != "" {
 					pre := updatedPresubmits[orgRepo]
 					pre.pipelineConditionallyRequired = append(pre.pipelineConditionallyRequired, p)
 					updatedPresubmits[orgRepo] = pre
 					continue
 				}
-				// Only categorize as protected if it doesn't have pipeline annotations
+				// Empty or absent conditional annotations are not valid conditions.
+				// Keep a required job protected instead of silently dropping it from
+				// controller ownership.
 				if !p.Optional {
-					if _, hasPipelineRun := p.Annotations["pipeline_run_if_changed"]; !hasPipelineRun {
-						if _, hasPipelineSkip := p.Annotations["pipeline_skip_if_only_changed"]; !hasPipelineSkip {
-							if _, hasDockerfile := p.Annotations["pipeline_run_if_dockerfile_changed"]; !hasDockerfile {
-								pre := updatedPresubmits[orgRepo]
-								pre.protected = append(pre.protected, p)
-								updatedPresubmits[orgRepo] = pre
-							}
-						}
-					}
+					pre := updatedPresubmits[orgRepo]
+					pre.protected = append(pre.protected, p)
+					updatedPresubmits[orgRepo] = pre
 				}
 			}
 			if !p.Optional && p.AlwaysRun {

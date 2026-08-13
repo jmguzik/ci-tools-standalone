@@ -14,12 +14,14 @@ import (
 )
 
 type fakeGhClient struct {
-	files      map[string][]byte
-	fileErrors map[string]error
-	refs       []string
-	changes    []github.PullRequestChange
-	statuses   []github.Status
-	statusRefs []string
+	files          map[string][]byte
+	fileErrors     map[string]error
+	fileRequests   map[string]int
+	refs           []string
+	changes        []github.PullRequestChange
+	changeRequests int
+	statuses       []github.Status
+	statusRefs     []string
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
@@ -29,6 +31,7 @@ func (f *fakeGhClient) CreateComment(org, repo string, number int, comment strin
 	return nil
 }
 func (f *fakeGhClient) GetPullRequestChanges(org, repo string, number int) ([]github.PullRequestChange, error) {
+	f.changeRequests++
 	return f.changes, nil
 }
 func (f *fakeGhClient) CreateStatus(org, repo, ref string, s github.Status) error {
@@ -41,6 +44,10 @@ func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.La
 	return nil, nil
 }
 func (f *fakeGhClient) GetFile(org, repo, filepath, commit string) ([]byte, error) {
+	if f.fileRequests == nil {
+		f.fileRequests = make(map[string]int)
+	}
+	f.fileRequests[filepath]++
 	f.refs = append(f.refs, commit)
 	if err, ok := f.fileErrors[filepath]; ok {
 		return nil, err
@@ -559,6 +566,20 @@ func TestFetchFileUsesImmutableBaseSHA(t *testing.T) {
 	}
 }
 
+func TestNewPullRequestProwJobPreservesRefs(t *testing.T) {
+	pj := newPullRequestProwJob("openshift", "hypershift", "release-4.20", "base-sha", 42, "head-sha")
+	refs := pj.Spec.Refs
+	if refs == nil {
+		t.Fatal("newPullRequestProwJob() returned nil refs")
+	}
+	if refs.Org != "openshift" || refs.Repo != "hypershift" || refs.BaseRef != "release-4.20" || refs.BaseSHA != "base-sha" {
+		t.Errorf("refs = %#v, want complete immutable base refs", refs)
+	}
+	if len(refs.Pulls) != 1 || refs.Pulls[0].Number != 42 || refs.Pulls[0].SHA != "head-sha" {
+		t.Errorf("pulls = %#v, want PR 42 at head-sha", refs.Pulls)
+	}
+}
+
 func TestChangedFilePathsIncludesRenameSource(t *testing.T) {
 	changes := []github.PullRequestChange{
 		{Filename: "cmd/new.go", Status: github.PullRequestFileRenamed, PreviousFilename: "pkg/old.go"},
@@ -573,6 +594,173 @@ func TestChangedFilePathsIncludesRenameSource(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("changedFilePaths()[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestDeferredChangedFilesProviderIncludesRenameSourceAndCaches(t *testing.T) {
+	ghc := &fakeGhClient{changes: []github.PullRequestChange{{
+		Filename:         "docs/new.go",
+		PreviousFilename: "pkg/old.go",
+		Status:           github.PullRequestFileRenamed,
+	}}}
+	provider := newDeferredChangedFilesProvider(ghc, "openshift", "hypershift", 42)
+
+	for i := 0; i < 2; i++ {
+		got, err := provider()
+		if err != nil {
+			t.Fatalf("provider() error = %v", err)
+		}
+		want := []string{"docs/new.go", "pkg/old.go"}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("provider() = %v, want %v", got, want)
+		}
+	}
+	if ghc.changeRequests != 1 {
+		t.Errorf("GetPullRequestChanges calls = %d, want 1", ghc.changeRequests)
+	}
+}
+
+func TestExistingPipelineConditionsScheduleRenameSource(t *testing.T) {
+	changes := []github.PullRequestChange{{
+		Filename:         "docs/new.go",
+		PreviousFilename: "pkg/old.go",
+		Status:           github.PullRequestFileRenamed,
+	}}
+	for _, tc := range []struct {
+		name       string
+		annotation string
+		pattern    string
+	}{
+		{name: "run if changed", annotation: "pipeline_run_if_changed", pattern: `^pkg/`},
+		{name: "skip if only changed", annotation: "pipeline_skip_if_only_changed", pattern: `^docs/`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			presubmit := config.Presubmit{
+				JobBase: config.JobBase{
+					Name:        "pull-ci-openshift-hypershift-main-e2e",
+					Annotations: map[string]string{tc.annotation: tc.pattern},
+				},
+				Trigger:      `^/test e2e$`,
+				RerunCommand: "/test e2e",
+			}
+			paths := changedFilePaths(changes)
+			if tc.annotation == "pipeline_run_if_changed" {
+				shouldRun, err := matchesPattern(tc.pattern, paths)
+				if err != nil || !shouldRun {
+					t.Fatalf("context decision = %v, %v; want run", shouldRun, err)
+				}
+			} else {
+				shouldSkip, err := allFilesMatchPattern(tc.pattern, paths)
+				if err != nil || shouldSkip {
+					t.Fatalf("context decision = skip %v, %v; want run", shouldSkip, err)
+				}
+			}
+
+			ghc := &fakeGhClient{changes: changes}
+			commands, _, err := acquireConditionalContexts(context.Background(), testProwJob(), []config.Presubmit{presubmit}, ghc, func() {}, nil, false)
+			if err != nil {
+				t.Fatalf("acquireConditionalContexts() error = %v", err)
+			}
+			if commands != "\n/test e2e" {
+				t.Errorf("commands = %q, want %q", commands, "\n/test e2e")
+			}
+		})
+	}
+}
+
+func TestAcquireConditionalContextsCachesDockerfileReads(t *testing.T) {
+	ghc := &fakeGhClient{
+		files:   map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n")},
+		changes: []github.PullRequestChange{{Filename: "docs/README.md", Status: string(github.PullRequestFileModified)}},
+	}
+	presubmits := []config.Presubmit{
+		{
+			JobBase:      config.JobBase{Name: "pull-ci-openshift-hypershift-main-first", Annotations: map[string]string{"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`}},
+			RerunCommand: "/test first",
+		},
+		{
+			JobBase:      config.JobBase{Name: "pull-ci-openshift-hypershift-main-second", Annotations: map[string]string{"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`}},
+			RerunCommand: "/test second",
+		},
+	}
+
+	commands, _, err := acquireConditionalContexts(context.Background(), testProwJob(), presubmits, ghc, func() {}, nil, false)
+	if err != nil {
+		t.Fatalf("acquireConditionalContexts() error = %v", err)
+	}
+	if commands != "" {
+		t.Errorf("commands = %q, want no commands", commands)
+	}
+	for _, filepath := range []string{"Dockerfile", "Dockerfile.dockerignore", ".dockerignore"} {
+		if ghc.fileRequests[filepath] != 1 {
+			t.Errorf("GetFile(%q) calls = %d, want 1", filepath, ghc.fileRequests[filepath])
+		}
+	}
+	if ghc.changeRequests != 1 {
+		t.Errorf("GetPullRequestChanges calls = %d, want 1", ghc.changeRequests)
+	}
+}
+
+func TestDockerfileConditionContextAndSchedulingAgreeOnRename(t *testing.T) {
+	var enabled enabledConfig
+	if err := yaml.Unmarshal([]byte(`
+orgs:
+- org: openshift
+  repos:
+  - name: hypershift
+    branches:
+    - main
+`), &enabled); err != nil {
+		t.Fatalf("failed to create enabled config: %v", err)
+	}
+
+	presubmit := config.Presubmit{
+		JobBase: config.JobBase{
+			Name: "pull-ci-openshift-hypershift-main-e2e",
+			Annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[{"path":"Dockerfile"}]`,
+			},
+		},
+		RerunCommand: "/test e2e",
+		Reporter:     config.Reporter{Context: "ci/prow/e2e"},
+	}
+	ghc := &fakeGhClient{
+		files: map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY pkg/ pkg/\n")},
+		changes: []github.PullRequestChange{{
+			Filename:         "docs/old.go",
+			PreviousFilename: "pkg/old.go",
+			Status:           github.PullRequestFileRenamed,
+		}},
+	}
+	cw := &clientWrapper{
+		ghc: ghc,
+		configDataProvider: &ConfigDataProvider{updatedPresubmits: map[string]presubmitTests{
+			"openshift/hypershift": {pipelineConditionallyRequired: []config.Presubmit{presubmit}},
+		}},
+		watcher:     &watcher{config: enabled},
+		lgtmWatcher: &watcher{},
+	}
+	event := github.PullRequestEvent{
+		Action: github.PullRequestActionOpened,
+		Repo:   github.Repo{Owner: github.User{Login: "openshift"}, Name: "hypershift"},
+		PullRequest: github.PullRequest{
+			Number: 42,
+			Base:   github.PullRequestBranch{Ref: "main", SHA: "base-sha"},
+			Head:   github.PullRequestBranch{SHA: "head-sha"},
+		},
+	}
+
+	cw.handlePipelineContextCreation(logrus.NewEntry(logrus.New()), event)
+	if len(ghc.statuses) != 1 || ghc.statuses[0].Context != "ci/prow/e2e" || ghc.statuses[0].State != "pending" {
+		t.Fatalf("webhook statuses = %#v, want one pending e2e status", ghc.statuses)
+	}
+
+	commands, _, err := acquireConditionalContexts(context.Background(), testProwJob(), []config.Presubmit{presubmit}, ghc, func() {}, nil, false)
+	if err != nil {
+		t.Fatalf("acquireConditionalContexts() error = %v", err)
+	}
+	if commands != "\n/test e2e" {
+		t.Errorf("commands = %q, want %q", commands, "\n/test e2e")
 	}
 }
 

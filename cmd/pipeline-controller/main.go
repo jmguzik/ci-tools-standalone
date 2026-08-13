@@ -107,6 +107,19 @@ type clientWrapper struct {
 	mu                 sync.RWMutex // Protects against race conditions in event handling
 }
 
+func newPullRequestProwJob(org, repo, baseRef, baseSHA string, number int, headSHA string) *v1.ProwJob {
+	return &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: &v1.Refs{
+		Org:     org,
+		Repo:    repo,
+		BaseRef: baseRef,
+		BaseSHA: baseSHA,
+		Pulls: []v1.Pull{{
+			Number: number,
+			SHA:    headSHA,
+		}},
+	}}}
+}
+
 // isBranchEnabled checks if the branch is enabled for the given repo configuration
 // If branches list is empty, all branches are enabled
 func isBranchEnabled(branches []string, branch string) bool {
@@ -305,18 +318,7 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 			return
 		}
 
-		prowJob := &v1.ProwJob{
-			Spec: v1.ProwJobSpec{
-				Refs: &v1.Refs{
-					Org:     org,
-					Repo:    repo,
-					BaseRef: event.PullRequest.Base.Ref,
-					Pulls: []v1.Pull{
-						{Number: event.PullRequest.Number, SHA: event.PullRequest.Head.SHA},
-					},
-				},
-			},
-		}
+		prowJob := newPullRequestProwJob(org, repo, event.PullRequest.Base.Ref, event.PullRequest.Base.SHA, event.PullRequest.Number, event.PullRequest.Head.SHA)
 
 		// If SHA is missing, log a warning but continue (status check will be skipped)
 		if event.PullRequest.Head.SHA == "" {
@@ -487,18 +489,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		// trigger second-stage tests immediately.
 		firstStageComplete := false
 		if cw.pjLister != nil && pr.Head.SHA != "" {
-			prowJob := &v1.ProwJob{
-				Spec: v1.ProwJobSpec{
-					Refs: &v1.Refs{
-						Org:     org,
-						Repo:    repo,
-						BaseRef: pr.Base.Ref,
-						Pulls: []v1.Pull{
-							{Number: number, SHA: pr.Head.SHA},
-						},
-					},
-				},
-			}
+			prowJob := newPullRequestProwJob(org, repo, pr.Base.Ref, pr.Base.SHA, number, pr.Head.SHA)
 			var err error
 			firstStageComplete, err = checkFirstStageComplete(context.Background(), cw.pjLister, prowJob, presubmits)
 			if err != nil {
@@ -514,18 +505,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 
 	// For /pipeline required (or /pipeline auto when first-stage already passed),
 	// trigger tests immediately. Create a ProwJob to reuse existing logic.
-	prowJob := &v1.ProwJob{
-		Spec: v1.ProwJobSpec{
-			Refs: &v1.Refs{
-				Org:     org,
-				Repo:    repo,
-				BaseRef: pr.Base.Ref,
-				Pulls: []v1.Pull{
-					{Number: number, SHA: pr.Head.SHA},
-				},
-			},
-		},
-	}
+	prowJob := newPullRequestProwJob(org, repo, pr.Base.Ref, pr.Base.SHA, number, pr.Head.SHA)
 
 	// Generate the comment with test/override commands
 	// Pass true for isExplicitCommand since this is an explicit /pipeline required command
@@ -615,19 +595,15 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 	// Filter tests by branch - only process tests that match the target branch
 	repoBaseRef := repo + "-" + baseBranch
 
-	pipelineProwJob := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: &v1.Refs{
-		Org:     org,
-		Repo:    repo,
-		BaseRef: baseBranch,
-		BaseSHA: event.PullRequest.Base.SHA,
-	}}}
+	pipelineProwJob := newPullRequestProwJob(org, repo, baseBranch, event.PullRequest.Base.SHA, number, sha)
+	fileClient := newFileCachingGhClient(cw.ghc)
 
 	// Evaluate pipeline_run_if_changed and pipeline_run_if_dockerfile_changed tests
 	for _, presubmit := range presubmits.pipelineConditionallyRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		shouldRun, err := evaluatePipelineRunCondition(presubmit.Annotations, filenames, pipelineProwJob, cw.ghc)
+		shouldRun, err := evaluatePipelineRunCondition(presubmit.Annotations, filenames, pipelineProwJob, fileClient)
 		if err != nil {
 			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to evaluate pipeline run condition")
 		}
