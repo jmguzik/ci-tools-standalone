@@ -79,6 +79,7 @@ The pipeline controller automatically detects which tests should run based on:
 2. **Conditionally required tests**: Tests that run based on file changes using:
    - `pipeline_run_if_changed`: Tests run if matching files changed
    - `pipeline_skip_if_only_changed`: Tests skip if only matching files changed
+   - `pipeline_run_if_dockerfile_changed`: Tests run if a changed file feeds a configured Docker build context
 
 The controller analyzes the files changed in your PR and determines which tests are relevant.
 
@@ -87,7 +88,7 @@ The controller analyzes the files changed in your PR and determines which tests 
 Always required second-stage tests are tests that:
 - Have `always_run: false` (they don't run automatically in the first stage)
 - Are **not** marked as `optional: true` (they are required to pass)
-- Do not have conditional annotations (`pipeline_run_if_changed` or `pipeline_skip_if_only_changed`)
+- Do not have conditional annotations (`pipeline_run_if_changed`, `pipeline_skip_if_only_changed`, or `pipeline_run_if_dockerfile_changed`)
 
 These tests will always be triggered by the pipeline controller in the second stage, regardless of file changes. They represent essential tests that must pass before a PR can be merged, but are expensive enough to run only after the first-stage tests pass.
 
@@ -171,11 +172,12 @@ This annotation specifies that a test should run **only if** files that feed int
 
 **How it works:**
 - The controller fetches each listed Dockerfile from the base commit and parses its `COPY`/`ADD` instructions and `RUN --mount=type=bind` sources
-- If any changed file falls within a referenced build-context source path, the test will be triggered
-- The test always runs if any of these files changed: the Dockerfile itself, `.dockerignore`, `go.mod`, `go.sum`, or `Makefile`
+- `context_dir` identifies the repository directory used as the Docker build context and defaults to the repository root; the required `path` is relative to that directory
+- If any changed file inside that context falls within a referenced build-context source path, the test will be triggered
+- The test always runs if the Dockerfile, its context's `.dockerignore`, `go.mod`, `go.sum`, or `Makefile` changes
 - `COPY --from=<stage>` and bind mounts from an earlier Dockerfile stage are ignored because that stage's inputs are evaluated separately; unknown named contexts trigger the test conservatively
-- Dockerfile-specific ignore rules (`<Dockerfile>.dockerignore`) take precedence over the root `.dockerignore`, matching Docker behavior
-- If the Dockerfile uses the whole build context or an input cannot be evaluated safely, the test is conservatively triggered for any file change
+- Dockerfile-specific ignore rules (`<Dockerfile>.dockerignore`) take precedence over `.dockerignore` at the context root, matching Docker behavior
+- If the Dockerfile uses the whole build context or an input cannot be evaluated safely, the test is conservatively triggered for any file change within that build context
 - Inputs introduced by an `ONBUILD` instruction inherited from a base image cannot be discovered from the Dockerfile text; do not use this condition for Dockerfiles based on images with inherited `ONBUILD COPY`, `ADD`, or bind-mount triggers
 
 **How to add it:**
@@ -187,7 +189,8 @@ Add the field to your test configuration in the ci-operator config file:
   as: e2e-aws
   pipeline_run_if_dockerfile_changed:
     - path: Dockerfile
-    - path: Dockerfile.control-plane
+    - context_dir: images/control-plane
+      path: Dockerfile
   steps:
     workflow: hypershift-hostedcluster-e2e-aws
 ```

@@ -21,14 +21,14 @@ import (
 
 type dockerfileEntry struct {
 	Path            string   `json:"path"`
+	ContextDir      string   `json:"context_dir,omitempty"`
 	GoBinaryTargets []string `json:"go_binary_targets,omitempty"`
 }
 
-var alwaysTriggerFiles = map[string]bool{
-	"go.mod":        true,
-	"go.sum":        true,
-	"Makefile":      true,
-	".dockerignore": true,
+var alwaysTriggerContextFiles = map[string]bool{
+	"go.mod":   true,
+	"go.sum":   true,
+	"Makefile": true,
 }
 
 func evaluateDockerfileAnnotation(annotation string, changedFiles []string, pj *v1.ProwJob, ghc minimalGhClient) (bool, error) {
@@ -47,23 +47,31 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 		return true
 	}
 
-	for _, f := range changedFiles {
-		if alwaysTriggerFiles[f] {
-			return true
-		}
-	}
-
 	for _, entry := range entries {
-		dockerfilePath := normalizeBuildContextPath(entry.Path)
+		contextDir := normalizeBuildContextPath(entry.ContextDir)
+		dockerfilePath := buildContextRepoPath(contextDir, entry.Path)
 		if dockerfilePath == "" {
 			return true
 		}
+		contextDockerignorePath := buildContextRepoPath(contextDir, ".dockerignore")
+		var contextChangedFiles []string
 
 		for _, f := range changedFiles {
 			changedPath := normalizeBuildContextPath(f)
-			if changedPath == dockerfilePath || changedPath == dockerfilePath+".dockerignore" {
+			if changedPath == dockerfilePath || changedPath == dockerfilePath+".dockerignore" || changedPath == contextDockerignorePath {
 				return true
 			}
+			contextPath, inContext := buildContextRelativePath(contextDir, changedPath)
+			if !inContext {
+				continue
+			}
+			contextChangedFiles = append(contextChangedFiles, contextPath)
+			if alwaysTriggerContextFiles[contextPath] {
+				return true
+			}
+		}
+		if len(contextChangedFiles) == 0 {
+			continue
 		}
 
 		if len(entry.GoBinaryTargets) > 0 {
@@ -83,7 +91,7 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 			return true
 		}
 
-		dockerignoreContent, err := fetchDockerignore(ghc, pj, dockerfilePath)
+		dockerignoreContent, err := fetchDockerignore(ghc, pj, dockerfilePath, contextDir)
 		if err != nil {
 			logrus.WithError(err).WithField("dockerfile", dockerfilePath).Warn("Failed to fetch Docker ignore rules, conservatively triggering test")
 			return true
@@ -94,9 +102,9 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 			return true
 		}
 
-		for _, changedFile := range changedFiles {
+		for _, contextPath := range contextChangedFiles {
 			if pm != nil {
-				excluded, err := pm.MatchesOrParentMatches(changedFile)
+				excluded, err := pm.MatchesOrParentMatches(contextPath)
 				if err != nil {
 					logrus.WithError(err).WithField("dockerfile", dockerfilePath).Warn("Failed to match Docker ignore rules, conservatively triggering test")
 					return true
@@ -106,7 +114,7 @@ func evaluateDockerfileChanges(entries []dockerfileEntry, changedFiles []string,
 				}
 			}
 			for _, src := range sourcePaths {
-				if pathMatchesSource(changedFile, src) {
+				if pathMatchesSource(contextPath, src) {
 					return true
 				}
 			}
@@ -126,8 +134,8 @@ func fetchFile(ghc minimalGhClient, pj *v1.ProwJob, path string) ([]byte, error)
 	return ghc.GetFile(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, path, ref)
 }
 
-func fetchDockerignore(ghc minimalGhClient, pj *v1.ProwJob, dockerfilePath string) ([]byte, error) {
-	for _, ignorePath := range []string{dockerfilePath + ".dockerignore", ".dockerignore"} {
+func fetchDockerignore(ghc minimalGhClient, pj *v1.ProwJob, dockerfilePath, contextDir string) ([]byte, error) {
+	for _, ignorePath := range []string{dockerfilePath + ".dockerignore", buildContextRepoPath(contextDir, ".dockerignore")} {
 		content, err := fetchFile(ghc, pj, ignorePath)
 		if err == nil {
 			return content, nil
@@ -291,6 +299,27 @@ func isPreviousDockerfileStage(from string, stages map[string]int, currentStage 
 // are removed, and trailing slashes are insignificant.
 func normalizeBuildContextPath(source string) string {
 	return strings.TrimPrefix(path.Clean("/"+source), "/")
+}
+
+func buildContextRepoPath(contextDir, contextPath string) string {
+	return normalizeBuildContextPath(path.Join(normalizeBuildContextPath(contextDir), normalizeBuildContextPath(contextPath)))
+}
+
+// buildContextRelativePath converts a repository-relative changed path to the
+// path visible inside the Docker build context.
+func buildContextRelativePath(contextDir, repoPath string) (string, bool) {
+	repoPath = normalizeBuildContextPath(repoPath)
+	if contextDir == "" {
+		return repoPath, true
+	}
+	if repoPath == contextDir {
+		return "", true
+	}
+	prefix := contextDir + "/"
+	if !strings.HasPrefix(repoPath, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(repoPath, prefix), true
 }
 
 func buildIgnoreMatcher(dockerignoreContent []byte) (*patternmatcher.PatternMatcher, error) {

@@ -14,14 +14,15 @@ import (
 )
 
 type fakeGhClient struct {
-	files          map[string][]byte
-	fileErrors     map[string]error
-	fileRequests   map[string]int
-	refs           []string
-	changes        []github.PullRequestChange
-	changeRequests int
-	statuses       []github.Status
-	statusRefs     []string
+	files           map[string][]byte
+	fileErrors      map[string]error
+	fileRequests    map[string]int
+	fileRequestHook func()
+	refs            []string
+	changes         []github.PullRequestChange
+	changeRequests  int
+	statuses        []github.Status
+	statusRefs      []string
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
@@ -44,6 +45,9 @@ func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.La
 	return nil, nil
 }
 func (f *fakeGhClient) GetFile(org, repo, filepath, commit string) ([]byte, error) {
+	if f.fileRequestHook != nil {
+		f.fileRequestHook()
+	}
 	if f.fileRequests == nil {
 		f.fileRequests = make(map[string]int)
 	}
@@ -293,6 +297,30 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 			want:         true,
 		},
 		{
+			name:         "trigger on matching COPY source within context dir",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/cmd/main.go"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         true,
+		},
+		{
+			name:         "skip matching-looking path outside context dir",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"cmd/main.go"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         false,
+		},
+		{
+			name:         "Dockerfile path is always relative to context dir",
+			entries:      []dockerfileEntry{{Path: "images/api/Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/cmd/main.go"},
+			files: map[string][]byte{
+				"images/api/images/api/Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n"),
+				"images/api/Dockerfile":            []byte("FROM scratch\nCOPY docs/ docs/\n"),
+			},
+			want: true,
+		},
+		{
 			name:         "skip on unrelated file",
 			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
 			changedFiles: []string{"docs/README.md"},
@@ -308,6 +336,61 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 				".dockerignore": dockerignore,
 			},
 			want: false,
+		},
+		{
+			name:         "context dir uses its own dockerignore",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/bin/hypershift"},
+			files: map[string][]byte{
+				"images/api/Dockerfile":    []byte("FROM golang:1.21\nCOPY bin/ bin/\n"),
+				"images/api/.dockerignore": []byte("bin/\n"),
+			},
+			want: false,
+		},
+		{
+			name:         "context dir does not use repository root dockerignore",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/cmd/main.go"},
+			files: map[string][]byte{
+				"images/api/Dockerfile": []byte("FROM golang:1.21\nCOPY cmd/ cmd/\n"),
+				".dockerignore":         []byte("cmd/\n"),
+			},
+			want: true,
+		},
+		{
+			name:         "context go.mod always triggers",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/go.mod"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         true,
+		},
+		{
+			name:         "repository root go.mod does not trigger nested context",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"go.mod"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         false,
+		},
+		{
+			name:         "repository root dockerignore does not trigger nested context",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{".dockerignore"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         false,
+		},
+		{
+			name:         "context Dockerfile change always triggers",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/Dockerfile"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         true,
+		},
+		{
+			name:         "context dockerignore change always triggers",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/.dockerignore"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         true,
 		},
 		{
 			name:         "Dockerfile-specific ignore takes precedence over root",
@@ -397,11 +480,32 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 			want:         true,
 		},
 		{
+			name:         "go_binary_targets ignore changes outside context dir",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api", GoBinaryTargets: []string{"./cmd/server"}}},
+			changedFiles: []string{"docs/README.md"},
+			files:        map[string][]byte{"images/api/Dockerfile": selectiveDockerfile},
+			want:         false,
+		},
+		{
 			name:         "conservatively trigger on broad COPY",
 			entries:      []dockerfileEntry{{Path: "Dockerfile"}},
 			changedFiles: []string{"docs/README.md"},
 			files:        map[string][]byte{"Dockerfile": []byte("FROM golang:1.21\nCOPY . .\n")},
 			want:         true,
+		},
+		{
+			name:         "broad COPY triggers on change within context dir",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"images/api/docs/README.md"},
+			files:        map[string][]byte{"images/api/Dockerfile": []byte("FROM golang:1.21\nCOPY . .\n")},
+			want:         true,
+		},
+		{
+			name:         "broad COPY ignores change outside context dir",
+			entries:      []dockerfileEntry{{Path: "Dockerfile", ContextDir: "images/api"}},
+			changedFiles: []string{"docs/README.md"},
+			files:        map[string][]byte{"images/api/Dockerfile": []byte("FROM golang:1.21\nCOPY . .\n")},
+			want:         false,
 		},
 		{
 			name:         "conservatively trigger on fetch error",
@@ -475,6 +579,15 @@ func TestEvaluatePipelineRunCondition(t *testing.T) {
 			changed: []string{"docs/README.md"},
 			files:   map[string][]byte{"Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n")},
 			want:    false,
+		},
+		{
+			name: "Dockerfile input matches within context dir",
+			annotations: map[string]string{
+				"pipeline_run_if_dockerfile_changed": `[{"context_dir":"images/api","path":"Dockerfile"}]`,
+			},
+			changed: []string{"images/api/cmd/main.go"},
+			files:   map[string][]byte{"images/api/Dockerfile": []byte("FROM scratch\nCOPY cmd/ cmd/\n")},
+			want:    true,
 		},
 		{
 			name: "malformed Dockerfile annotation blocks conservatively",
@@ -802,6 +915,14 @@ orgs:
 		watcher:            &watcher{config: enabled},
 		lgtmWatcher:        &watcher{},
 	}
+	fileReadsOutsideLock := true
+	ghc.fileRequestHook = func() {
+		if !cw.mu.TryLock() {
+			fileReadsOutsideLock = false
+			return
+		}
+		cw.mu.Unlock()
+	}
 	event := github.PullRequestEvent{
 		Action: github.PullRequestActionOpened,
 		Repo:   github.Repo{Owner: github.User{Login: "openshift"}, Name: "hypershift"},
@@ -827,5 +948,8 @@ orgs:
 		if ref != "base-sha" {
 			t.Errorf("GetFile ref = %q, want immutable base-sha", ref)
 		}
+	}
+	if !fileReadsOutsideLock {
+		t.Error("Dockerfile reads happened while the controller-wide lock was held")
 	}
 }

@@ -516,9 +516,6 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 
 // handlePipelineContextCreation handles PR events (open, push, reopen) and creates contexts for matching tests
 func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event github.PullRequestEvent) {
-	cw.mu.Lock()
-	defer cw.mu.Unlock()
-
 	logger := l.WithFields(logrus.Fields{
 		"handler": "handlePipelineContextCreation",
 		"action":  event.Action,
@@ -597,6 +594,12 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 
 	pipelineProwJob := newPullRequestProwJob(org, repo, baseBranch, event.PullRequest.Base.SHA, number, sha)
 	fileClient := newFileCachingGhClient(cw.ghc)
+	type pendingContext struct {
+		testName       string
+		context        string
+		successMessage string
+	}
+	var pendingContexts []pendingContext
 
 	// Evaluate pipeline_run_if_changed and pipeline_run_if_dockerfile_changed tests
 	for _, presubmit := range presubmits.pipelineConditionallyRequired {
@@ -610,11 +613,11 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		if !shouldRun {
 			continue
 		}
-		if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
-			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
-		} else {
-			logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
-		}
+		pendingContexts = append(pendingContexts, pendingContext{
+			testName:       presubmit.Name,
+			context:        presubmit.Context,
+			successMessage: "created pending context for pipeline test",
+		})
 	}
 
 	// Evaluate pipeline_skip_if_only_changed tests
@@ -628,11 +631,11 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 				continue
 			} else if !shouldSkip {
 				// If not all files match the skip pattern, we should run the test
-				if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
-					logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
-				} else {
-					logger.WithField("test", presubmit.Name).Info("created pending context for pipeline test")
-				}
+				pendingContexts = append(pendingContexts, pendingContext{
+					testName:       presubmit.Name,
+					context:        presubmit.Context,
+					successMessage: "created pending context for pipeline test",
+				})
 			}
 		}
 	}
@@ -642,10 +645,23 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
-			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
+		pendingContexts = append(pendingContexts, pendingContext{
+			testName:       presubmit.Name,
+			context:        presubmit.Context,
+			successMessage: "created pending context for protected test",
+		})
+	}
+
+	// Dockerfile evaluation can require several GitHub file reads. Keep those
+	// reads outside the controller-wide critical section, then serialize only
+	// the status mutations with the other event handlers.
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	for _, pending := range pendingContexts {
+		if err := cw.createContext(org, repo, sha, pending.context, "pending", PipelinePendingMessage); err != nil {
+			logger.WithError(err).WithField("test", pending.testName).Error("failed to create context")
 		} else {
-			logger.WithField("test", presubmit.Name).Info("created pending context for protected test")
+			logger.WithField("test", pending.testName).Info(pending.successMessage)
 		}
 	}
 }
