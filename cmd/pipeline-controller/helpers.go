@@ -55,6 +55,13 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 			if !strings.Contains(presubmit.Name, repoBaseRef) {
 				continue
 			}
+			// Skip re-triggering if a ProwJob already exists at the same SHA
+			// (unless this is an explicit /pipeline required command)
+			if !isExplicitCommand && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
+				if existsAtSHA(context.Background(), pjLister, pj, presubmit.Name) {
+					continue
+				}
+			}
 			protectedCommands += "\n" + presubmit.RerunCommand
 		}
 		if protectedCommands != "" {
@@ -185,6 +192,35 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 		}
 	}
 	return testCommands, "", nil
+}
+
+// existsAtSHA checks whether a ProwJob with the given job name already exists
+// for the same org/repo/PR/baseRef at the same HEAD SHA. This is used to avoid
+// re-triggering tests that were already triggered (e.g. via /pipeline required)
+// when an event like /lgtm fires at the same commit.
+func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, jobName string) bool {
+	selector := map[string]string{
+		kube.OrgLabel:         pj.Spec.Refs.Org,
+		kube.RepoLabel:        pj.Spec.Refs.Repo,
+		kube.PullLabel:        fmt.Sprintf("%d", pj.Spec.Refs.Pulls[0].Number),
+		kube.BaseRefLabel:     pj.Spec.Refs.BaseRef,
+		kube.ProwJobTypeLabel: string(v1.PresubmitJob),
+	}
+
+	var pjs v1.ProwJobList
+	if err := pjLister.List(ctx, &pjs, ctrlruntimeclient.MatchingLabels(selector)); err != nil {
+		return false
+	}
+
+	for _, pjob := range pjs.Items {
+		if pjob.Spec.Job == jobName &&
+			pjob.Spec.Refs != nil &&
+			len(pjob.Spec.Refs.Pulls) > 0 &&
+			pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
+			return true
+		}
+	}
+	return false
 }
 
 // checkFirstStageComplete checks if all first-stage tests have completed
