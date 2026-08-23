@@ -3,12 +3,15 @@ package opsproxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -62,12 +65,43 @@ type amClient struct {
 	httpClient *http.Client
 }
 
-func NewAlertmanagerClient(baseURL string, token func() []byte) Alertmanager {
+func NewAlertmanagerClient(baseURL string, token func() []byte, caPath string) (Alertmanager, error) {
+	httpClient, err := alertmanagerHTTPClient(caPath)
+	if err != nil {
+		return nil, err
+	}
 	return &amClient{
 		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		token:      token,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: httpClient,
+	}, nil
+}
+
+func alertmanagerHTTPClient(caPath string) (*http.Client, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	if strings.TrimSpace(caPath) == "" {
+		return client, nil
 	}
+	pemBytes, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("read alertmanager CA %s: %w", caPath, err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("alertmanager CA %s contained no certificates", caPath)
+	}
+	tlsCfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+		cloned := tr.Clone()
+		cloned.TLSClientConfig = tlsCfg
+		client.Transport = cloned
+		return client, nil
+	}
+	client.Transport = &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsCfg}
+	return client, nil
 }
 
 type amStatusError struct {

@@ -33,6 +33,7 @@ type options struct {
 	ackAllowlist          string
 	alertmanagerURL       string
 	alertmanagerTokenPath string
+	alertmanagerCAPath    string
 	configmapNamespace    string
 	configmapName         string
 	reconcileInterval     time.Duration
@@ -53,6 +54,7 @@ func gatherOptions() (options, error) {
 	fs.StringVar(&o.ackAllowlist, "ack-allowlist", "", "Comma-separated Slack user IDs allowed to ack. Empty deny-all.")
 	fs.StringVar(&o.alertmanagerURL, "alertmanager-url", "", "Alertmanager base URL (required). Silences and alerts use /api/v2.")
 	fs.StringVar(&o.alertmanagerTokenPath, "alertmanager-token-path", "", "Optional path to a bearer token for the Alertmanager API.")
+	fs.StringVar(&o.alertmanagerCAPath, "alertmanager-ca-path", "", "Optional PEM CA file for Alertmanager HTTPS (OpenShift service-ca).")
 	fs.StringVar(&o.configmapNamespace, "configmap-namespace", "ci", "Namespace of the ops-proxy ConfigMap.")
 	fs.StringVar(&o.configmapName, "configmap-name", "ops-proxy", "Name of the ops-proxy ConfigMap.")
 	fs.DurationVar(&o.reconcileInterval, "reconcile-interval", time.Minute, "How often to reconcile from Alertmanager firing alerts and silences.")
@@ -116,7 +118,10 @@ func main() {
 		path := o.alertmanagerTokenPath
 		amToken = func() []byte { return secret.GetSecret(path) }
 	}
-	am := opsproxy.NewAlertmanagerClient(o.alertmanagerURL, amToken)
+	am, err := opsproxy.NewAlertmanagerClient(o.alertmanagerURL, amToken, o.alertmanagerCAPath)
+	if err != nil {
+		logrus.WithError(err).Fatal("Failed to create Alertmanager client")
+	}
 	slackPath := o.slackTokenPath
 	slackClient := opsproxy.NewSlackAPI(func() []byte { return secret.GetSecret(slackPath) })
 	store := opsproxy.NewStore(kubeClient, o.configmapNamespace, o.configmapName)

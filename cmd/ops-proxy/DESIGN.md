@@ -229,6 +229,8 @@ ops-proxy needs:
 
 Silence API: `POST /api/v2/silences`, `GET /api/v2/silences`, expire via the AM v2 delete/expire mechanism. Matchers from incident labels only.
 
+UWM Alertmanager is HTTPS with a service-CA serving cert. The AM HTTP client must load OpenShift `service-ca.crt` (`--alertmanager-ca-path`); the default system trust store is not enough.
+
 ## Relationship to openshift/release
 
 Cutover order:

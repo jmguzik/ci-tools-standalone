@@ -2,15 +2,34 @@ package opsproxy
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
+
+func mustAMClient(t *testing.T, baseURL string, token func() []byte, caPath string) Alertmanager {
+	t.Helper()
+	c, err := NewAlertmanagerClient(baseURL, token, caPath)
+	if err != nil {
+		t.Fatalf("NewAlertmanagerClient: %v", err)
+	}
+	return c
+}
 
 func TestAMClient(t *testing.T) {
 	t.Parallel()
@@ -40,7 +59,7 @@ func TestAMClient(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := NewAlertmanagerClient(srv.URL, func() []byte { return []byte("am-token") })
+	c := mustAMClient(t, srv.URL, func() []byte { return []byte("am-token") }, "")
 	ctx := context.Background()
 
 	alerts, err := c.ListAlerts(ctx)
@@ -100,8 +119,81 @@ func TestAMClient(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv404.Close)
-	c404 := NewAlertmanagerClient(srv404.URL, nil)
+	c404 := mustAMClient(t, srv404.URL, nil, "")
 	if err := c404.ExpireSilence(ctx, "already-gone"); err != nil {
 		t.Fatalf("expire 404 should be success: %v", err)
+	}
+}
+
+func TestAMClientCustomCA(t *testing.T) {
+	t.Parallel()
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ops-proxy-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "alertmanager"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"127.0.0.1", "localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafCert, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER}, PrivateKey: leafKey, Leaf: leafCert}}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := mustAMClient(t, srv.URL, nil, caPath)
+	if _, err := c.ListSilences(context.Background()); err != nil {
+		t.Fatalf("ListSilences with custom CA: %v", err)
+	}
+
+	if _, err := NewAlertmanagerClient(srv.URL, nil, ""); err != nil {
+		t.Fatalf("constructor with empty CA path: %v", err)
+	}
+	bare := mustAMClient(t, srv.URL, nil, "")
+	if _, err := bare.ListSilences(context.Background()); err == nil {
+		t.Fatal("expected TLS failure without service CA")
+	}
+	if _, err := NewAlertmanagerClient(srv.URL, nil, filepath.Join(t.TempDir(), "missing.pem")); err == nil {
+		t.Fatal("expected error for missing CA file")
 	}
 }

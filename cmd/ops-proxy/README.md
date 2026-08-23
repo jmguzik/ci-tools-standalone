@@ -47,6 +47,7 @@ Durations: `2h`, `4h`, `8h`, `16h`, `24h`, `2d`, `monday` (next Monday 00:00 UTC
 | `--ack-allowlist` | empty (deny all) | | Comma-separated Slack user IDs |
 | `--alertmanager-url` | | yes | AM base URL (`/api/v2/alerts`, `/api/v2/silences`) |
 | `--alertmanager-token-path` | | | Optional AM API bearer (in-cluster SA) |
+| `--alertmanager-ca-path` | | | Optional PEM CA for AM HTTPS (OpenShift `service-ca.crt`) |
 | `--configmap-namespace` | `ci` | | Incident store |
 | `--configmap-name` | `ops-proxy` | | Single JSON blob in data key `state` |
 | `--reconcile-interval` | `1m` | | Rebuild cards from AM firing + silences |
