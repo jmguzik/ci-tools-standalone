@@ -12,6 +12,7 @@ Standalone CI tools extracted from [openshift/ci-tools](https://github.com/opens
 | `determinize-peribolos` | Deterministically formats Peribolos org configuration YAML |
 | `gpu-scheduling-webhook` | Kubernetes mutating admission webhook for GPU/KVM workload scheduling |
 | `helpdesk-faq` | Web service that serves helpdesk FAQ items from Kubernetes ConfigMaps |
+| `ops-proxy` | Alertmanager webhook proxy: one Slack card per incident, ack-until-T silences, pinned board |
 | `pipeline-controller` | Kubernetes controller that manages CI pipeline resources |
 | `pr-reminder` | Sends Slack reminders to team members about PRs awaiting review |
 | `publicize` | Prow plugin that mirrors private PR merges to public repositories |
@@ -60,6 +61,7 @@ cmd/                    One subdirectory per tool
 internal/               Repo-private shared packages
   gzip/                 Gzip decompression utility
   helpdeskfaq/          Helpdesk FAQ client and types
+  opsproxy/             Ops-proxy identity, ConfigMap store, Slack board, AM silences
   prreminder/           PR reminder Rover types
   retester/             Retester logic and caches
 images/                 Dockerfiles per tool
