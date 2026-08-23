@@ -70,3 +70,16 @@ func TestValidateOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestTrimSecretBytes(t *testing.T) {
+	t.Parallel()
+	if got := string(trimSecretBytes([]byte("hook-token\n"))); got != "hook-token" {
+		t.Fatalf("newline: got %q", got)
+	}
+	if got := string(trimSecretBytes([]byte("  hook-token\r\n"))); got != "hook-token" {
+		t.Fatalf("spaces: got %q", got)
+	}
+	if len(trimSecretBytes([]byte(" \n\t"))) != 0 {
+		t.Fatal("whitespace-only secret must be empty after trim")
+	}
+}

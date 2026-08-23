@@ -1,6 +1,7 @@
 package opsproxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"encoding/json"
@@ -48,12 +49,13 @@ type Config struct {
 
 // Server is the ops-proxy HTTP surface and reconcile loop.
 type Server struct {
-	log   *logrus.Entry
-	cfg   Config
-	store *Store
-	am    Alertmanager
-	slack SlackClient
-	mu    sync.Mutex
+	log      *logrus.Entry
+	cfg      Config
+	store    *Store
+	am       Alertmanager
+	slack    SlackClient
+	mu       sync.Mutex
+	renderWG sync.WaitGroup
 }
 
 func NewServer(log *logrus.Entry, cfg Config, store *Store, am Alertmanager, slack SlackClient) *Server {
@@ -100,21 +102,49 @@ func (s *Server) handleHook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
 	}
+	events := eventsFromPayload(payload)
+	if len(events) == 0 {
+		s.log.Info("webhook contained no usable alerts")
+		s.writeOK(w)
+		return
+	}
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.ingestWebhook(r.Context(), payload); err != nil {
-		if errors.Is(err, ErrNoIdentity) {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+	resolved, err := s.persistWebhookEvents(r.Context(), events)
+	s.mu.Unlock()
+	if err != nil {
 		s.log.WithError(err).Error("webhook ingest failed")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.writeOK(w)
+	s.scheduleHookRender(resolved)
+}
+
+func (s *Server) writeOK(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]bool{"ok": true}); err != nil {
 		s.log.WithError(err).Error("failed to encode webhook response")
 	}
+}
+
+func (s *Server) scheduleHookRender(resolved []IncidentState) {
+	s.renderWG.Add(1)
+	go func() {
+		defer s.renderWG.Done()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, inc := range resolved {
+			s.markResolved(inc)
+		}
+		if err := s.renderLocked(context.Background()); err != nil {
+			s.log.WithError(err).Error("webhook render failed")
+		}
+	}()
+}
+
+func (s *Server) waitForIdle() {
+	s.renderWG.Wait()
 }
 
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
@@ -173,7 +203,7 @@ var (
 func (s *Server) requireBearer(w http.ResponseWriter, r *http.Request, tokenFn func() []byte) bool {
 	var want []byte
 	if tokenFn != nil {
-		want = tokenFn()
+		want = bytes.TrimSpace(tokenFn())
 	}
 	got := []byte(extractBearer(r.Header.Get("Authorization")))
 	if len(want) == 0 || !hmac.Equal(got, want) {
@@ -214,11 +244,7 @@ func ParseAllowlist(raw string) map[string]struct{} {
 	return out
 }
 
-func (s *Server) ingestWebhook(ctx context.Context, payload WebhookPayload) error {
-	events, err := eventsFromPayload(payload)
-	if err != nil {
-		return err
-	}
+func (s *Server) persistWebhookEvents(ctx context.Context, events []hookEvent) ([]IncidentState, error) {
 	var resolved []IncidentState
 	if _, err := s.store.Mutate(ctx, func(st *State) error {
 		resolved = nil
@@ -237,12 +263,9 @@ func (s *Server) ingestWebhook(ctx context.Context, payload WebhookPayload) erro
 		}
 		return nil
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	for _, inc := range resolved {
-		s.markResolved(inc)
-	}
-	return s.renderLocked(ctx)
+	return resolved, nil
 }
 
 type hookEvent struct {
@@ -251,13 +274,12 @@ type hookEvent struct {
 	firing bool
 }
 
-func eventsFromPayload(payload WebhookPayload) ([]hookEvent, error) {
+func eventsFromPayload(payload WebhookPayload) []hookEvent {
 	alerts := payload.Alerts
 	if len(alerts) == 0 {
 		alerts = []WebhookAlert{{Status: payload.Status, Labels: payload.CommonLabels}}
 	}
 	byID := map[string]hookEvent{}
-	var firstErr error
 	for _, a := range alerts {
 		labels := a.Labels
 		if len(labels) == 0 {
@@ -265,9 +287,6 @@ func eventsFromPayload(payload WebhookPayload) ([]hookEvent, error) {
 		}
 		id, err := IdentityFromLabels(labels)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
 			continue
 		}
 		status := a.Status
@@ -281,17 +300,11 @@ func eventsFromPayload(payload WebhookPayload) ([]hookEvent, error) {
 		}
 		byID[id.ID] = hookEvent{id: id, labels: copyLabels(labels), firing: firing}
 	}
-	if len(byID) == 0 {
-		if firstErr != nil {
-			return nil, firstErr
-		}
-		return nil, fmt.Errorf("%w: webhook contained no usable alerts", ErrNoIdentity)
-	}
 	out := make([]hookEvent, 0, len(byID))
 	for _, ev := range byID {
 		out = append(out, ev)
 	}
-	return out, nil
+	return out
 }
 
 func (s *Server) ack(ctx context.Context, req ActionRequest) error {
@@ -511,6 +524,12 @@ func (s *Server) Reconcile(ctx context.Context) error {
 		prev.Labels = copyLabels(a.Labels)
 		next[id.ID] = prev
 	}
+	var resolved []IncidentState
+	for id, inc := range st.Incidents {
+		if _, ok := next[id]; !ok {
+			resolved = append(resolved, inc)
+		}
+	}
 	for _, inc := range next {
 		if inc.SlackTS == "" {
 			s.log.Error("ops-proxy ConfigMap had no Slack timestamps for firing incidents; posting new Slack roots (fail visible)")
@@ -525,6 +544,9 @@ func (s *Server) Reconcile(ctx context.Context) error {
 		return nil
 	}); err != nil {
 		return err
+	}
+	for _, inc := range resolved {
+		s.markResolved(inc)
 	}
 	return s.renderLocked(ctx)
 }

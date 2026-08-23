@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"net/http"
@@ -116,22 +117,22 @@ func main() {
 	var amToken func() []byte
 	if o.alertmanagerTokenPath != "" {
 		path := o.alertmanagerTokenPath
-		amToken = func() []byte { return secret.GetSecret(path) }
+		amToken = func() []byte { return secretBytes(path) }
 	}
 	am, err := opsproxy.NewAlertmanagerClient(o.alertmanagerURL, amToken, o.alertmanagerCAPath)
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to create Alertmanager client")
 	}
 	slackPath := o.slackTokenPath
-	slackClient := opsproxy.NewSlackAPI(func() []byte { return secret.GetSecret(slackPath) })
+	slackClient := opsproxy.NewSlackAPI(func() []byte { return secretBytes(slackPath) })
 	store := opsproxy.NewStore(kubeClient, o.configmapNamespace, o.configmapName)
 	hookPath := o.hookTokenPath
 	apiPath := o.apiTokenPath
 	server := opsproxy.NewServer(
 		logrus.WithField("component", "ops-proxy"),
 		opsproxy.Config{
-			HookToken:    func() []byte { return secret.GetSecret(hookPath) },
-			APIToken:     func() []byte { return secret.GetSecret(apiPath) },
+			HookToken:    func() []byte { return secretBytes(hookPath) },
+			APIToken:     func() []byte { return secretBytes(apiPath) },
 			Allowlist:    opsproxy.ParseAllowlist(o.ackAllowlist),
 			SlackChannel: o.slackChannel,
 			SetTopic:     o.setChannelTopic,
@@ -155,4 +156,12 @@ func main() {
 	}, o.reconcileInterval)
 
 	interrupts.WaitForGracefulShutdown()
+}
+
+func secretBytes(path string) []byte {
+	return trimSecretBytes(secret.GetSecret(path))
+}
+
+func trimSecretBytes(b []byte) []byte {
+	return bytes.TrimSpace(b)
 }

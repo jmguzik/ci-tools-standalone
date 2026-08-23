@@ -296,15 +296,16 @@ func reasonWebhook(alertname, reason string) []byte {
 	return raw
 }
 
-func postHook(t *testing.T, h http.Handler, token string, body []byte) {
+func postHook(t *testing.T, s *Server, token string, body []byte) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/hook/alertmanager", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
+	s.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("hook status=%d body=%s", rr.Code, rr.Body.String())
 	}
+	s.waitForIdle()
 }
 
 func postAction(t *testing.T, h http.Handler, path, token string, body ActionRequest) *httptest.ResponseRecorder {
@@ -326,14 +327,7 @@ func TestAckHappyPath(t *testing.T) {
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
 	h := s.Handler()
-
-	hookReq := httptest.NewRequest(http.MethodPost, "/hook/alertmanager", bytes.NewReader(firingWebhook("infrastructure-job-failures", "periodic-foo")))
-	hookReq.Header.Set("Authorization", "Bearer hook-token")
-	hookRR := httptest.NewRecorder()
-	h.ServeHTTP(hookRR, hookReq)
-	if hookRR.Code != http.StatusOK {
-		t.Fatalf("hook status=%d body=%s", hookRR.Code, hookRR.Body.String())
-	}
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 
 	incidentID := "infrastructure-job-failures/periodic-foo"
 	ackBody, _ := json.Marshal(ActionRequest{IncidentID: incidentID, Duration: "24h", SlackUserID: "U123"})
@@ -390,14 +384,7 @@ func TestWebhookFiringThenResolved(t *testing.T) {
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
 	h := s.Handler()
-
-	hookReq := httptest.NewRequest(http.MethodPost, "/hook/alertmanager", bytes.NewReader(firingWebhook("infrastructure-job-failures", "periodic-foo")))
-	hookReq.Header.Set("Authorization", "Bearer hook-token")
-	hookRR := httptest.NewRecorder()
-	h.ServeHTTP(hookRR, hookReq)
-	if hookRR.Code != http.StatusOK {
-		t.Fatalf("firing status=%d body=%s", hookRR.Code, hookRR.Body.String())
-	}
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	st, err := s.store.Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -429,6 +416,7 @@ func TestWebhookFiringThenResolved(t *testing.T) {
 	if resRR.Code != http.StatusOK {
 		t.Fatalf("resolved status=%d body=%s", resRR.Code, resRR.Body.String())
 	}
+	s.waitForIdle()
 	st, err = s.store.Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +497,7 @@ func TestCMSilenceIDWithoutAMSilenceIsOpen(t *testing.T) {
 	am := &fakeAM{}
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
-	postHook(t, s.Handler(), "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	id := "infrastructure-job-failures/periodic-foo"
 	if _, err := s.store.Mutate(ctx, func(st *State) error {
 		inc := st.Incidents[id]
@@ -536,7 +524,7 @@ func TestAMSilenceWithEmptyCMCacheIsAcked(t *testing.T) {
 	am := &fakeAM{}
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
-	postHook(t, s.Handler(), "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	id := "infrastructure-job-failures/periodic-foo"
 	if _, err := s.store.Mutate(ctx, func(st *State) error {
 		inc := st.Incidents[id]
@@ -574,7 +562,7 @@ func TestListSilencesFailureDoesNotAckFromConfigMap(t *testing.T) {
 	am := &fakeAM{}
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
-	postHook(t, s.Handler(), "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	id := "infrastructure-job-failures/periodic-foo"
 	if _, err := s.store.Mutate(ctx, func(st *State) error {
 		inc := st.Incidents[id]
@@ -611,7 +599,7 @@ func TestUnackExpiresAMSilenceAndCardOpens(t *testing.T) {
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
 	h := s.Handler()
-	postHook(t, h, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	id := "infrastructure-job-failures/periodic-foo"
 	ackRR := postAction(t, h, "/ack", "api-token", ActionRequest{IncidentID: id, Duration: "24h", SlackUserID: "U123"})
 	if ackRR.Code != http.StatusOK {
@@ -655,7 +643,7 @@ func TestNeedsHumanDoesNotCreateSilence(t *testing.T) {
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
 	h := s.Handler()
-	postHook(t, h, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	id := "infrastructure-job-failures/periodic-foo"
 	rr := postAction(t, h, "/needs-human", "api-token", ActionRequest{IncidentID: id, SlackUserID: "U123"})
 	if rr.Code != http.StatusOK {
@@ -717,6 +705,48 @@ func TestReconcileRebuildsFromFiringAndSilences(t *testing.T) {
 	}
 }
 
+func TestHookUnusableAlertsOK(t *testing.T) {
+	t.Parallel()
+	s := testServer(t, "U123", "hook-token", "api-token", &fakeAM{}, &fakeSlack{})
+	body := []byte(`{"status":"firing","commonLabels":{"alertname":"Watchdog"},"alerts":[{"status":"firing","labels":{"alertname":"Watchdog"}}]}`)
+	postHook(t, s, "hook-token", body)
+	st, err := s.store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Incidents) != 0 {
+		t.Fatalf("unusable webhook created incidents: %#v", st.Incidents)
+	}
+}
+
+func TestReconcileResolvesDroppedCards(t *testing.T) {
+	t.Parallel()
+	am := &fakeAM{}
+	sl := &fakeSlack{}
+	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	id := "infrastructure-job-failures/periodic-foo"
+	if err := s.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.Incidents[id]; ok {
+		t.Fatalf("dropped incident still stored: %#v", st.Incidents)
+	}
+	if got := sl.lastIncidentText(id); got != "RESOLVED: "+id {
+		t.Fatalf("card=%q", got)
+	}
+}
+
+func TestRequireBearerTrimsToken(t *testing.T) {
+	t.Parallel()
+	s := testServer(t, "U123", "hook-token\n", "api-token", &fakeAM{}, &fakeSlack{})
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+}
+
 func TestGetAckWithoutBearerUnauthorized(t *testing.T) {
 	t.Parallel()
 	s := testServer(t, "U123", "hook-token", "api-token", &fakeAM{}, &fakeSlack{})
@@ -759,8 +789,8 @@ func TestAckCoalescedCIOperatorErrorPostsBothSilences(t *testing.T) {
 	sl := &fakeSlack{}
 	s := testServer(t, "U123", "hook-token", "api-token", am, sl)
 	h := s.Handler()
-	postHook(t, h, "hook-token", reasonWebhook("high-ci-operator-error-rate", "creating_release_images"))
-	postHook(t, h, "hook-token", reasonWebhook("high-ci-operator-infra-error-rate", "creating_release_images"))
+	postHook(t, s, "hook-token", reasonWebhook("high-ci-operator-error-rate", "creating_release_images"))
+	postHook(t, s, "hook-token", reasonWebhook("high-ci-operator-infra-error-rate", "creating_release_images"))
 	id := "ci-operator-error/creating_release_images"
 	st, err := s.store.Load(context.Background())
 	if err != nil {
@@ -823,8 +853,7 @@ func TestResolvedSlackOutsideConfigMapMutate(t *testing.T) {
 		SetTopic:     true,
 		Now:          func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
 	}, store, &fakeAM{}, sl)
-	h := s.Handler()
-	postHook(t, h, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
+	postHook(t, s, "hook-token", firingWebhook("infrastructure-job-failures", "periodic-foo"))
 	allowConflict.Store(true)
 
 	resolved := WebhookPayload{
@@ -845,7 +874,7 @@ func TestResolvedSlackOutsideConfigMapMutate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	postHook(t, h, "hook-token", raw)
+	postHook(t, s, "hook-token", raw)
 	if !conflicted.Load() {
 		t.Fatal("expected ConfigMap conflict retry")
 	}
