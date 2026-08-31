@@ -2,35 +2,26 @@
 # pylint: disable=E0401, C0413
 
 import re
-from typing import Dict
 
 import click
 from google.api_core.exceptions import NotFound, PermissionDenied
 from google.cloud import secretmanager
 from google.cloud.secretmanager import SecretPayload
 from util import (
+    JIRA_LABEL,
     PROJECT_ID,
+    REQUEST_INFO,
+    ROTATION_INSTRUCTIONS,
     check_if_collection_exists,
     create_payload,
+    ensure_authentication,
     get_secret_name,
     get_secrets_from_index,
     update_index_secret,
     validate_collection,
     validate_path,
     validate_secret_source,
-    ensure_authentication,
 )
-
-# Metadata keys used when creating secrets:
-# - JIRA_LABEL a label to associate the secret with a specific JIRA project.
-JIRA_LABEL = "jira-project"
-
-# - ROTATION_INSTRUCTIONS is an annotation that describes how the secret should be rotated.
-ROTATION_INSTRUCTIONS = "rotation-instructions"
-
-# - REQUEST_INFO is an annotation that describes how the secret was originally requested,
-#   to help trace who to contact in case of problems.
-REQUEST_INFO = "request-information"
 
 
 @click.command("create")
@@ -128,7 +119,7 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
         ) from e
 
 
-def prompt_for_labels() -> Dict[str, str]:
+def prompt_for_labels() -> dict[str, str]:
     click.echo(
         "Enter team JIRA project associated with this secret (e.g. 'art' for issues.redhat.com/browse/ART).\n"
         "Test Platform may open tickets in this project to help handle incidents requiring secret rotation."
@@ -153,7 +144,7 @@ def is_valid_label_value(value: str) -> bool:
     )
 
 
-def prompt_for_annotations() -> Dict[str, str]:
+def prompt_for_annotations() -> dict[str, str]:
     annotations = {}
 
     click.echo(
@@ -187,7 +178,7 @@ def prompt_for_annotation(msg: str) -> str:
         click.echo("Input cannot be empty. Please enter a value or 'N/A'.")
 
 
-def check_annotations_size(annotations: Dict):
+def check_annotations_size(annotations: dict):
     size = sum(
         len(key.encode("utf-8")) + len(value.encode("utf-8"))
         for key, value in annotations.items()

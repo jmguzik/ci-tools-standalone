@@ -26,6 +26,9 @@ Users in the `openshift/release` repository run:
 # List secrets
 ./hack/secret-manager.sh list
 
+# Show a secret's metadata (creation date, ownership info; never the value)
+./hack/secret-manager.sh describe -c my-collection aws/access-key-id
+
 # Create a secret
 ./hack/secret-manager.sh create
 
