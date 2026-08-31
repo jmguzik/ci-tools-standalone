@@ -26,6 +26,17 @@ INDEX_SECRET_NAME = "__index"
 # The string reserved for the service account secret associated with each collection.
 UPDATER_SA_SECRET_NAME = "updater-service-account"
 
+# Metadata keys attached to secrets at creation time:
+# - JIRA_LABEL is a label associating the secret with a specific JIRA project.
+JIRA_LABEL = "jira-project"
+
+# - ROTATION_INSTRUCTIONS is an annotation that describes how the secret should be rotated.
+ROTATION_INSTRUCTIONS = "rotation-instructions"
+
+# - REQUEST_INFO is an annotation that describes how the secret was originally requested,
+#   to help trace who to contact in case of problems.
+REQUEST_INFO = "request-information"
+
 # GCP limit for a secret name is 255 chars, 200 should be plenty
 # (we must also take into account the collection).
 SECRET_NAME_MAX_LENGTH = 200

@@ -9,28 +9,20 @@ from google.api_core.exceptions import NotFound, PermissionDenied
 from google.cloud import secretmanager
 from google.cloud.secretmanager import SecretPayload
 from util import (
+    JIRA_LABEL,
     PROJECT_ID,
+    REQUEST_INFO,
+    ROTATION_INSTRUCTIONS,
     check_if_collection_exists,
     create_payload,
+    ensure_authentication,
     get_secret_name,
     get_secrets_from_index,
     update_index_secret,
     validate_collection,
     validate_path,
     validate_secret_source,
-    ensure_authentication,
 )
-
-# Metadata keys used when creating secrets:
-# - JIRA_LABEL a label to associate the secret with a specific JIRA project.
-JIRA_LABEL = "jira-project"
-
-# - ROTATION_INSTRUCTIONS is an annotation that describes how the secret should be rotated.
-ROTATION_INSTRUCTIONS = "rotation-instructions"
-
-# - REQUEST_INFO is an annotation that describes how the secret was originally requested,
-#   to help trace who to contact in case of problems.
-REQUEST_INFO = "request-information"
 
 
 @click.command("create")

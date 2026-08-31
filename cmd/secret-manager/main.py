@@ -6,6 +6,7 @@
 import click
 from commands.create import create
 from commands.delete import delete
+from commands.describe import describe
 from commands.get_service_account import get_service_account
 from commands.list import list_secrets
 from commands.login import login
@@ -20,6 +21,7 @@ def cli():
 cli.add_command(login)
 cli.add_command(list_secrets)
 cli.add_command(create)
+cli.add_command(describe)
 cli.add_command(update)
 cli.add_command(delete)
 cli.add_command(get_service_account)
