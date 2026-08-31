@@ -3,7 +3,6 @@
 
 import os
 import re
-from typing import Dict, List, Set
 
 import click
 import requests
@@ -258,12 +257,12 @@ def create_payload(from_file: str, from_literal: str) -> bytes:
         raise
 
 
-def get_group_collections() -> Dict[str, List[str]]:
+def get_group_collections() -> dict[str, list[str]]:
     """
     Returns a dictionary mapping each group to its associated secret collections.
 
     Returns:
-        Dict[str,list[str]]: A dictionary where each key is a group name and
+        dict[str, list[str]]: A dictionary where each key is a group name and
         each value is a list of secret collections associated with that group.
     """
     try:
@@ -294,12 +293,12 @@ def get_group_collections() -> Dict[str, List[str]]:
     return result
 
 
-def get_collections() -> Set[str]:
+def get_collections() -> set[str]:
     """
     Returns a set of all existing collections.
 
     Returns:
-        Set[str]: A set containing all secret collections.
+        set[str]: A set containing all secret collections.
     """
     collections_dict = get_group_collections()
     collections_set = set()
@@ -328,7 +327,7 @@ def check_if_collection_exists(collection: str) -> bool:
 
 def get_secrets_from_index(
     client: secretmanager.SecretManagerServiceClient, collection: str
-) -> List[str]:
+) -> list[str]:
     """
     Gets the secrets listed in the index secret of the collection.
 
@@ -337,7 +336,7 @@ def get_secrets_from_index(
         collection (str): Name of the collection.
 
     Returns:
-        List[str]: A list of secrets.
+        list[str]: A list of secrets.
     """
     index_secret = client.secret_version_path(
         PROJECT_ID, get_index_secret_for_collection(collection), "latest"
@@ -369,7 +368,7 @@ def get_secrets_from_index(
 def update_index_secret(
     client: secretmanager.SecretManagerServiceClient,
     collection: str,
-    secret_names: List[str],
+    secret_names: list[str],
 ):
     """
     Updates the index secret for the collection with a new list of secrets.
@@ -377,7 +376,7 @@ def update_index_secret(
     Args:
         client (secretmanager.SecretManagerServiceClient): Secret Manager client.
         collection (str): Name of the collection.
-        secret_names (List[str]): A list of the new list of secrets to write into the index.
+        secret_names (list[str]): A list of the new list of secrets to write into the index.
     """
 
     name = client.secret_path(PROJECT_ID, get_index_secret_for_collection(collection))

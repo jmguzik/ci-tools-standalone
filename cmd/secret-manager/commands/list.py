@@ -2,7 +2,6 @@
 # pylint: disable=E0401, C0413
 
 import json
-from typing import Dict, List
 
 import click
 from google.cloud import secretmanager
@@ -59,7 +58,7 @@ def list_secrets(output: str, collection: str, rover_group: str):
         list_all_collections(collections_dict, output)
 
 
-def list_all_collections(collections_dict: Dict, output: str):
+def list_all_collections(collections_dict: dict, output: str):
     if output == "json":
         click.echo(json.dumps(collections_dict, indent=2))
     else:
@@ -70,7 +69,7 @@ def list_all_collections(collections_dict: Dict, output: str):
 
 
 def list_collections_for_rover_group(
-    collections_dict: Dict[str, List[str]], rover_group: str, output: str
+    collections_dict: dict[str, list[str]], rover_group: str, output: str
 ):
     """Lists collections for a specified rover group."""
 

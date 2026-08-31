@@ -2,7 +2,6 @@
 # pylint: disable=E0401, C0413
 
 import re
-from typing import Dict
 
 import click
 from google.api_core.exceptions import NotFound, PermissionDenied
@@ -120,7 +119,7 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
         ) from e
 
 
-def prompt_for_labels() -> Dict[str, str]:
+def prompt_for_labels() -> dict[str, str]:
     click.echo(
         "Enter team JIRA project associated with this secret (e.g. 'art' for issues.redhat.com/browse/ART).\n"
         "Test Platform may open tickets in this project to help handle incidents requiring secret rotation."
@@ -145,7 +144,7 @@ def is_valid_label_value(value: str) -> bool:
     )
 
 
-def prompt_for_annotations() -> Dict[str, str]:
+def prompt_for_annotations() -> dict[str, str]:
     annotations = {}
 
     click.echo(
@@ -179,7 +178,7 @@ def prompt_for_annotation(msg: str) -> str:
         click.echo("Input cannot be empty. Please enter a value or 'N/A'.")
 
 
-def check_annotations_size(annotations: Dict):
+def check_annotations_size(annotations: dict):
     size = sum(
         len(key.encode("utf-8")) + len(value.encode("utf-8"))
         for key, value in annotations.items()
