@@ -23,6 +23,11 @@ from util import (
     validate_secret_source,
 )
 
+# What a user can type at any metadata prompt to indicate the field does not
+# apply. When entered, the corresponding label/annotation is left unset rather
+# than storing the literal text.
+NOT_APPLICABLE = "none"
+
 
 @click.command("create")
 @click.option(
@@ -129,6 +134,8 @@ def prompt_for_labels() -> dict[str, str]:
             text="Jira project (required)",
             type=str,
         ).strip()
+        if jira.lower() == NOT_APPLICABLE:
+            return {}
         if is_valid_label_value(jira):
             return {JIRA_LABEL: jira.lower()}
         click.echo(
@@ -137,8 +144,6 @@ def prompt_for_labels() -> dict[str, str]:
 
 
 def is_valid_label_value(value: str) -> bool:
-    if value.lower() == "none":
-        return True
     return bool(re.fullmatch(r"[a-z]([-a-z0-9]*[a-z0-9])?", value)) and (
         1 <= len(value) <= 63
     )
@@ -153,9 +158,9 @@ def prompt_for_annotations() -> dict[str, str]:
         "Do not include sensitive information."
     )
 
-    annotations[ROTATION_INSTRUCTIONS] = prompt_for_annotation(
-        "Rotation info (required)"
-    )
+    rotation = prompt_for_annotation("Rotation info (required)")
+    if rotation is not None:
+        annotations[ROTATION_INSTRUCTIONS] = rotation
 
     click.echo(
         "\nProvide a short description of how this secret was originally requested\n"
@@ -163,19 +168,26 @@ def prompt_for_annotations() -> dict[str, str]:
         "This can help future team members know who to contact in case of problems.\n"
         "Do not include sensitive information."
     )
-    annotations[REQUEST_INFO] = prompt_for_annotation("Request info (required)")
+    request = prompt_for_annotation("Request info (required)")
+    if request is not None:
+        annotations[REQUEST_INFO] = request
     check_annotations_size(annotations)
     return annotations
 
 
-def prompt_for_annotation(msg: str) -> str:
+def prompt_for_annotation(msg: str) -> str | None:
+    """Prompt for an annotation value.
+
+    Returns the entered text, or None if the user typed 'none' to indicate the field does not apply.
+    """
     while True:
         value = click.prompt(text=msg, type=str).strip()
-        if value and value.lower() == "n/a":
-            return "N/A"
-        if value:
-            return value
-        click.echo("Input cannot be empty. Please enter a value or 'N/A'.")
+        if not value:
+            click.echo(f"Input cannot be empty. Please enter a value or '{NOT_APPLICABLE}'.")
+            continue
+        if value.lower() == NOT_APPLICABLE:
+            return None
+        return value
 
 
 def check_annotations_size(annotations: dict):
