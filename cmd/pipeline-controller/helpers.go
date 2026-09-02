@@ -14,6 +14,18 @@ import (
 	"sigs.k8s.io/prow/pkg/kube"
 )
 
+// scheduleMode selects how second-stage tests are scheduled.
+type scheduleMode int
+
+const (
+	// modeForce schedules the entire required set, re-firing jobs that already
+	// exist at HEAD. Used only by the explicit /pipeline required command.
+	modeForce scheduleMode = iota
+	// modeDelta schedules only the required jobs that do not yet have a ProwJob
+	// at HEAD (the delta). Used by automatic, LGTM, and /pipeline remaining.
+	modeDelta
+)
+
 type minimalGhClient interface {
 	GetPullRequest(org, repo string, number int) (*github.PullRequest, error)
 	CreateComment(org, repo string, number int, comment string) error
@@ -70,10 +82,10 @@ func newDeferredChangedFilesProvider(ghc minimalGhClient, org, repo string, numb
 }
 
 func sendComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader) error {
-	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, false)
+	return sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, modeDelta)
 }
 
-func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, isExplicitCommand bool) error {
+func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode) error {
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
 		deleteIds()
 		return fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
@@ -83,8 +95,12 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	allConditionalTests := append([]config.Presubmit{}, presubmits.pipelineConditionallyRequired...)
 	allConditionalTests = append(allConditionalTests, presubmits.pipelineSkipOnlyRequired...)
 
-	testContexts, manualControlMessage, err := acquireConditionalContexts(context.Background(), pj, allConditionalTests, ghc, deleteIds, pjLister, isExplicitCommand)
+	testContexts, err := acquireConditionalContexts(context.Background(), pj, allConditionalTests, ghc, deleteIds, pjLister, mode)
 	if err != nil {
+		// In modeDelta a list error fails closed: schedule nothing and post no
+		// comment. deleteIds() lets the automatic path retry on the next event
+		// (and, because no comment is posted here, does not defeat the
+		// one-comment-per-SHA guarantee).
 		deleteIds()
 		return err
 	}
@@ -93,40 +109,41 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 
-	// If it's an explicit /pipeline required command, ignore manual control message
-	// and proceed with scheduling tests
-	if manualControlMessage != "" && !isExplicitCommand {
-		comment = manualControlMessage
-	} else {
-		var protectedCommands string
-		for _, presubmit := range presubmits.protected {
-			if !strings.Contains(presubmit.Name, repoBaseRef) {
+	var protectedCommands string
+	for _, presubmit := range presubmits.protected {
+		if !strings.Contains(presubmit.Name, repoBaseRef) {
+			continue
+		}
+		// Skip re-triggering if a ProwJob already exists at the same SHA
+		// (unless this is an explicit /pipeline required command).
+		if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
+			if existsAtSHA(context.Background(), pjLister, pj, presubmit.Name) {
 				continue
 			}
-			// Skip re-triggering if a ProwJob already exists at the same SHA
-			// (unless this is an explicit /pipeline required command)
-			if !isExplicitCommand && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
-				if existsAtSHA(context.Background(), pjLister, pj, presubmit.Name) {
-					continue
-				}
-			}
-			protectedCommands += "\n" + presubmit.RerunCommand
 		}
+		protectedCommands += "\n" + presubmit.RerunCommand
+	}
+	if protectedCommands != "" {
+		comment += "Scheduling required tests:" + protectedCommands
+	}
+	if testContexts != "" {
 		if protectedCommands != "" {
-			comment += "Scheduling required tests:" + protectedCommands
+			comment += "\n"
 		}
-		if testContexts != "" {
-			if protectedCommands != "" {
-				comment += "\n"
-			}
-			comment += "\nScheduling tests matching the `pipeline_run_if_changed`, `pipeline_run_if_dockerfile_changed`, or not excluded by `pipeline_skip_if_only_changed` parameters:"
-			comment += testContexts
-		}
+		comment += "\nScheduling tests matching the `pipeline_run_if_changed`, `pipeline_run_if_dockerfile_changed`, or not excluded by `pipeline_skip_if_only_changed` parameters:"
+		comment += testContexts
 	}
 
-	// If no tests matched, send an informative comment instead of staying silent
+	// If nothing was scheduled, post an informative comment instead of staying
+	// silent. In modeDelta the empty result can mean the second stage was already
+	// triggered earlier for this HEAD; in that case avoid the misleading "no
+	// second-stage tests were triggered" wording.
 	if comment == "" {
-		comment = fmt.Sprintf("**Pipeline controller notification**\n\nNo second-stage tests were triggered for this PR.\n\nThis can happen when:\n- The changed files don't match any `pipeline_run_if_changed` patterns\n- The changed files don't feed into any configured `pipeline_run_if_dockerfile_changed` Dockerfiles\n- All files match `pipeline_skip_if_only_changed` patterns\n- No pipeline-controlled jobs are defined for the `%s` branch\n\nUse `/test ?` to see all available tests.", pj.Spec.Refs.BaseRef)
+		if mode == modeDelta && secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits) {
+			comment = fmt.Sprintf("**Pipeline controller notification**\n\nAll applicable second-stage tests for this HEAD have already been triggered. Nothing new to schedule.\n\nUse `/test ?` to see all available tests, or `/pipeline required` to re-run the full required set for the `%s` branch.", pj.Spec.Refs.BaseRef)
+		} else {
+			comment = fmt.Sprintf("**Pipeline controller notification**\n\nNo second-stage tests were triggered for this PR.\n\nThis can happen when:\n- The changed files don't match any `pipeline_run_if_changed` patterns\n- The changed files don't feed into any configured `pipeline_run_if_dockerfile_changed` Dockerfiles\n- All files match `pipeline_skip_if_only_changed` patterns\n- No pipeline-controlled jobs are defined for the `%s` branch\n\nUse `/test ?` to see all available tests.", pj.Spec.Refs.BaseRef)
+		}
 	}
 
 	if err := ghc.CreateComment(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, comment); err != nil {
@@ -136,9 +153,54 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	return nil
 }
 
-func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineConditionallyRequired []config.Presubmit, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, isExplicitCommand bool) (string, string, error) {
+// secondStageTriggeredAtSHA reports whether any second-stage (protected or
+// conditional) job already has a ProwJob at the ProwJob's HEAD SHA. It reads the
+// controller cache only (no GitHub calls) and is used solely to word the
+// empty-delta comment. It returns false when there is no lister or HEAD SHA.
+func secondStageTriggeredAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, presubmits presubmitTests) bool {
+	if pjLister == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 || pj.Spec.Refs.Pulls[0].SHA == "" {
+		return false
+	}
+
+	selector := map[string]string{
+		kube.OrgLabel:         pj.Spec.Refs.Org,
+		kube.RepoLabel:        pj.Spec.Refs.Repo,
+		kube.PullLabel:        fmt.Sprintf("%d", pj.Spec.Refs.Pulls[0].Number),
+		kube.BaseRefLabel:     pj.Spec.Refs.BaseRef,
+		kube.ProwJobTypeLabel: string(v1.PresubmitJob),
+	}
+
+	var pjs v1.ProwJobList
+	if err := pjLister.List(ctx, &pjs, ctrlruntimeclient.MatchingLabels(selector)); err != nil {
+		return false
+	}
+
+	existing := map[string]bool{}
+	for _, pjob := range pjs.Items {
+		if pjob.Spec.Refs != nil && len(pjob.Spec.Refs.Pulls) > 0 &&
+			pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
+			existing[pjob.Spec.Job] = true
+		}
+	}
+
+	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
+	secondStage := append([]config.Presubmit{}, presubmits.protected...)
+	secondStage = append(secondStage, presubmits.pipelineConditionallyRequired...)
+	secondStage = append(secondStage, presubmits.pipelineSkipOnlyRequired...)
+	for _, presubmit := range secondStage {
+		if !strings.Contains(presubmit.Name, repoBaseRef) {
+			continue
+		}
+		if existing[presubmit.Name] {
+			return true
+		}
+	}
+	return false
+}
+
+func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineConditionallyRequired []config.Presubmit, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode) (string, error) {
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
-		return "", "", fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
+		return "", fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
 	}
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
@@ -161,12 +223,12 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				psList[0].RegexpChangeMatcher = config.RegexpChangeMatcher{RunIfChanged: run}
 				if err := config.SetPresubmitRegexes(psList); err != nil {
 					deleteIds()
-					return "", "", err
+					return "", err
 				}
 				_, shouldRunResult, err := psList[0].RegexpChangeMatcher.ShouldRun(cfp)
 				if err != nil {
 					deleteIds()
-					return "", "", err
+					return "", err
 				}
 				shouldRun = shouldRunResult
 			} else if skip, ok := presubmit.Annotations["pipeline_skip_if_only_changed"]; ok && skip != "" {
@@ -175,19 +237,19 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				psList[0].RegexpChangeMatcher = config.RegexpChangeMatcher{SkipIfOnlyChanged: skip}
 				if err := config.SetPresubmitRegexes(psList); err != nil {
 					deleteIds()
-					return "", "", err
+					return "", err
 				}
 				_, shouldRunResult, err := psList[0].RegexpChangeMatcher.ShouldRun(cfp)
 				if err != nil {
 					deleteIds()
-					return "", "", err
+					return "", err
 				}
 				shouldRun = shouldRunResult
 			} else if dockerfileAnnotation, ok := presubmit.Annotations["pipeline_run_if_dockerfile_changed"]; ok && dockerfileAnnotation != "" {
 				changedFiles, err := cfp()
 				if err != nil {
 					deleteIds()
-					return "", "", err
+					return "", err
 				}
 				shouldRunResult, err := evaluateDockerfileAnnotation(dockerfileAnnotation, changedFiles, pj, fileClient)
 				if err != nil {
@@ -203,10 +265,16 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 			}
 		}
 
-		// Check if any of the tests that should run have already been manually triggered
-		// Skip this check if it's an explicit /pipeline required command
-		if len(testsToRun) > 0 && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" && !isExplicitCommand {
-			// Build label selector from ProwJob spec (same as in reconciler.go)
+		// In modeDelta, complement the jobs already triggered at HEAD by scheduling
+		// only the ones still missing. List the PR's ProwJobs from the controller
+		// cache once (not per job) and subtract the ones already present at the same
+		// SHA. modeForce (/pipeline required) skips this entirely and schedules all.
+		//
+		// Preserve today's guards: skip the cache lookup when there is no lister or
+		// no HEAD SHA (several tests pass a nil lister).
+		existing := map[string]bool{}
+		if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
+			// Same label selector today's latch block built (from ProwJob spec).
 			selector := map[string]string{
 				kube.OrgLabel:         pj.Spec.Refs.Org,
 				kube.RepoLabel:        pj.Spec.Refs.Repo,
@@ -217,41 +285,31 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 
 			var pjs v1.ProwJobList
 			if err := pjLister.List(ctx, &pjs, ctrlruntimeclient.MatchingLabels(selector)); err != nil {
-				// If listing fails, skip check and proceed with creating comment
-				deleteIds()
-				testCommands := ""
-				for _, presubmit := range testsToRun {
-					testCommands += "\n" + presubmit.RerunCommand
-				}
-				return testCommands, "", nil
+				// Fail closed: a list error must NOT be treated as "all jobs absent"
+				// (that would mass-trigger). Return the error so sendCommentWithMode
+				// short-circuits and schedules nothing; the automatic path retries on
+				// the next ProwJob event.
+				return "", fmt.Errorf("listing prowjobs for delta: %w", err)
 			}
-
-			// Check if any of the tests we want to run have already been triggered
-			// by looking for ProwJobs with matching job names and same SHA
-			// If a job exists in ANY state, it means it was already triggered
-			// so we should not run it and inform the user
-			for _, presubmit := range testsToRun {
-				testName := presubmit.Name
-				// Only check presubmits that match the repo-baseRef pattern (same as reconciler)
-				if !strings.Contains(testName, repoBaseRef) {
-					continue
-				}
-				for _, pjob := range pjs.Items {
-					if pjob.Spec.Job == testName &&
-						pjob.Spec.Refs != nil &&
-						len(pjob.Spec.Refs.Pulls) > 0 &&
-						pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
-						return "", "Tests from second stage were triggered manually. Pipeline can be controlled only manually, until HEAD changes. Use command to trigger second stage.", nil
-					}
+			for _, pjob := range pjs.Items {
+				if pjob.Spec.Refs != nil && len(pjob.Spec.Refs.Pulls) > 0 &&
+					pjob.Spec.Refs.Pulls[0].SHA == pj.Spec.Refs.Pulls[0].SHA {
+					existing[pjob.Spec.Job] = true
 				}
 			}
 		}
 
 		for _, presubmit := range testsToRun {
-			testCommands += "\n" + presubmit.RerunCommand
+			if !strings.Contains(presubmit.Name, repoBaseRef) {
+				continue
+			}
+			if mode == modeForce || !existing[presubmit.Name] {
+				testCommands += "\n" + presubmit.RerunCommand
+			}
+			// else: already present at HEAD (manual trigger or a prior delta) → skip it
 		}
 	}
-	return testCommands, "", nil
+	return testCommands, nil
 }
 
 // existsAtSHA checks whether a ProwJob with the given job name already exists

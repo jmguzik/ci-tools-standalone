@@ -16,13 +16,29 @@ import (
 	fakectrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// fakeGhClient implements minimalGhClient for testing.
+// fakeGhClient implements minimalGhClient for testing. It merges the fields used
+// by the comment/scheduling tests (comments, changes) with those used by the
+// Dockerfile-evaluation tests (file reads, statuses) into a single fake so the
+// package has exactly one definition.
 type fakeGhClient struct {
-	comments []string
-	changes  []github.PullRequestChange
+	comments        []string
+	files           map[string][]byte
+	fileErrors      map[string]error
+	fileRequests    map[string]int
+	fileRequestHook func()
+	refs            []string
+	changes         []github.PullRequestChange
+	changeRequests  int
+	statuses        []github.Status
+	statusRefs      []string
+	pullRequest     *github.PullRequest
+	addedLabels     []string
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
+	if f.pullRequest != nil {
+		return f.pullRequest, nil
+	}
 	return &github.PullRequest{}, nil
 }
 
@@ -32,19 +48,41 @@ func (f *fakeGhClient) CreateComment(org, repo string, number int, comment strin
 }
 
 func (f *fakeGhClient) GetPullRequestChanges(org string, repo string, number int) ([]github.PullRequestChange, error) {
+	f.changeRequests++
 	return f.changes, nil
 }
 
 func (f *fakeGhClient) CreateStatus(org, repo, ref string, s github.Status) error {
+	f.statusRefs = append(f.statusRefs, ref)
+	f.statuses = append(f.statuses, s)
 	return nil
 }
 
 func (f *fakeGhClient) AddLabel(org, repo string, number int, label string) error {
+	f.addedLabels = append(f.addedLabels, label)
 	return nil
 }
 
 func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.Label, error) {
 	return nil, nil
+}
+
+func (f *fakeGhClient) GetFile(org, repo, filepath, commit string) ([]byte, error) {
+	if f.fileRequestHook != nil {
+		f.fileRequestHook()
+	}
+	if f.fileRequests == nil {
+		f.fileRequests = make(map[string]int)
+	}
+	f.fileRequests[filepath]++
+	f.refs = append(f.refs, commit)
+	if err, ok := f.fileErrors[filepath]; ok {
+		return nil, err
+	}
+	if content, ok := f.files[filepath]; ok {
+		return content, nil
+	}
+	return nil, github.NewNotFound()
 }
 
 func newFakePJLister(pjs ...v1.ProwJob) ctrlruntimeclient.Reader {
@@ -146,31 +184,31 @@ func TestSendCommentWithMode_ProtectedDedup(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		isExplicitCommand bool
-		existingPJs       []v1.ProwJob
-		wantComment       string // substring to check for
-		wantNoRerun       bool   // true if we expect the RerunCommand NOT to appear
+		name        string
+		mode        scheduleMode
+		existingPJs []v1.ProwJob
+		wantComment string // substring to check for
+		wantNoRerun bool   // true if we expect the RerunCommand NOT to appear
 	}{
 		{
-			name:              "protected tests triggered normally when no existing ProwJob",
-			isExplicitCommand: false,
-			existingPJs:       nil,
-			wantComment:       "Scheduling required tests:",
-			wantNoRerun:       false,
+			name:        "protected tests triggered normally when no existing ProwJob",
+			mode:        modeDelta,
+			existingPJs: nil,
+			wantComment: "Scheduling required tests:",
+			wantNoRerun: false,
 		},
 		{
-			name:              "protected tests NOT re-triggered when ProwJob exists at same SHA (dedup)",
-			isExplicitCommand: false,
+			name: "protected tests NOT re-triggered when ProwJob exists at same SHA (dedup)",
+			mode: modeDelta,
 			existingPJs: []v1.ProwJob{
 				makeProwJob(protectedJobName, sha),
 			},
-			wantComment: "No second-stage tests were triggered",
+			wantComment: "already been triggered",
 			wantNoRerun: true,
 		},
 		{
-			name:              "protected tests ARE re-triggered with explicit command even with existing ProwJob",
-			isExplicitCommand: true,
+			name: "protected tests ARE re-triggered with force command even with existing ProwJob",
+			mode: modeForce,
 			existingPJs: []v1.ProwJob{
 				makeProwJob(protectedJobName, sha),
 			},
@@ -178,8 +216,8 @@ func TestSendCommentWithMode_ProtectedDedup(t *testing.T) {
 			wantNoRerun: false,
 		},
 		{
-			name:              "protected tests triggered when ProwJob exists at different SHA",
-			isExplicitCommand: false,
+			name: "protected tests triggered when ProwJob exists at different SHA",
+			mode: modeDelta,
 			existingPJs: []v1.ProwJob{
 				makeProwJob(protectedJobName, "different_sha_123"),
 			},
@@ -202,7 +240,7 @@ func TestSendCommentWithMode_ProtectedDedup(t *testing.T) {
 			deleteIdsCalled := false
 			deleteIds := func() { deleteIdsCalled = true }
 
-			err := sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, tc.isExplicitCommand)
+			err := sendCommentWithMode(presubmits, pj, ghc, deleteIds, pjLister, tc.mode)
 			if err != nil {
 				t.Fatalf("sendCommentWithMode returned error: %v", err)
 			}
@@ -232,7 +270,11 @@ func TestSendCommentWithMode_ProtectedDedup(t *testing.T) {
 	}
 }
 
-func TestSendCommentWithMode_ConditionalDedupStillWorks(t *testing.T) {
+// TestSendCommentWithMode_ConditionalDelta verifies the delta planner for the
+// conditional (second-stage) jobs: modeDelta complements the jobs already
+// present at HEAD instead of latching the whole pipeline into manual control,
+// and modeForce re-fires everything. The old manual-control message is gone.
+func TestSendCommentWithMode_ConditionalDelta(t *testing.T) {
 	const (
 		org     = "openshift"
 		repo    = "myrepo"
@@ -241,90 +283,312 @@ func TestSendCommentWithMode_ConditionalDedupStillWorks(t *testing.T) {
 		prNum   = 42
 	)
 
-	conditionalJobName := fmt.Sprintf("pull-ci-%s-%s-%s-conditional-test", org, repo, baseRef)
+	jobA := fmt.Sprintf("pull-ci-%s-%s-%s-conditional-a", org, repo, baseRef)
+	jobB := fmt.Sprintf("pull-ci-%s-%s-%s-conditional-b", org, repo, baseRef)
 
-	conditionalPresubmit := config.Presubmit{
-		JobBase: config.JobBase{
-			Name: conditionalJobName,
-			Annotations: map[string]string{
-				"pipeline_run_if_changed": "^cmd/",
+	presubmitFor := func(name string) config.Presubmit {
+		return config.Presubmit{
+			JobBase: config.JobBase{
+				Name:        name,
+				Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"},
 			},
-		},
-		Reporter: config.Reporter{
-			Context: conditionalJobName,
-		},
-		RerunCommand: "/test " + conditionalJobName,
+			Reporter:     config.Reporter{Context: name},
+			RerunCommand: "/test " + name,
+		}
 	}
+	conditionalPresubmits := []config.Presubmit{presubmitFor(jobA), presubmitFor(jobB)}
+	changes := []github.PullRequestChange{{Filename: "cmd/main.go"}}
+
+	const manualControlMsg = "Tests from second stage were triggered manually"
 
 	tests := []struct {
-		name              string
-		isExplicitCommand bool
-		existingPJs       []v1.ProwJob
-		changes           []github.PullRequestChange
-		wantManualControl bool // true if we expect the manual control message
+		name        string
+		mode        scheduleMode
+		existingPJs []v1.ProwJob
+		wantRerun   []string // rerun commands that MUST appear
+		wantNoRerun []string // rerun commands that must NOT appear
+		wantComment string   // substring that must appear
 	}{
 		{
-			name:              "conditional tests dedup returns manual control message when ProwJob exists",
-			isExplicitCommand: false,
-			existingPJs: []v1.ProwJob{
-				makeProwJob(conditionalJobName, sha),
-			},
-			changes: []github.PullRequestChange{
-				{Filename: "cmd/main.go"},
-			},
-			wantManualControl: true,
+			name:        "no jobs exist yet schedules the full set",
+			mode:        modeDelta,
+			existingPJs: nil,
+			wantRerun:   []string{"/test " + jobA, "/test " + jobB},
 		},
 		{
-			name:              "conditional tests are triggered when no ProwJob exists",
-			isExplicitCommand: false,
-			existingPJs:       nil,
-			changes: []github.PullRequestChange{
-				{Filename: "cmd/main.go"},
-			},
-			wantManualControl: false,
+			name:        "one job exists schedules only the missing one (delta)",
+			mode:        modeDelta,
+			existingPJs: []v1.ProwJob{makeProwJob(jobA, sha)},
+			wantRerun:   []string{"/test " + jobB},
+			wantNoRerun: []string{"/test " + jobA},
 		},
 		{
-			name:              "conditional tests triggered with explicit command even when ProwJob exists",
-			isExplicitCommand: true,
-			existingPJs: []v1.ProwJob{
-				makeProwJob(conditionalJobName, sha),
-			},
-			changes: []github.PullRequestChange{
-				{Filename: "cmd/main.go"},
-			},
-			wantManualControl: false,
+			name:        "all jobs exist schedules nothing without a misleading comment",
+			mode:        modeDelta,
+			existingPJs: []v1.ProwJob{makeProwJob(jobA, sha), makeProwJob(jobB, sha)},
+			wantNoRerun: []string{"/test " + jobA, "/test " + jobB},
+			wantComment: "already been triggered",
+		},
+		{
+			name:        "force reschedules every job even when present",
+			mode:        modeForce,
+			existingPJs: []v1.ProwJob{makeProwJob(jobA, sha), makeProwJob(jobB, sha)},
+			wantRerun:   []string{"/test " + jobA, "/test " + jobB},
+		},
+		{
+			name:        "job present at a different SHA does not suppress delta",
+			mode:        modeDelta,
+			existingPJs: []v1.ProwJob{makeProwJob(jobA, "different_sha_12345")},
+			wantRerun:   []string{"/test " + jobA, "/test " + jobB},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ghc := &fakeGhClient{changes: tc.changes}
+			ghc := &fakeGhClient{changes: changes}
 			pjLister := newFakePJLister(tc.existingPJs...)
 
-			presubmits := presubmitTests{
-				pipelineConditionallyRequired: []config.Presubmit{conditionalPresubmit},
-			}
-
+			presubmits := presubmitTests{pipelineConditionallyRequired: conditionalPresubmits}
 			pj := makeTriggerPJ(org, repo, baseRef, prNum, sha)
 
-			err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, tc.isExplicitCommand)
-			if err != nil {
+			if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, tc.mode); err != nil {
 				t.Fatalf("sendCommentWithMode returned error: %v", err)
 			}
-
 			if len(ghc.comments) != 1 {
 				t.Fatalf("expected 1 comment, got %d", len(ghc.comments))
 			}
 			comment := ghc.comments[0]
 
-			manualControlMsg := "Tests from second stage were triggered manually"
-			if tc.wantManualControl && !strings.Contains(comment, manualControlMsg) {
-				t.Errorf("expected manual control message in comment but got: %q", comment)
+			if strings.Contains(comment, manualControlMsg) {
+				t.Errorf("manual control message should no longer be emitted, got: %q", comment)
 			}
-			if !tc.wantManualControl && strings.Contains(comment, manualControlMsg) {
-				t.Errorf("did not expect manual control message but got it in comment: %q", comment)
+			for _, want := range tc.wantRerun {
+				if !strings.Contains(comment, want) {
+					t.Errorf("expected %q in comment, got: %q", want, comment)
+				}
+			}
+			for _, notWant := range tc.wantNoRerun {
+				if strings.Contains(comment, notWant) {
+					t.Errorf("did not expect %q in comment, got: %q", notWant, comment)
+				}
+			}
+			if tc.wantComment != "" && !strings.Contains(comment, tc.wantComment) {
+				t.Errorf("expected substring %q in comment, got: %q", tc.wantComment, comment)
 			}
 		})
+	}
+}
+
+// TestSendCommentWithMode_DeltaDoesNotSuppressProtected verifies that a manually
+// triggered conditional job no longer suppresses the required protected jobs:
+// the protected job is still scheduled while the already-present conditional job
+// is skipped.
+func TestSendCommentWithMode_DeltaDoesNotSuppressProtected(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+		prNum   = 42
+	)
+
+	protectedJob := fmt.Sprintf("pull-ci-%s-%s-%s-protected", org, repo, baseRef)
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+
+	presubmits := presubmitTests{
+		protected: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: protectedJob},
+			Reporter:     config.Reporter{Context: protectedJob},
+			RerunCommand: "/test " + protectedJob,
+		}},
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: conditionalJob},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+
+	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "cmd/main.go"}}}
+	// The conditional job was already triggered manually; the protected job was not.
+	pjLister := newFakePJLister(makeProwJob(conditionalJob, sha))
+	pj := makeTriggerPJ(org, repo, baseRef, prNum, sha)
+
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta); err != nil {
+		t.Fatalf("sendCommentWithMode returned error: %v", err)
+	}
+	if len(ghc.comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(ghc.comments))
+	}
+	comment := ghc.comments[0]
+	if !strings.Contains(comment, "/test "+protectedJob) {
+		t.Errorf("protected job should be scheduled despite manual conditional trigger, got: %q", comment)
+	}
+	if strings.Contains(comment, "/test "+conditionalJob) {
+		t.Errorf("already-triggered conditional job should be skipped, got: %q", comment)
+	}
+}
+
+// errorLister is a ctrlruntimeclient.Reader whose List always fails, used to
+// exercise the fail-closed behavior of modeDelta.
+type errorLister struct {
+	ctrlruntimeclient.Reader
+}
+
+func (errorLister) List(_ context.Context, _ ctrlruntimeclient.ObjectList, _ ...ctrlruntimeclient.ListOption) error {
+	return fmt.Errorf("boom: cannot list prowjobs")
+}
+
+// TestSendCommentWithMode_DeltaListErrorFailsClosed verifies that a list error in
+// modeDelta fails closed: nothing is scheduled, no comment is posted, the error
+// is returned, and deleteIds is invoked so the SHA is not left with a stale
+// comment (it is retried on the next event rather than double-posted).
+func TestSendCommentWithMode_DeltaListErrorFailsClosed(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+		prNum   = 42
+	)
+
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	presubmits := presubmitTests{
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: conditionalJob},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+
+	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "cmd/main.go"}}}
+	pj := makeTriggerPJ(org, repo, baseRef, prNum, sha)
+
+	deleteIdsCalled := false
+	err := sendCommentWithMode(presubmits, pj, ghc, func() { deleteIdsCalled = true }, errorLister{}, modeDelta)
+	if err == nil {
+		t.Fatal("expected an error from modeDelta list failure, got nil")
+	}
+	if len(ghc.comments) != 0 {
+		t.Errorf("expected no comment to be posted on list error, got: %v", ghc.comments)
+	}
+	if !deleteIdsCalled {
+		t.Error("expected deleteIds to be called on list error so the SHA is retried, not double-posted")
+	}
+}
+
+// TestSendCommentWithMode_DeltaNilListerNoPanic verifies that modeDelta with a
+// nil lister does not panic and schedules the full set (no cache to subtract).
+func TestSendCommentWithMode_DeltaNilListerNoPanic(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+		prNum   = 42
+	)
+
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	presubmits := presubmitTests{
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: conditionalJob},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "cmd/main.go"}}}
+	pj := makeTriggerPJ(org, repo, baseRef, prNum, sha)
+
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, nil, modeDelta); err != nil {
+		t.Fatalf("sendCommentWithMode returned error: %v", err)
+	}
+	if len(ghc.comments) != 1 || !strings.Contains(ghc.comments[0], "/test "+conditionalJob) {
+		t.Errorf("expected the conditional job to be scheduled with a nil lister, got: %v", ghc.comments)
+	}
+}
+
+// TestSendCommentWithMode_DeltaNewHeadReEvaluates verifies that a new HEAD SHA is
+// evaluated from scratch: jobs present only at the old SHA do not suppress the
+// delta at the new SHA.
+func TestSendCommentWithMode_DeltaNewHeadReEvaluates(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		oldSHA  = "old1234567890abc"
+		newSHA  = "new1234567890abc"
+		prNum   = 42
+	)
+
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	presubmits := presubmitTests{
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: conditionalJob},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "cmd/main.go"}}}
+	// Job exists only at the old SHA.
+	pjLister := newFakePJLister(makeProwJob(conditionalJob, oldSHA))
+	pj := makeTriggerPJ(org, repo, baseRef, prNum, newSHA)
+
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta); err != nil {
+		t.Fatalf("sendCommentWithMode returned error: %v", err)
+	}
+	if len(ghc.comments) != 1 || !strings.Contains(ghc.comments[0], "/test "+conditionalJob) {
+		t.Errorf("expected the conditional job to be scheduled at the new HEAD, got: %v", ghc.comments)
+	}
+}
+
+// TestSendCommentWithMode_DeltaEmptyWithOnlyFirstStageJobs verifies that when the
+// delta is empty and only FIRST-stage jobs exist at HEAD (no second-stage job has
+// run), the controller posts the generic "No second-stage tests were triggered"
+// message, not the misleading "already been triggered" one.
+func TestSendCommentWithMode_DeltaEmptyWithOnlyFirstStageJobs(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+		prNum   = 42
+	)
+
+	firstStageJob := fmt.Sprintf("pull-ci-%s-%s-%s-unit", org, repo, baseRef)
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+
+	presubmits := presubmitTests{
+		// A first-stage always-required job (its ProwJob will exist at HEAD).
+		alwaysRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: firstStageJob},
+			Reporter:     config.Reporter{Context: firstStageJob},
+			RerunCommand: "/test " + firstStageJob,
+		}},
+		// A conditional second-stage job whose condition does NOT match the changes,
+		// so the delta is empty.
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: conditionalJob},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+
+	// Only the first-stage job exists at HEAD; no second-stage job has run.
+	ghc := &fakeGhClient{changes: []github.PullRequestChange{{Filename: "docs/README.md"}}}
+	pjLister := newFakePJLister(makeProwJob(firstStageJob, sha))
+	pj := makeTriggerPJ(org, repo, baseRef, prNum, sha)
+
+	if err := sendCommentWithMode(presubmits, pj, ghc, func() {}, pjLister, modeDelta); err != nil {
+		t.Fatalf("sendCommentWithMode returned error: %v", err)
+	}
+	if len(ghc.comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d: %v", len(ghc.comments), ghc.comments)
+	}
+	comment := ghc.comments[0]
+	if !strings.Contains(comment, "No second-stage tests were triggered") {
+		t.Errorf("expected the generic no-tests message, got: %q", comment)
+	}
+	if strings.Contains(comment, "already been triggered") {
+		t.Errorf("first-stage jobs must not trigger the already-triggered message, got: %q", comment)
 	}
 }
 

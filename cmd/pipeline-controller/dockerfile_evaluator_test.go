@@ -13,54 +13,8 @@ import (
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-type fakeGhClient struct {
-	files           map[string][]byte
-	fileErrors      map[string]error
-	fileRequests    map[string]int
-	fileRequestHook func()
-	refs            []string
-	changes         []github.PullRequestChange
-	changeRequests  int
-	statuses        []github.Status
-	statusRefs      []string
-}
-
-func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
-	return nil, nil
-}
-func (f *fakeGhClient) CreateComment(org, repo string, number int, comment string) error {
-	return nil
-}
-func (f *fakeGhClient) GetPullRequestChanges(org, repo string, number int) ([]github.PullRequestChange, error) {
-	f.changeRequests++
-	return f.changes, nil
-}
-func (f *fakeGhClient) CreateStatus(org, repo, ref string, s github.Status) error {
-	f.statusRefs = append(f.statusRefs, ref)
-	f.statuses = append(f.statuses, s)
-	return nil
-}
-func (f *fakeGhClient) AddLabel(org, repo string, number int, label string) error { return nil }
-func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.Label, error) {
-	return nil, nil
-}
-func (f *fakeGhClient) GetFile(org, repo, filepath, commit string) ([]byte, error) {
-	if f.fileRequestHook != nil {
-		f.fileRequestHook()
-	}
-	if f.fileRequests == nil {
-		f.fileRequests = make(map[string]int)
-	}
-	f.fileRequests[filepath]++
-	f.refs = append(f.refs, commit)
-	if err, ok := f.fileErrors[filepath]; ok {
-		return nil, err
-	}
-	if content, ok := f.files[filepath]; ok {
-		return content, nil
-	}
-	return nil, github.NewNotFound()
-}
+// fakeGhClient is defined once in helpers_test.go and shared across the package's
+// tests.
 
 func testProwJob() *v1.ProwJob {
 	return &v1.ProwJob{
@@ -398,7 +352,7 @@ func TestEvaluateDockerfileChanges(t *testing.T) {
 			changedFiles: []string{"src/main.go"},
 			files: map[string][]byte{
 				"docker/build.Dockerfile":              []byte("FROM scratch\nCOPY src/ src/\n"),
-				"docker/build.Dockerfile.dockerignore": []byte{},
+				"docker/build.Dockerfile.dockerignore": {},
 				".dockerignore":                        []byte("src/\n"),
 			},
 			want: true,
@@ -649,23 +603,20 @@ func TestAcquireConditionalContextsSchedulesMalformedDockerfileAnnotation(t *tes
 		},
 		RerunCommand: "/test e2e",
 	}
-	commands, manualMessage, err := acquireConditionalContexts(
+	commands, err := acquireConditionalContexts(
 		context.Background(),
 		testProwJob(),
 		[]config.Presubmit{presubmit},
 		&fakeGhClient{},
 		func() {},
 		nil,
-		false,
+		modeDelta,
 	)
 	if err != nil {
 		t.Fatalf("acquireConditionalContexts() error = %v", err)
 	}
 	if commands != "\n/test e2e" {
 		t.Errorf("commands = %q, want %q", commands, "\n/test e2e")
-	}
-	if manualMessage != "" {
-		t.Errorf("manual message = %q, want empty", manualMessage)
 	}
 }
 
@@ -770,7 +721,7 @@ func TestExistingPipelineConditionsScheduleRenameSource(t *testing.T) {
 			}
 
 			ghc := &fakeGhClient{changes: changes}
-			commands, _, err := acquireConditionalContexts(context.Background(), testProwJob(), []config.Presubmit{presubmit}, ghc, func() {}, nil, false)
+			commands, err := acquireConditionalContexts(context.Background(), testProwJob(), []config.Presubmit{presubmit}, ghc, func() {}, nil, modeDelta)
 			if err != nil {
 				t.Fatalf("acquireConditionalContexts() error = %v", err)
 			}
@@ -797,7 +748,7 @@ func TestAcquireConditionalContextsCachesDockerfileReads(t *testing.T) {
 		},
 	}
 
-	commands, _, err := acquireConditionalContexts(context.Background(), testProwJob(), presubmits, ghc, func() {}, nil, false)
+	commands, err := acquireConditionalContexts(context.Background(), testProwJob(), presubmits, ghc, func() {}, nil, modeDelta)
 	if err != nil {
 		t.Fatalf("acquireConditionalContexts() error = %v", err)
 	}
@@ -868,7 +819,7 @@ orgs:
 		t.Fatalf("webhook statuses = %#v, want one pending e2e status", ghc.statuses)
 	}
 
-	commands, _, err := acquireConditionalContexts(context.Background(), testProwJob(), []config.Presubmit{presubmit}, ghc, func() {}, nil, false)
+	commands, err := acquireConditionalContexts(context.Background(), testProwJob(), []config.Presubmit{presubmit}, ghc, func() {}, nil, modeDelta)
 	if err != nil {
 		t.Fatalf("acquireConditionalContexts() error = %v", err)
 	}

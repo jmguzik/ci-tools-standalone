@@ -40,7 +40,7 @@ In **Automatic Mode**, the pipeline controller automatically triggers second-sta
 - Teams that want fully automated test execution
 - When you want to ensure all relevant tests run automatically
 
-**Important Note:** If you manually trigger any second-stage test before the automatic trigger occurs, the controller will detect this and inform you that the pipeline is now under manual control. You will need to use `/pipeline required` to trigger the remaining tests manually until the PR HEAD changes.
+**Important Note:** If you manually trigger some second-stage tests before the automatic trigger occurs, the controller **complements** them rather than stepping aside. When the first stage completes it schedules only the remaining required jobs that do not yet have a run at the current HEAD (a "delta"), skipping the ones you already triggered. One manual trigger no longer moves the whole pipeline into manual control. To re-run a specific job that already ran, use `/test <job>`.
 
 ### 3. LGTM Mode
 
@@ -57,7 +57,7 @@ In **LGTM Mode**, the pipeline controller triggers second-stage tests when the `
 - Teams that want tests to run only when code review is approved
 - To reduce unnecessary test runs during active development
 
-**Important Note:** If you manually trigger any second-stage test before the LGTM label is added, the controller will detect this and inform you that the pipeline is now under manual control. You will need to use `/pipeline required` to trigger the remaining tests manually until the PR HEAD changes.
+**Important Note:** If you manually trigger some second-stage tests before the `lgtm` label is added, the controller **complements** them when the label lands: it schedules only the remaining required jobs that do not yet have a run at the current HEAD (a "delta"), skipping the ones you already triggered. One manual trigger no longer moves the whole pipeline into manual control. To re-run a specific job that already ran, use `/test <job>`.
 
 ## The `/pipeline required` Command
 
@@ -67,9 +67,23 @@ The `/pipeline required` command works in **all three modes** and allows you to 
 - In Manual Mode: To trigger all required tests at once
 - In Automatic Mode: To trigger tests before they would automatically run, or to retrigger after manual intervention
 - In LGTM Mode: To trigger tests before the LGTM label is added, or to retrigger after manual intervention
-- When you've manually triggered some tests and want to trigger the remaining ones
+- When you want to force-run the entire required set at once (note: this re-fires jobs that are already running; to run only the jobs still missing at HEAD, use `/pipeline remaining`)
 
-**Important:** When you use `/pipeline required` in Automatic or LGTM mode before the automatic trigger occurs, you take responsibility for manual control. The controller will not automatically trigger tests after this point until the PR HEAD changes.
+**Important:** `/pipeline required` force-schedules the whole required set, including jobs already running at the current HEAD. Using it in Automatic or LGTM mode does not disable automatic scheduling: the controller keeps auto-completing (delta) afterward — once these jobs exist at HEAD the next automatic pass simply computes an empty delta and schedules nothing new until the PR HEAD changes.
+
+## The `/pipeline remaining` Command
+
+The `/pipeline remaining` command works in **all three modes** and schedules the required second-stage tests **minus** the jobs that already have a run at the current HEAD — the same "delta" the Automatic and LGTM modes compute automatically, but on demand.
+
+**How it differs from `/pipeline required`:**
+- `/pipeline required` force-schedules the **entire** required set, re-firing jobs that are already running and spending CI twice.
+- `/pipeline remaining` schedules **only the jobs that are still missing** at HEAD, leaving already-triggered jobs alone.
+
+**When to use `/pipeline remaining`:**
+- In Manual Mode, to "run the rest" after you triggered a few jobs yourself, without the force-all duplication of `/pipeline required`.
+- In Automatic or LGTM mode, to fill gaps early — before the first stage completes — without re-running jobs that already started.
+
+**Important:** Like `/pipeline required`, `/pipeline remaining` **bypasses the first-stage gate**. It can schedule second-stage jobs before the first-stage (always-required) tests pass. This is intentional for the "fill gaps early" use case, but it means the command does not wait for the first stage the way Automatic mode does. To force a re-run of a specific job that already ran, use `/test <job>`.
 
 ## Test Detection
 
@@ -212,16 +226,15 @@ Add the field to your test configuration in the ci-operator config file:
 
 5. **Combine with `always_run: false`**: These annotations only work with second-stage tests that have `always_run: false`.
 
-## Manual Trigger Detection
+## Manual Trigger Detection (Auto-Complement)
 
-If you manually trigger any second-stage test (using `/test <job-name>`) in Automatic or LGTM mode before the automatic trigger occurs, the controller will:
+If you manually trigger some second-stage tests (using `/test <job-name>`) in Automatic or LGTM mode before the automatic trigger occurs, the controller **complements** your work instead of latching into manual control. When it next schedules the second stage, it:
 
-1. Detect that tests were manually triggered
-2. Post a comment informing you that the pipeline is now under manual control
-3. Require you to use `/pipeline required` to trigger remaining tests
-4. Continue requiring manual control until the PR HEAD changes
+1. Detects, from its in-cluster ProwJob cache, which second-stage jobs already have a run at the current HEAD (no extra GitHub calls are made for this check)
+2. Schedules only the remaining required jobs — the "delta" — skipping the ones already triggered
+3. Re-evaluates from scratch whenever the PR HEAD changes
 
-This prevents duplicate test runs and ensures you have full control once you've started manually triggering tests.
+This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
 
 ## Enrolling Repository
 
