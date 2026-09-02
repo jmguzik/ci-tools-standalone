@@ -104,7 +104,28 @@ type clientWrapper struct {
 	lgtmWatcher        *watcher
 	pjLister           ctrlruntimeclient.Reader
 	pipelineAutoCache  *PipelineAutoCache
-	mu                 sync.RWMutex // Protects against race conditions in event handling
+	// ids provides a per-SHA idempotency guard for the LGTM and /pipeline
+	// remaining scheduling paths, which do not run under the reconciler's own
+	// ids cache. Keyed by composeKey (org/repo/pr/baseRef/SHA).
+	ids sync.Map
+	mu  sync.RWMutex // Protects against race conditions in event handling
+}
+
+// cleanOldIds periodically evicts stale per-SHA idempotency keys from cw.ids so
+// the map does not grow unbounded. It mirrors reconciler.cleanOldIds; the values
+// stored are the time each key was added.
+func (cw *clientWrapper) cleanOldIds(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cw.ids.Range(func(key, value interface{}) bool {
+			if time.Since(value.(time.Time)) >= interval {
+				cw.ids.Delete(key)
+			}
+			return true
+		})
+	}
 }
 
 // isBranchEnabled checks if the branch is enabled for the given repo configuration
@@ -349,8 +370,17 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 			return
 		}
 
+		// Per-SHA idempotency guard: the LGTM path does not run under the
+		// reconciler's ids cache, so guard against repeated label events
+		// double-posting /test within the ProwJob cache-latency window.
+		key := composeKey(prowJob.Spec.Refs)
+		if _, loaded := cw.ids.LoadOrStore(key, time.Now()); loaded {
+			logger.Info("Second-stage tests already scheduled for this HEAD, skipping duplicate LGTM trigger")
+			return
+		}
+
 		logger.Info("Sending comment for LGTM label addition")
-		if err := sendComment(presubmits, prowJob, cw.ghc, func() {}, cw.pjLister); err != nil {
+		if err := sendComment(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister); err != nil {
 			logger.WithError(err).Error("failed to send a comment")
 		} else {
 			logger.Info("Successfully sent comment for LGTM label addition")
@@ -375,15 +405,18 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		return
 	}
 
-	// Check if the comment contains "/pipeline required" or "/pipeline auto" as a command (at start of line)
+	// Check if the comment contains "/pipeline required", "/pipeline remaining", or
+	// "/pipeline auto" as a command (at start of line).
 	// Use (?m) for multiline mode so ^ matches start of any line, not just start of string
 	pipelineRequiredRegex := regexp.MustCompile(`(?im)^/pipeline\s+required`)
+	pipelineRemainingRegex := regexp.MustCompile(`(?im)^/pipeline\s+remaining`)
 	pipelineAutoRegex := regexp.MustCompile(`(?im)^/pipeline\s+auto`)
 
 	matchesRequired := pipelineRequiredRegex.MatchString(event.Comment.Body)
+	matchesRemaining := pipelineRemainingRegex.MatchString(event.Comment.Body)
 	matchesAuto := pipelineAutoRegex.MatchString(event.Comment.Body)
 
-	if !matchesRequired && !matchesAuto {
+	if !matchesRequired && !matchesRemaining && !matchesAuto {
 		return
 	}
 
@@ -397,9 +430,12 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		"pr":   number,
 	})
 
-	if matchesAuto {
+	switch {
+	case matchesAuto:
 		logger.Info("Processing /pipeline auto comment")
-	} else {
+	case matchesRemaining && !matchesRequired:
+		logger.Info("Processing /pipeline remaining comment")
+	default:
 		logger.Info("Processing /pipeline required comment")
 	}
 
@@ -512,8 +548,9 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		logger.Info("All first-stage tests already passed, triggering second-stage tests immediately")
 	}
 
-	// For /pipeline required (or /pipeline auto when first-stage already passed),
-	// trigger tests immediately. Create a ProwJob to reuse existing logic.
+	// For /pipeline required, /pipeline remaining, or /pipeline auto (when the
+	// first stage already passed), trigger tests immediately. Create a ProwJob to
+	// reuse existing logic.
 	prowJob := &v1.ProwJob{
 		Spec: v1.ProwJobSpec{
 			Refs: &v1.Refs{
@@ -527,10 +564,37 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		},
 	}
 
-	// Generate the comment with test/override commands
-	// Pass true for isExplicitCommand since this is an explicit /pipeline required command
-	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, func() {}, cw.pjLister, true); err != nil {
-		logger.WithError(err).Error("failed to send comment in response to /pipeline required")
+	// /pipeline required force-schedules the whole required set (re-firing jobs
+	// already running at HEAD). /pipeline remaining and the /pipeline auto
+	// immediate-trigger fallthrough behave like the reconciler's automatic path:
+	// they run the delta planner under a per-SHA idempotency guard (neither runs
+	// under the reconciler's own ids cache).
+	mode := modeForce
+	deleteIds := func() {}
+	if !matchesRequired && (matchesRemaining || matchesAuto) {
+		mode = modeDelta
+		// Per-SHA idempotency guard: guard against repeated comments/events
+		// double-posting /test within the ProwJob cache-latency window.
+		key := composeKey(prowJob.Spec.Refs)
+		if _, loaded := cw.ids.LoadOrStore(key, time.Now()); loaded {
+			logger.Info("Second-stage tests already scheduled for this HEAD, skipping duplicate")
+			// /pipeline remaining is an explicit user command; tell the user the
+			// guard suppressed it instead of returning silently. The /pipeline auto
+			// fallthrough is event-driven and stays silent.
+			if matchesRemaining {
+				msg := fmt.Sprintf("**Pipeline controller notification**\n\nThe second stage has already been scheduled for this HEAD (`%s`); nothing further to trigger.", prowJob.Spec.Refs.Pulls[0].SHA)
+				if err := cw.ghc.CreateComment(org, repo, number, msg); err != nil {
+					logger.WithError(err).Error("failed to create comment")
+				}
+			}
+			return
+		}
+		deleteIds = func() { cw.ids.Delete(key) }
+	}
+
+	// Generate the comment with test/override commands.
+	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode); err != nil {
+		logger.WithError(err).Error("failed to send comment in response to pipeline command")
 	}
 }
 
@@ -873,6 +937,10 @@ func main() {
 		pjLister:           mgr.GetCache(),
 		pipelineAutoCache:  pipelineAutoCache,
 	}
+
+	// Evict stale per-SHA idempotency keys from the LGTM / /pipeline remaining
+	// guard, mirroring the reconciler's ids cleanup.
+	go cw.cleanOldIds(24 * time.Hour)
 
 	eventServer := githubeventserver.New(o.githubEventServerOptions, webhookTokenGenerator, logger)
 
