@@ -80,6 +80,15 @@ func TestWebhookLifecycleAndPersistentDeduplication(t *testing.T) {
 	if state.Groups[g.GroupKey].ClosedReason != "resolved" || state.Groups[g.GroupKey].Parent != nil {
 		t.Fatalf("explicit settlement did not detach resolved episode: %#v", state.Groups[g.GroupKey])
 	}
+	closeReply := state.Outbox["close-reply:"+oldEpisode]
+	if closeReply == nil || closeReply.ImmutablePayload == nil {
+		t.Fatalf("settlement queued no close reply: %#v", state.Outbox)
+	}
+	// Alertmanager only reports that the group stopped firing, so the reply must not
+	// assert the underlying problem is fixed.
+	if text := closeReply.ImmutablePayload.Text; !strings.Contains(text, "may not mean the underlying problem is fixed") {
+		t.Fatalf("close reply claims resolution: %s", text)
+	}
 
 	now = now.Add(time.Minute)
 	recurrence := webhookBody(t, "firing", alertPayload("a", "firing", now))

@@ -187,7 +187,7 @@ func (p *WebhookProcessor) Process(ctx context.Context, source string, body []by
 			}
 			if knownFiring == 0 {
 				g.Status = "resolved"
-				closeEpisode(s, g, now, "resolved", p.renderer.RenderParent(g, false), p.renderer.RenderEventReply("This notification group has explicitly resolved in Alertmanager."))
+				closeEpisode(s, g, now, "resolved", p.renderer.RenderParent(g, false), p.renderer.RenderEventReply("Alertmanager stopped reporting this notification group as firing. Depending on the rule, that may not mean the underlying problem is fixed."))
 			} else {
 				g.Status = "incomplete"
 			}
