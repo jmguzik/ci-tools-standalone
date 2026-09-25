@@ -17,6 +17,9 @@ const (
 	// the window while the job stays red, so claiming "resolved" here is wrong as
 	// often as it is right. Say only what the notification actually carries.
 	noLongerFiringStatus = "NO LONGER FIRING IN ALERTMANAGER"
+	// Carried on the parent card rather than in a reply of its own. A settled episode
+	// is not news; it is a state change to the message that already reported the alert.
+	noLongerFiringCaveat = ":heavy_minus_sign: Alertmanager stopped reporting this notification group as firing. Depending on the rule, that may not mean the underlying problem is fixed."
 )
 
 type Renderer struct {
@@ -43,6 +46,9 @@ func (r *Renderer) RenderParent(g *GroupState, controls bool) SlackPayload {
 	if isProbeGroup(g) {
 		probeText := fmt.Sprintf("Alert proxy end-to-end probe · status %s · delivery %d · %s UTC", strings.ToLower(status), g.NotificationCount, g.LastSeen.UTC().Format("2006-01-02 15:04"))
 		return payload(probeText, []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": probeText}}})
+	}
+	if status == noLongerFiringStatus {
+		meta += "\n" + noLongerFiringCaveat
 	}
 	if g.Ack != nil {
 		meta += fmt.Sprintf("\nAcknowledged by <@%s> at %s UTC", slackEscape(g.Ack.Actor), g.Ack.At.UTC().Format("2006-01-02 15:04"))

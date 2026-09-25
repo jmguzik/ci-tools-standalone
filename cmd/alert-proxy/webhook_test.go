@@ -71,6 +71,7 @@ func TestWebhookLifecycleAndPersistentDeduplication(t *testing.T) {
 		t.Fatalf("omitted firing member was falsely resolved: status=%s closed=%v", g.Status, g.ClosedAt)
 	}
 	now = now.Add(time.Minute)
+	parentPostID := state.Groups[g.GroupKey].Parent.PostID
 	resolvedA := webhookBody(t, "resolved", alertPayload("a", "resolved", now.Add(-time.Hour)))
 	if _, err := processor.Process(ctx, "app-ci-uwm", resolvedA); err != nil {
 		t.Fatal(err)
@@ -80,14 +81,16 @@ func TestWebhookLifecycleAndPersistentDeduplication(t *testing.T) {
 	if state.Groups[g.GroupKey].ClosedReason != "resolved" || state.Groups[g.GroupKey].Parent != nil {
 		t.Fatalf("explicit settlement did not detach resolved episode: %#v", state.Groups[g.GroupKey])
 	}
-	closeReply := state.Outbox["close-reply:"+oldEpisode]
-	if closeReply == nil || closeReply.ImmutablePayload == nil {
-		t.Fatalf("settlement queued no close reply: %#v", state.Outbox)
+	// Settling posts nothing of its own; the parent update carries the whole story.
+	if work, ok := state.Outbox["close-reply:"+oldEpisode]; ok {
+		t.Fatalf("settlement queued a separate resolved message: %#v", work)
 	}
-	// Alertmanager only reports that the group stopped firing, so the reply must not
-	// assert the underlying problem is fixed.
-	if text := closeReply.ImmutablePayload.Text; !strings.Contains(text, "may not mean the underlying problem is fixed") {
-		t.Fatalf("close reply claims resolution: %s", text)
+	closeParent := state.Outbox["parent:"+parentPostID]
+	if closeParent == nil || closeParent.ImmutablePayload == nil {
+		t.Fatalf("settlement did not pin a final parent payload: %#v", state.Outbox)
+	}
+	if text := closeParent.ImmutablePayload.Text; !strings.Contains(text, "may not mean the underlying problem is fixed") {
+		t.Fatalf("final parent omits the no-longer-firing caveat: %s", text)
 	}
 
 	now = now.Add(time.Minute)
@@ -276,5 +279,40 @@ func TestShrinkingBatchDurablyRetiresOverflowReply(t *testing.T) {
 	state, _ = store.Read(ctx)
 	if state.Groups[groupKey].MemberList != nil || state.Outbox[retirementID] != nil {
 		t.Fatalf("retired overflow remained tracked: group=%#v outbox=%#v", state.Groups[groupKey], state.Outbox)
+	}
+}
+
+// A silence or drain close still needs its own reply: it carries the audit
+// controls, and operations.go addresses that post by "close-reply:"+EpisodeID.
+func TestCloseEpisodeRepliesOnlyWhenGivenOne(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		messageTS string
+	}{
+		{name: "parent already posted", messageTS: "1"},
+		{name: "parent still in flight", messageTS: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reply := range []struct {
+				name    string
+				payload SlackPayload
+				want    bool
+			}{
+				{name: "silenced", payload: SlackPayload{Text: "silenced by UADMIN"}, want: true},
+				{name: "resolved", payload: SlackPayload{}, want: false},
+			} {
+				t.Run(reply.name, func(t *testing.T) {
+					g := openTestGroup()
+					g.Parent.MessageTS = tc.messageTS
+					s := &State{Groups: map[string]*GroupState{"g": g}, Outbox: map[string]*OutboxWork{
+						"parent:" + g.Parent.PostID: {GroupKey: "g", Object: "parent", Kind: "post", DesiredRevision: 1},
+					}}
+					closeEpisode(s, g, time.Now(), "x", SlackPayload{Text: "final"}, reply.payload)
+					if _, ok := s.Outbox["close-reply:e"]; ok != reply.want {
+						t.Fatalf("close reply queued=%v want=%v", ok, reply.want)
+					}
+				})
+			}
+		})
 	}
 }
