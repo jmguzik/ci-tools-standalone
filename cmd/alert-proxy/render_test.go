@@ -82,13 +82,30 @@ func TestResolvedGroupDoesNotClaimTheProblemIsFixed(t *testing.T) {
 		t.Fatalf("rendered group omits the no-longer-firing wording: %s", rendered)
 	}
 
+	if !strings.Contains(rendered, noLongerFiringCaveat) {
+		t.Fatalf("rendered group omits the no-longer-firing caveat: %s", rendered)
+	}
+
 	// The outbox can re-render a group after closeEpisode has already detached it,
-	// so the ClosedReason path has to reach the same wording as the live one.
+	// so the ClosedReason path has to reach the same wording as the live one —
+	// caveat included, because that is all a settled episode ever says.
 	closed := openTestGroup()
 	closed.Status = "firing"
 	closed.ClosedReason = "resolved"
-	if rendered := string(testRenderer().RenderParent(closed, false).Blocks); !strings.Contains(rendered, noLongerFiringStatus) {
-		t.Fatalf("closed-as-resolved group omits the no-longer-firing wording: %s", rendered)
+	closedRender := string(testRenderer().RenderParent(closed, false).Blocks)
+	if !strings.Contains(closedRender, noLongerFiringStatus) || !strings.Contains(closedRender, noLongerFiringCaveat) {
+		t.Fatalf("closed-as-resolved group omits the no-longer-firing wording: %s", closedRender)
+	}
+
+	// Silences and staleness have their own explanation; the settlement caveat
+	// would be a claim about Alertmanager that those closes never made.
+	for _, reason := range []string{"silenced", "stale"} {
+		other := openTestGroup()
+		other.Status = "firing"
+		other.ClosedReason = reason
+		if rendered := string(testRenderer().RenderParent(other, false).Blocks); strings.Contains(rendered, noLongerFiringCaveat) {
+			t.Fatalf("%s close carried the settlement caveat: %s", reason, rendered)
+		}
 	}
 }
 

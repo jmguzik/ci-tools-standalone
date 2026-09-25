@@ -189,7 +189,7 @@ func (p *WebhookProcessor) Process(ctx context.Context, source string, body []by
 				g.Status = "resolved"
 				// No reply: RenderParent carries the caveat on the card that reported
 				// the alert, so settling an episode adds nothing to #ops-testplatform.
-				closeEpisode(s, g, now, "resolved", p.renderer.RenderParent(g, false), SlackPayload{})
+				closeEpisode(s, g, now, "resolved", p.renderer.RenderParent(g, false), nil)
 			} else {
 				g.Status = "incomplete"
 			}
@@ -247,27 +247,28 @@ func retireMemberList(s *State, g *GroupState, renderer *Renderer) {
 	putOutbox(s, id, &OutboxWork{GroupKey: g.GroupKey, Object: "memberListRetire", Kind: kind, DesiredRevision: member.DesiredRevision, Target: target, DependsOnPostID: depends, ImmutablePayload: &payload, Phase: "pending"})
 }
 
-// An empty replyPayload closes the episode with the parent update alone. Silences
-// and drains still reply, because those carry audit controls or an explanation the
-// parent cannot; an ordinary settlement is not worth its own message in the channel.
-func closeEpisode(s *State, g *GroupState, now time.Time, reason string, parentPayload, replyPayload SlackPayload) {
+// A nil replyPayload closes the episode with the parent update alone; any non-nil
+// payload is always queued as "close-reply:"+EpisodeID. Silences and drains must
+// pass one, because those carry audit controls or an explanation the parent cannot
+// — operations.go addresses the silence audit post by that very ID. An ordinary
+// settlement is not worth its own message in the channel, so it passes nil.
+func closeEpisode(s *State, g *GroupState, now time.Time, reason string, parentPayload SlackPayload, replyPayload *SlackPayload) {
 	g.ClosedAt, g.ClosedReason = now, reason
-	reply := replyPayload.Text != ""
 	if g.Parent != nil {
 		postID := g.Parent.PostID
 		if g.Parent.MessageTS != "" {
 			delete(s.Outbox, "parent:"+postID)
 			putOutbox(s, "close-parent:"+g.EpisodeID, &OutboxWork{GroupKey: g.GroupKey, Object: "eventReply", Kind: "update", Target: OutboxTarget{Channel: g.Channel, MessageTS: g.Parent.MessageTS}, ImmutablePayload: &parentPayload, ProbeDelivery: isProbeGroup(g), Phase: "pending"})
-			if reply {
-				putOutbox(s, "close-reply:"+g.EpisodeID, &OutboxWork{GroupKey: g.GroupKey, Object: "eventReply", Kind: "post", Target: OutboxTarget{Channel: g.Channel, ThreadTS: g.Parent.MessageTS}, ImmutablePayload: &replyPayload, Phase: "pending"})
+			if replyPayload != nil {
+				putOutbox(s, "close-reply:"+g.EpisodeID, &OutboxWork{GroupKey: g.GroupKey, Object: "eventReply", Kind: "post", Target: OutboxTarget{Channel: g.Channel, ThreadTS: g.Parent.MessageTS}, ImmutablePayload: replyPayload, Phase: "pending"})
 			}
 		} else {
 			if w := s.Outbox["parent:"+postID]; w != nil {
 				w.ImmutablePayload = &parentPayload
 				w.DesiredRevision++
 			}
-			if reply {
-				putOutbox(s, "close-reply:"+g.EpisodeID, &OutboxWork{GroupKey: g.GroupKey, Object: "eventReply", Kind: "post", Target: OutboxTarget{Channel: g.Channel}, DependsOnPostID: postID, ImmutablePayload: &replyPayload, Phase: "pending"})
+			if replyPayload != nil {
+				putOutbox(s, "close-reply:"+g.EpisodeID, &OutboxWork{GroupKey: g.GroupKey, Object: "eventReply", Kind: "post", Target: OutboxTarget{Channel: g.Channel}, DependsOnPostID: postID, ImmutablePayload: replyPayload, Phase: "pending"})
 			}
 		}
 		g.Parent = nil
