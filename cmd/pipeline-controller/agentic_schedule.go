@@ -268,7 +268,7 @@ func (a *agenticController) restoreRecords(ctx context.Context) error {
 		if a.scheduler.pending[work] != nil {
 			continue
 		}
-		unfinished := r.Desired != nil || state.PendingDispatch || state.RevisionPending || state.LegacyImport || (state.Command != nil && !state.Command.Applied) || (state.Review != nil && !state.ReviewPosted)
+		unfinished := r.Desired != nil || state.PendingDispatch || state.RevisionPending || (state.Command != nil && !state.Command.Applied) || (state.Review != nil && !state.ReviewPosted)
 		waiting := state.WaitingSince != nil && !state.Frozen && state.Dispatch == nil
 		if saved := r.Wakeup; saved != nil && (saved.Backoff > 0 || !saved.NotBefore.IsZero() || (!unfinished && waiting)) {
 			a.installWakeup(a.scheduler, work, &agenticWakeup{deadline: saved.Deadline, backoff: saved.Backoff, notBefore: saved.NotBefore, comment: saved.Comment}, saved.At)

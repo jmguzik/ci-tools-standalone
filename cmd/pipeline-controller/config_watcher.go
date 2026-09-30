@@ -30,10 +30,6 @@ func (a *AgenticConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return fmt.Errorf("unsupported repository agentic option %q; timeout and trusted authors are controller flags", key)
 	}
 	a.Mode = raw.Mode
-	return a.validate()
-}
-
-func (a AgenticConfig) validate() error {
 	if a.Mode != "" && !a.enabled() {
 		return fmt.Errorf("unsupported agentic mode %q", a.Mode)
 	}
@@ -79,9 +75,6 @@ func (r *RepoItem) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if r.Mode.Trigger == "" {
 		r.Mode.Trigger = "auto" // default to auto if not specified
 	}
-	if err := r.Mode.Agentic.validate(); err != nil {
-		return fmt.Errorf("repository %s: %w", r.Name, err)
-	}
 	if r.Mode.Agentic.enabled() && r.Mode.Trigger != "auto" && r.Mode.Trigger != "manual" && r.Mode.Trigger != "lgtm" {
 		return fmt.Errorf("repository %s: unsupported trigger %q", r.Name, r.Mode.Trigger)
 	}
@@ -122,11 +115,6 @@ func newWatcher(filePath string, logger *logrus.Entry) *watcher {
 }
 
 func (w *watcher) watch() {
-	// Load initial config
-	if err := w.reloadConfig(); err != nil {
-		w.logger.WithError(err).Error("Failed to load initial config")
-	}
-
 	// Use polling instead of fsnotify because git-sync doesn't trigger filesystem events
 	ticker := time.NewTicker(3 * time.Minute)
 	defer ticker.Stop()

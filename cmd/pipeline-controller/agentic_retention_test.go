@@ -131,7 +131,7 @@ func TestAgenticRetentionDisabledModesLeaveStorageUntouched(t *testing.T) {
 				info, err := os.Stat(path)
 				require.NoError(t, err)
 				require.True(t, info.ModTime().Equal(modified))
-				_, err = os.Stat(filepath.Join(f.a.options.stateDir, agenticLegacyImportRetired))
+				_, err = os.Stat(filepath.Join(f.a.options.stateDir, agenticFreshPlanMarker))
 				require.True(t, os.IsNotExist(err))
 			})
 		})
@@ -198,53 +198,29 @@ func TestAgenticRetentionEventCannotReuseExpiredSelectionOrGreenGate(t *testing.
 	require.Equal(t, 2, f.jobs.creates)
 }
 
-func TestAgenticRetentionTombstoneCannotReimportLegacyAuthorizationAfterTTLDisabled(t *testing.T) {
-	f := newAgenticFixture(t, "manual")
-	legacy := newAgenticState("org", "repo", &f.gh.pr, f.now.Add(-time.Hour))
-	legacy.RevisionPending = false
-	legacy.LastCommandID, legacy.ManualRequestID = 500, 500
-	legacy.Command = &agenticCommand{ID: 500, Command: "remaining", Applied: true}
-	legacy.Plan, legacy.Frozen = &agenticSelection{Source: "chai", Jobs: []agenticJob{}}, true
-	metadata, err := agenticMetadata(agenticStateMarker, legacy)
-	require.NoError(t, err)
-	f.gh.checks = []github.CheckRun{{ID: 1, Name: agenticGate, HeadSHA: legacy.HeadSHA, ExternalID: agenticExternalID("org", "repo", 42), Status: "completed", Conclusion: "success", Output: github.CheckRunOutput{Text: metadata}}}
-	f.gh.checks[0].App.ID = f.a.appID
-	f.plan(t, "job-a")
-	f.command(500, "remaining")
-	f.a.options.stateTTL = time.Hour
-	require.NoError(t, f.a.prepareStore())
-	tombstone := newAgenticState("org", "repo", &f.gh.pr, f.now)
-	tombstone.Inactive, tombstone.RevisionPending = true, false
-	require.NoError(t, f.a.writeRecord(context.Background(), &agenticRecord{State: tombstone}))
-	ageAgenticRecord(t, f, 42, f.now.Add(-time.Hour))
-	before := *f.gh
-	require.NoError(t, f.a.expireRecordsLocked(context.Background()))
-	require.Equal(t, before, *f.gh, "expiry modified the gate projection")
-	require.Equal(t, "success", f.gh.checks[0].Conclusion)
-	require.NoError(t, f.a.closeStore())
-	f.a.options.stateTTL = 0
-	f.now = f.now.Add(time.Minute)
-	f.passFirstStage(t)
-	f.reconcile(t, nil)
-	gate, state := f.gate(t)
-	require.Equal(t, int64(1), gate.ID)
-	require.NotEqual(t, "success", gate.Conclusion)
-	require.Zero(t, state.ManualRequestID)
-	require.Nil(t, state.Plan)
-	require.False(t, state.LegacyImport)
-	require.Zero(t, f.jobs.creates)
-}
-
 func TestAgenticRetentionMissingGateStillRequiresFreshPlan(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a")
-	f.a.options.stateTTL = time.Hour
-	f.reconcile(t, nil)
-	_, state := f.gate(t)
-	require.Nil(t, state.Plan, "missing projection accepted a pre-tracking plan in a retired store")
-	require.Zero(t, f.jobs.creates)
-	f.plan(t, "job-a")
-	f.reconcile(t, nil)
-	require.Equal(t, 1, f.jobs.creates)
+	for _, phase := range []string{"first-observation", "after-expiry-ttl-disabled"} {
+		t.Run(phase, func(t *testing.T) {
+			f := newReadyAgenticFixture(t, "auto", "job-a")
+			f.a.options.stateTTL = time.Hour
+			f.reconcile(t, nil)
+			if phase == "after-expiry-ttl-disabled" {
+				ageAgenticRecord(t, f, 42, f.now.Add(-time.Hour))
+				require.NoError(t, f.a.expireRecordsLocked(context.Background()))
+				require.Empty(t, f.a.store.entries)
+				require.NoError(t, f.a.closeStore())
+				f.a.options.stateTTL, f.gh.checks = 0, nil
+				f.now = f.now.Add(time.Minute)
+				f.reconcile(t, nil)
+			}
+			_, state := f.gate(t)
+			require.Nil(t, state.Plan, "missing state and gate accepted a pre-tracking plan")
+			require.Zero(t, f.jobs.creates)
+			f.plan(t, "job-a")
+			f.reconcile(t, nil)
+			require.Equal(t, 1, f.jobs.creates)
+		})
+	}
 }
 
 func TestAgenticRetentionPreservesCorruptionAndDurabilityFaults(t *testing.T) {
@@ -276,18 +252,18 @@ func TestAgenticRetentionPreservesCorruptionAndDurabilityFaults(t *testing.T) {
 	}
 }
 
-func TestAgenticRetentionRejectsInvalidRetirementMarker(t *testing.T) {
+func TestAgenticRetentionRejectsInvalidFreshPlanMarker(t *testing.T) {
 	for _, invalid := range []string{"nonempty", "symlink"} {
 		t.Run(invalid, func(t *testing.T) {
 			dir := t.TempDir()
-			path := filepath.Join(dir, agenticLegacyImportRetired)
+			path := filepath.Join(dir, agenticFreshPlanMarker)
 			if invalid == "symlink" {
 				require.NoError(t, os.Symlink(t.TempDir(), path))
 			} else {
 				require.NoError(t, os.WriteFile(path, []byte("invalid"), 0600))
 			}
 			_, err := openAgenticStore(dir)
-			require.ErrorContains(t, err, "retirement marker")
+			require.ErrorContains(t, err, "fresh-plan marker")
 		})
 	}
 }

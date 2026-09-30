@@ -33,11 +33,6 @@ func (a *agenticController) rememberStatusContexts(state *agenticState) {
 			contexts[job.Context] = true
 		}
 	}
-	if state.Dispatch != nil {
-		for _, execution := range state.Dispatch.Executions {
-			contexts[execution.Context] = true
-		}
-	}
 	state.StatusInterests = state.StatusInterests[:0]
 	for interest := range contexts {
 		state.StatusInterests = append(state.StatusInterests, interest)

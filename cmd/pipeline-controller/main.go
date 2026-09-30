@@ -898,47 +898,11 @@ func main() {
 			}
 		}
 
-		// If no repos found, retry once after a short delay
-		if len(repos) == 0 {
-			time.Sleep(100 * time.Millisecond)
-
-			// Retry getting configs
-			mainConfig = watcher.getConfig()
-			lgtmConfig = lgtmWatcher.getConfig()
-
-			for org, repoConfigs := range mainConfig {
-				for repo := range repoConfigs {
-					repos = append(repos, org+"/"+repo)
-				}
-			}
-
-			for org, repoConfigs := range lgtmConfig {
-				for repo := range repoConfigs {
-					orgRepo := org + "/" + repo
-					found := false
-					for _, existing := range repos {
-						if existing == orgRepo {
-							found = true
-							break
-						}
-					}
-					if !found {
-						repos = append(repos, orgRepo)
-					}
-				}
-			}
-		}
-
 		return repos
 	}
 
 	configDataProvider := NewConfigDataProvider(cfg, repoLister, logger.WithField("component", "config-data-provider"))
 	go configDataProvider.Run()
-
-	// Wait for config data provider to be ready
-	logger.Info("Waiting for config data provider to be ready...")
-	time.Sleep(2 * time.Second) // Give it time to load initial data
-	logger.Info("Config data provider should be ready")
 
 	pipelineAutoCache := NewPipelineAutoCache()
 	go func() {

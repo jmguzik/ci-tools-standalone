@@ -247,9 +247,9 @@ cannot replace fallback or a dispatched selection; push a new commit to change i
 `ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
 Recovery state lives in one JSON file per PR on a PVC; GitHub shows only the gate. Normal branches in mixed-mode repos may also have inactive records. New revisions reset state; observed PR closure deletes the file. Malformed state is preserved and blocks startup; repair or restore it.
 Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
-Enabling TTL permanently retires legacy GitHub-journal import in this directory, even if TTL is later disabled. Missing local state then requires a fresh post-tracking plan; tracked PRs still accept early plans for new commits.
+Enabling TTL permanently requires a fresh post-tracking plan when local state is missing, even if TTL is later disabled. Tracked PRs still accept early plans for new commits.
 Restart restores known deadlines and unfinished actions from disk, without scanning GitHub or replaying existing jobs. There is no polling or missed-event catch-up; a missed event may require another event or manual command.
-Without prior TTL activation, existing GitHub journals migrate on the next PR event. Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
+Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
 
 Before enrolling:
 

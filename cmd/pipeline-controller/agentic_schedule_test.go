@@ -291,27 +291,6 @@ func TestAgenticNonRetryableErrorsWaitForEvent(t *testing.T) {
 	}
 }
 
-func TestAgenticMalformedLegacyJournalWriteFailureRetries(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		stop := startAgenticRunner(f)
-		defer stop()
-		f.reconcile(t, nil)
-		f.gh.checks[0].Output.Text = agenticStateMarker + "\ninvalid saved state\n-->"
-		require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
-		f.gh.failCheck = true
-		if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil || !agenticRetryFor(err).transient {
-			t.Fatal("terminal journal error hid its transient failure-report error")
-		}
-		f.gh.failCheck = false
-		advanceAgenticTime(f, agenticInitialBackoff)
-		if f.gh.checks[0].Conclusion != "failure" || len(f.a.scheduler.pending) != 0 || f.jobs.creates != 0 {
-			t.Fatal("failure-report recovery did not stop after recording the terminal error")
-		}
-		assertAgenticIdle(t, f, time.Hour)
-	})
-}
-
 func TestAgenticRateLimitKeepsDeadlineAndOriginalCommand(t *testing.T) {
 	for _, kind := range []string{"server-wait", "no-hint"} {
 		t.Run(kind, func(t *testing.T) {

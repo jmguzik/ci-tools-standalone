@@ -4,7 +4,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
@@ -43,33 +42,6 @@ func TestAgenticConfigValidation(t *testing.T) {
 			require.NoError(t, err)
 			if item.Name != "repo" || item.Mode.Trigger != tc.trigger || item.Mode.Agentic.enabled() != tc.enabled {
 				t.Fatalf("unexpected repository configuration: %+v", item)
-			}
-		})
-	}
-}
-
-func TestAgenticMetadataEnvelope(t *testing.T) {
-	revision := agenticRevision{HeadSHA: strings.Repeat("a", 40), BaseBranch: "main", ObservedAt: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC), RevisionID: "revision"}
-	body, err := agenticMetadata(agenticRevisionMarker, revision)
-	require.NoError(t, err)
-	var decoded agenticRevision
-	if err := parseAgenticMetadata("Controller tracking comment\n\n"+body+"\n", agenticRevisionMarker, &decoded); err != nil || !reflect.DeepEqual(decoded, revision) {
-		t.Fatalf("controller journal did not round-trip: %+v / %v", decoded, err)
-	}
-	for _, tc := range []struct{ name, body string }{
-		{"missing marker", "Run protected."},
-		{"two markers", body + "\n" + body},
-		{"unterminated", strings.TrimSuffix(body, "-->")},
-		{"invalid JSON", agenticRevisionMarker + "\n{broken}\n-->"},
-		{"unknown field", agenticRevisionMarker + "\n{\"head_sha\":\"a\",\"surprise\":true}\n-->"},
-		{"two JSON objects", agenticRevisionMarker + "\n{} {}\n-->"},
-		{"array instead of object", agenticRevisionMarker + "\n[]\n-->"},
-		{"oversize", strings.Repeat("x", 64*1024) + body},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var got agenticRevision
-			if err := parseAgenticMetadata(tc.body, agenticRevisionMarker, &got); err == nil {
-				t.Fatal("accepted malformed or ambiguous metadata")
 			}
 		})
 	}

@@ -402,7 +402,7 @@ func TestAgenticSupersededReportRecovery(t *testing.T) {
 }
 
 func TestAgenticMalformedJournalFailsClosed(t *testing.T) {
-	for _, corruption := range []string{"metadata", "head", "external-id", "request", "dispatch"} {
+	for _, corruption := range []string{"metadata", "head", "external-id", "request", "command", "dispatch"} {
 		t.Run(corruption, func(t *testing.T) {
 			f := newReadyAgenticFixture(t, "auto")
 			f.reconcile(t, nil)
@@ -416,6 +416,9 @@ func TestAgenticMalformedJournalFailsClosed(t *testing.T) {
 				r.Gate.ExternalID = "not-the-controller-identity"
 			case "request":
 				state.ManualRequestID = 999 // no recorded command authorizes it
+			case "command":
+				state.LastCommandID = 0
+				state.Command = &agenticCommand{Command: "remaining"}
 			case "dispatch":
 				state.Dispatch = &agenticDispatch{ID: "unbound-execution"}
 			}
@@ -442,19 +445,15 @@ func TestAgenticForeignAppGateDoesNotAuthorizeDispatch(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.plan(t, "job-a")
 	f.reconcile(t, nil)
-	_, state := f.gate(t)
-	state.ManualRequestID, state.ForceRequestID, state.LastCommandID = 500, 500, 500
-	body, err := agenticMetadata(agenticStateMarker, state)
-	require.NoError(t, err)
+	body := f.gh.checks[0].Output.Text
 	f.gh.checks[0].App.ID = 999
-	f.gh.checks[0].Output.Text = body
 	f.gh.checks[0].Status, f.gh.checks[0].Conclusion = "completed", "success"
 	require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
 	f.passFirstStage(t)
 	f.reconcile(t, nil)
 	gate, recovered := f.gate(t)
 	if gate.ID == 1 || gate.Status != "in_progress" || recovered.ManualRequestID != 0 || f.jobs.creates != 0 || f.gh.checks[0].Output.Text != body {
-		t.Fatal("foreign App journal was trusted or modified")
+		t.Fatal("foreign App gate was reused or modified")
 	}
 }
 
@@ -475,7 +474,7 @@ func TestAgenticAutoOverrideStillWaitsForFirstStage(t *testing.T) {
 }
 
 func TestAgenticDepartureInvalidatesReturningRevision(t *testing.T) {
-	for _, source := range []string{"local-record", "legacy-marker", "legacy-no-marker", "legacy-other-head"} {
+	for _, source := range []string{"local-record", "missing-record", "missing-record-other-head"} {
 		t.Run(source, func(t *testing.T) {
 			f, _ := mixedAgenticFixture(t)
 			f.plan(t, "job-a")
@@ -487,16 +486,8 @@ func TestAgenticDepartureInvalidatesReturningRevision(t *testing.T) {
 			}
 			originalSHA := f.gh.pr.Head.SHA
 			if source != "local-record" {
-				metadata, err := agenticMetadata(agenticStateMarker, old)
-				require.NoError(t, err)
-				f.gh.checks[0].Output.Text = metadata
-				if source != "legacy-no-marker" {
-					body, err := agenticMetadata(agenticRevisionMarker, agenticRevision{HeadSHA: old.HeadSHA, BaseBranch: old.BaseBranch, ObservedAt: old.ObservedAt, RevisionID: old.RevisionID, CommentFloor: old.LastCommandID})
-					require.NoError(t, err)
-					f.gh.comments = append(f.gh.comments, github.IssueComment{ID: 501, Body: body, User: github.User{Login: "controller[bot]"}})
-				}
 				require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
-				if source == "legacy-other-head" {
+				if source == "missing-record-other-head" {
 					f.gh.pr.Head.SHA = strings.Repeat("c", 40)
 				}
 			}
@@ -517,7 +508,7 @@ func TestAgenticDepartureInvalidatesReturningRevision(t *testing.T) {
 				require.Zero(t, r.Gate.ID)
 				require.False(t, r.State.RevisionPending)
 				require.Equal(t, reads, f.gh.listCheckRunsCalls+f.gh.listCommentsCalls)
-				require.Len(t, f.gh.checkWrites, writes, "unimported departure published a gate")
+				require.Len(t, f.gh.checkWrites, writes, "missing-state departure published a gate")
 			}
 			require.NoError(t, f.a.closeStore()) // Reentry must honor the durable departure after restart.
 			f.gh.pr.Head.SHA = originalSHA

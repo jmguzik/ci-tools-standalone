@@ -41,7 +41,7 @@ func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticS
 		return nil
 	}
 	state.LastCommandID = comment.ID
-	state.Command = &agenticCommand{ID: comment.ID, Command: strings.ToLower(matches[0][1])}
+	state.Command = &agenticCommand{Command: strings.ToLower(matches[0][1])}
 	return a.saveState(gate, state, "", "Pipeline request recorded for this HEAD/base.")
 }
 
@@ -85,13 +85,13 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 	if command := state.Command; command != nil && !command.Applied {
 		switch command.Command {
 		case "required":
-			state.ManualRequestID, state.ForceRequestID = command.ID, command.ID
+			state.ManualRequestID, state.ForceRequestID = state.LastCommandID, state.LastCommandID
 			state.Dispatch = nil
 		case "remaining":
-			state.ManualRequestID = command.ID
+			state.ManualRequestID = state.LastCommandID
 		case "auto":
 			if cfg.Trigger != "lgtm" {
-				body := fmt.Sprintf("`/pipeline auto` is available only in LGTM mode.\n\n<!-- pipeline-controller:command:%d -->", command.ID)
+				body := fmt.Sprintf("`/pipeline auto` is available only in LGTM mode.\n\n<!-- pipeline-controller:command:%d -->", state.LastCommandID)
 				if err := a.ensureComment(state, comments, body); err != nil {
 					return err
 				}
@@ -111,14 +111,14 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 			if !state.Frozen {
 				state.Plan, state.WaitingSince = nil, nil
 			} else {
-				body := fmt.Sprintf("Normal selection is enabled for future pushes. The dispatched selection for `%s` is already fixed.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, command.ID)
+				body := fmt.Sprintf("Normal selection is enabled for future pushes. The dispatched selection for `%s` is already fixed.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, state.LastCommandID)
 				if err := a.ensureComment(state, comments, body); err != nil {
 					return err
 				}
 			}
 		case "agent-review":
 			if state.Frozen {
-				body := fmt.Sprintf("The selection for `%s` is already dispatched and cannot be replaced. Push a new commit to request a new selection.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, command.ID)
+				body := fmt.Sprintf("The selection for `%s` is already dispatched and cannot be replaced. Push a new commit to request a new selection.\n\n<!-- pipeline-controller:command:%d -->", state.HeadSHA, state.LastCommandID)
 				if err := a.ensureComment(state, comments, body); err != nil {
 					return err
 				}
@@ -137,7 +137,7 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 				}
 				state.Plan, state.WaitingSince = nil, nil
 				state.Review = &agenticReviewRequest{HeadSHA: state.HeadSHA, BaseBranch: state.BaseBranch,
-					RequestID: agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, strconv.Itoa(command.ID))}
+					RequestID: agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, strconv.Itoa(state.LastCommandID))}
 				state.ReviewPosted = false
 			}
 		}

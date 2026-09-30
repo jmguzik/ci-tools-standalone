@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-const agenticLegacyImportRetired = ".legacy-import-retired"
+const agenticFreshPlanMarker = ".fresh-plan-required"
 
-func (s *agenticStore) loadLegacyImportRetirement() error {
-	info, err := os.Lstat(filepath.Join(s.dir, agenticLegacyImportRetired))
+func (s *agenticStore) loadFreshPlanRequirement() error {
+	info, err := os.Lstat(filepath.Join(s.dir, agenticFreshPlanMarker))
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -20,37 +20,37 @@ func (s *agenticStore) loadLegacyImportRetirement() error {
 		return err
 	}
 	if !info.Mode().IsRegular() || info.Size() != 0 {
-		return fmt.Errorf("invalid agentic legacy-import retirement marker")
+		return fmt.Errorf("invalid agentic fresh-plan marker")
 	}
-	s.legacyImportRetired = true
+	s.requireFreshPlan = true
 	return nil
 }
 
-// This constant-size marker outlives expired departure records. Missing local
-// state can no longer import stale manual authorization from GitHub, including
-// after a later restart with TTL disabled. Caller holds mu and the store flock.
-func (s *agenticStore) retireLegacyImport() error {
+// This constant-size marker outlives expired records. Missing state requires
+// a fresh plan, even after a restart with TTL disabled and a deleted gate.
+// Caller holds mu and the store flock.
+func (s *agenticStore) requireFreshPlans() error {
 	if s.fault != nil {
 		return s.fault
 	}
-	if s.legacyImportRetired {
+	if s.requireFreshPlan {
 		return nil
 	}
-	file, err := os.OpenFile(filepath.Join(s.dir, agenticLegacyImportRetired), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	file, err := os.OpenFile(filepath.Join(s.dir, agenticFreshPlanMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if syncErr != nil || closeErr != nil {
-		s.fault = fmt.Errorf("syncing agentic legacy-import retirement: %w", errors.Join(syncErr, closeErr))
+		s.fault = fmt.Errorf("syncing agentic fresh-plan marker: %w", errors.Join(syncErr, closeErr))
 		return s.fault
 	}
 	if err := s.directory.Sync(); err != nil {
-		s.fault = fmt.Errorf("syncing agentic legacy-import retirement directory: %w", err)
+		s.fault = fmt.Errorf("syncing agentic fresh-plan marker directory: %w", err)
 		return s.fault
 	}
-	s.legacyImportRetired = true
+	s.requireFreshPlan = true
 	return nil
 }
 
@@ -76,7 +76,7 @@ func (a *agenticController) expireRecordLocked(ctx context.Context, name string,
 	if now.Sub(info.ModTime()) < a.options.stateTTL {
 		return false, nil
 	}
-	if err := a.store.retireLegacyImport(); err != nil {
+	if err := a.store.requireFreshPlans(); err != nil {
 		return false, err
 	}
 	r, err := a.store.read(name)

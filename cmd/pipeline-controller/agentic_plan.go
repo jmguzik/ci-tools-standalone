@@ -1,9 +1,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -14,11 +12,9 @@ import (
 )
 
 const (
-	agenticPlanMarker     = "Chai test plan"
-	agenticStateMarker    = "<!-- pipeline-controller:state:v1"
-	agenticRevisionMarker = "<!-- pipeline-controller:revision:v1"
-	agenticGate           = "ci/tests-dispatched"
-	agenticSkipLabel      = "pipeline-skip-agent-review"
+	agenticPlanMarker = "Chai test plan"
+	agenticGate       = "ci/tests-dispatched"
+	agenticSkipLabel  = "pipeline-skip-agent-review"
 )
 
 // agenticPlan is parsed directly from the visible Markdown, without a second
@@ -101,31 +97,6 @@ type agenticJob struct {
 	Name     string `json:"name"`
 	Context  string `json:"context"`
 	Optional bool   `json:"optional,omitempty"`
-}
-
-// parseAgenticMetadata reads legacy state/revision metadata during lazy import.
-// Chai plans use parseAgenticPlan, not hidden JSON.
-func parseAgenticMetadata(body, marker string, into interface{}) error {
-	if len(body) > 64*1024 {
-		return fmt.Errorf("comment exceeds 64 KiB")
-	}
-	if strings.Count(body, marker) != 1 {
-		return fmt.Errorf("expected exactly one %s metadata block", strings.TrimPrefix(marker, "<!-- "))
-	}
-	_, rest, _ := strings.Cut(body, marker)
-	raw, _, closed := strings.Cut(rest, "-->")
-	if !closed {
-		return fmt.Errorf("unterminated metadata block")
-	}
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(into); err != nil {
-		return fmt.Errorf("invalid metadata: %w", err)
-	}
-	if err := decoder.Decode(new(interface{})); err != io.EOF {
-		return fmt.Errorf("metadata must contain exactly one JSON object")
-	}
-	return nil
 }
 
 func formatAgenticReview(request agenticReviewRequest) string {
@@ -239,7 +210,7 @@ func latestAgenticJobs(pjs []v1.ProwJob, org, repo string, pr *github.PullReques
 }
 
 // agenticFirstStageReady is deliberately independent of second-stage existence.
-// Unlike the legacy duplicate guard, it also works after a partial dispatch.
+// Unlike the ordinary duplicate guard, it also works after a partial dispatch.
 func agenticFirstStageReady(static []config.Presubmit, latest map[string]*v1.ProwJob, statuses *github.CombinedStatus, witnesses map[string]agenticFirstStageWitness, pr *github.PullRequest, ghc minimalGhClient, org, repo string) (bool, error) {
 	changes := config.NewGitHubDeferredChangedFilesProvider(ghc, org, repo, pr.Number)
 	ready := true
@@ -268,7 +239,7 @@ func agenticFirstStageReady(static []config.Presubmit, latest map[string]*v1.Pro
 					delete(witnesses, p.Name)
 					ready = false
 				} else {
-					witnesses[p.Name] = agenticFirstStageWitness{Context: p.Context, ProwJob: pj.Name, URL: pj.Status.URL}
+					witnesses[p.Name] = agenticFirstStageWitness{Context: p.Context, URL: pj.Status.URL}
 				}
 			} else {
 				// Commit statuses alone are not base-branch-scoped. Only reuse a

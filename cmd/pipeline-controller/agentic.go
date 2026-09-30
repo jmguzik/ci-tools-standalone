@@ -46,7 +46,6 @@ type agenticSelection struct {
 }
 
 type agenticCommand struct {
-	ID      int    `json:"id"`
 	Command string `json:"command"`
 	Applied bool   `json:"applied,omitempty"`
 }
@@ -68,7 +67,6 @@ type agenticDispatch struct {
 
 type agenticFirstStageWitness struct {
 	Context string `json:"context"`
-	ProwJob string `json:"prowjob"`
 	URL     string `json:"url"`
 }
 
@@ -102,7 +100,6 @@ type agenticState struct {
 	StatusInterests  []string                            `json:"status_interests,omitempty"`
 	PendingDispatch  bool                                `json:"pending_dispatch,omitempty"`
 	RevisionPending  bool                                `json:"revision_pending,omitempty"`
-	LegacyImport     bool                                `json:"legacy_import,omitempty"`
 	record           *agenticRecord
 }
 
@@ -172,7 +169,7 @@ func (a *agenticController) loadState(org, repo string, pr *github.PullRequest) 
 			return nil, nil, err // No owned lock: never publish another writer's gate.
 		}
 		// An unreadable local record must not leave an owned successful gate
-		// green. This exceptional lookup never imports or replaces the record.
+		// green. This exceptional lookup never replaces the record.
 		checks, lookupErr := a.gh.ListCheckRuns(org, repo, pr.Head.SHA)
 		if lookupErr != nil {
 			return nil, nil, errors.Join(err, lookupErr)
@@ -205,7 +202,7 @@ func (a *agenticController) loadState(org, repo string, pr *github.PullRequest) 
 		// A return to an earlier SHA must reopen its existing gate, not create
 		// another same-name run beside an old success.
 		r.Gate = github.CheckRun{}
-		found, _, err := a.findGate(org, repo, pr)
+		found, err := a.findGate(org, repo, pr)
 		if err != nil {
 			return found, nil, err
 		}
@@ -218,32 +215,28 @@ func (a *agenticController) loadState(org, repo string, pr *github.PullRequest) 
 		}
 		return found, fresh, nil
 	}
-	gate, imported, err := a.findGate(org, repo, pr)
+	gate, err := a.findGate(org, repo, pr)
 	if err != nil {
 		return gate, nil, err
 	}
-	state := imported
-	if state == nil {
-		state = newAgenticState(org, repo, pr, a.currentTime().Truncate(time.Second))
-		if gate.ID != 0 || (a.store != nil && a.store.legacyImportRetired) {
-			state.PlanNotBefore = &state.ObservedAt
-		}
+	state := newAgenticState(org, repo, pr, a.currentTime().Truncate(time.Second))
+	if gate.ID != 0 || (a.store != nil && a.store.requireFreshPlan) {
+		state.PlanNotBefore = &state.ObservedAt
 	}
 	r = &agenticRecord{State: state, Gate: *gate}
 	state.record = r
 	return gate, state, nil
 }
 
-// Used only when the local record has no gate for this SHA. Old GitHub journals
-// are imported lazily on an actual PR event, never in a startup migration scan.
-func (a *agenticController) findGate(org, repo string, pr *github.PullRequest) (*github.CheckRun, *agenticState, error) {
+// Used only when the local record has no gate for this SHA.
+func (a *agenticController) findGate(org, repo string, pr *github.PullRequest) (*github.CheckRun, error) {
 	checks, err := a.gh.ListCheckRuns(org, repo, pr.Head.SHA)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	gate := &github.CheckRun{}
 	if checks == nil {
-		return nil, nil, fmt.Errorf("empty check-run response")
+		return nil, fmt.Errorf("empty check-run response")
 	}
 	for _, check := range checks.CheckRuns {
 		if check.Name == agenticGate && check.App.ID == a.appID && check.ID > gate.ID {
@@ -251,46 +244,7 @@ func (a *agenticController) findGate(org, repo string, pr *github.PullRequest) (
 			gate = &copy
 		}
 	}
-	if gate.ID == 0 {
-		return gate, nil, nil
-	}
-	if gate.ExternalID != agenticExternalID(org, repo, pr.Number) {
-		fresh := newAgenticState(org, repo, pr, a.currentTime().Truncate(time.Second))
-		fresh.RevisionPending = true
-		return gate, fresh, nil // Live collision validation precedes takeover.
-	}
-	if a.store != nil && a.store.legacyImportRetired {
-		// An expired departure boundary must never resurrect authorization
-		// from a legacy GitHub journal, even if TTL is later disabled.
-		return gate, nil, nil
-	}
-	if !strings.Contains(gate.Output.Text, agenticStateMarker) {
-		return gate, nil, nil // Presentation-only gate; local state was retired.
-	}
-	var legacy struct {
-		agenticState
-		RevisionUpdate *agenticRevision `json:"revision_update,omitempty"`
-		Departure      *agenticRevision `json:"departure,omitempty"`
-	}
-	if err := parseAgenticMetadata(gate.Output.Text, agenticStateMarker, &legacy); err != nil {
-		return gate, nil, fmt.Errorf("cannot recover controller gate: %w", err)
-	}
-	state := legacy.agenticState
-	if state.Version != 1 || state.Org != org || state.Repo != repo || state.HeadSHA != pr.Head.SHA || gate.HeadSHA != pr.Head.SHA || state.ObservedAt.IsZero() || state.RevisionID == "" || gate.ExternalID != agenticExternalID(org, repo, state.Number) {
-		return gate, nil, fmt.Errorf("controller gate has invalid revision identity")
-	}
-	if state.BaseBranch != pr.Base.Ref || state.Number != pr.Number || legacy.Departure != nil {
-		fresh := newAgenticState(org, repo, pr, a.currentTime())
-		fresh.RevisionID = agenticID(state.RevisionID, fresh.RevisionID)
-		fresh.PlanNotBefore = &fresh.ObservedAt
-		fresh.RevisionPending = true
-		return gate, fresh, nil
-	}
-	if err := validateAgenticState(&state); err != nil {
-		return gate, nil, fmt.Errorf("cannot recover controller gate: %w", err)
-	}
-	state.LegacyImport = true
-	return gate, &state, nil
+	return gate, nil
 }
 
 func validateAgenticState(state *agenticState) error {
@@ -298,11 +252,11 @@ func validateAgenticState(state *agenticState) error {
 		return fmt.Errorf("invalid persisted request identity")
 	}
 	for name, witness := range state.FirstStage {
-		if name == "" || witness.Context == "" || witness.Context == agenticGate || witness.ProwJob == "" || witness.URL == "" {
+		if name == "" || witness.Context == "" || witness.Context == agenticGate || witness.URL == "" {
 			return fmt.Errorf("invalid first-stage witness")
 		}
 	}
-	if state.LastCommandID < 0 || (state.Command != nil && (state.Command.ID <= 0 || state.Command.ID != state.LastCommandID || !validAgenticCommand(state.Command.Command))) {
+	if state.LastCommandID < 0 || (state.Command != nil && (state.LastCommandID <= 0 || !validAgenticCommand(state.Command.Command))) {
 		return fmt.Errorf("invalid persisted command")
 	}
 	if state.Review != nil && (state.Review.HeadSHA != state.HeadSHA || state.Review.BaseBranch != state.BaseBranch || state.Review.RequestID == "") {
@@ -362,9 +316,6 @@ func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState
 	previousSuccess := hadPending && r.Desired.Conclusion == "success"
 	r.Reopen = r.Reopen || (status == "in_progress" && (gate.Conclusion == "success" || previousSuccess))
 	r.State, r.Gate = state, *gate
-	if strings.Contains(r.Gate.Output.Text, agenticStateMarker) {
-		r.Gate.Output.Text = ""
-	} // Do not duplicate the imported journal.
 	r.Gate.ExternalID = next.ExternalID // Commit-scoped gate ownership can transfer after collision validation.
 	if !hadPending && !r.Reopen && gate.ID != 0 && gate.ExternalID == next.ExternalID && gate.Status == next.Status && (gate.Conclusion == next.Conclusion || (status == "in_progress" && gate.Conclusion != "success")) &&
 		gate.Output.Title == next.Output.Title && gate.Output.Summary == next.Output.Summary && gate.Output.Text == next.Output.Text {
@@ -382,7 +333,7 @@ func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState
 	if gate.ID == 0 {
 		// An earlier create may have succeeded despite a lost response. This
 		// lookup is exceptional: records with an ID never list CheckRuns.
-		existing, _, err := a.findGate(state.Org, state.Repo, &github.PullRequest{Number: state.Number, Head: github.PullRequestBranch{SHA: state.HeadSHA}, Base: github.PullRequestBranch{Ref: state.BaseBranch}})
+		existing, err := a.findGate(state.Org, state.Repo, &github.PullRequest{Number: state.Number, Head: github.PullRequestBranch{SHA: state.HeadSHA}, Base: github.PullRequestBranch{Ref: state.BaseBranch}})
 		if err != nil {
 			return err
 		}
@@ -489,7 +440,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 	}
 	gate, state, err := a.loadState(org, repo, pr)
 	if err != nil {
-		// Do not turn an unreadable journal into a fresh, empty selection. Close
+		// Do not turn an unreadable record into a fresh, empty selection. Close
 		// our own check, preserving the malformed data for diagnosis.
 		if gate != nil && gate.ID != 0 {
 			if writeErr := a.gh.UpdateCheckRun(org, repo, gate.ID, github.CheckRun{Status: "completed", Conclusion: "failure", Output: github.CheckRunOutput{Title: "Cannot recover dispatch", Summary: err.Error(), Text: gate.Output.Text}}); writeErr != nil {
@@ -533,12 +484,11 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 	// collision check. Stable waiting events need no repository listing.
 	if gate.ID == 0 || state.RevisionPending {
 		if err := checkCollision(); err != nil {
-			// Preserve the owner's journal, including frozen selections/executions.
+			// Preserve the owner's record, including frozen selections/executions.
 			return a.failExistingGate(gate, state, err)
 		}
 	}
-	state, err = a.ensureRevision(gate, state, pr, comments)
-	if err != nil {
+	if err := a.ensureRevision(gate, state, comments); err != nil {
 		return a.failState(gate, state, err)
 	}
 	// Finish already-recorded side effects before accepting a later command.

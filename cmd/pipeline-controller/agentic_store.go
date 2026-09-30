@@ -21,16 +21,15 @@ const agenticRecordLimit = 192 * 1024
 
 var agenticRecordFilename = regexp.MustCompile(`^pipeline-agentic-[0-9a-f]{32}\.json$`)
 
-// One authoritative record replaces the CheckRun journal and revision comment.
+// One authoritative record holds each PR's recovery state.
 // Desired is persisted before publishing the gate; Wakeup uses the existing
 // scheduler rather than introducing a second recovery queue.
 type agenticRecord struct {
-	State     *agenticState       `json:"state"`
-	Gate      github.CheckRun     `json:"gate"`
-	Desired   *github.CheckRun    `json:"desired,omitempty"`
-	Reopen    bool                `json:"reopen,omitempty"`
-	Wakeup    *agenticSavedWakeup `json:"wakeup,omitempty"`
-	persisted bool
+	State   *agenticState       `json:"state"`
+	Gate    github.CheckRun     `json:"gate"`
+	Desired *github.CheckRun    `json:"desired,omitempty"`
+	Reopen  bool                `json:"reopen,omitempty"`
+	Wakeup  *agenticSavedWakeup `json:"wakeup,omitempty"`
 }
 
 type agenticSavedWakeup struct {
@@ -48,13 +47,13 @@ func agenticRecordName(org, repo string, number int) string {
 // Only routing metadata is retained in memory. Every transition reads its
 // authoritative record from disk while the controller holds mu and the lock.
 type agenticStore struct {
-	dir                 string
-	lock                *os.File
-	directory           *os.File
-	entries             map[string]agenticWork
-	routes              map[agenticWork]map[string]bool
-	fault               error // A failed directory sync leaves durability uncertain until restart.
-	legacyImportRetired bool
+	dir              string
+	lock             *os.File
+	directory        *os.File
+	entries          map[string]agenticWork
+	routes           map[agenticWork]map[string]bool
+	fault            error // A failed directory sync leaves durability uncertain until restart.
+	requireFreshPlan bool
 }
 
 func openAgenticStore(dir string) (_ *agenticStore, err error) {
@@ -81,7 +80,7 @@ func openAgenticStore(dir string) (_ *agenticStore, err error) {
 	if err = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return nil, fmt.Errorf("locking agentic state directory: %w", err)
 	}
-	if err = s.loadLegacyImportRetirement(); err != nil {
+	if err = s.loadFreshPlanRequirement(); err != nil {
 		return nil, err
 	}
 	files, err := os.ReadDir(dir)
@@ -92,9 +91,6 @@ func openAgenticStore(dir string) (_ *agenticStore, err error) {
 		name := file.Name()
 		if !strings.HasPrefix(name, "pipeline-agentic-") {
 			continue // Includes abandoned .agentic-*.tmp files and the lock.
-		}
-		if !agenticRecordFilename.MatchString(name) {
-			return nil, fmt.Errorf("invalid agentic record filename %q", name)
 		}
 		r, err := s.read(name)
 		if err != nil {
@@ -214,7 +210,7 @@ func decodeAgenticRecord(name string, data []byte) (*agenticRecord, error) {
 	if r.Wakeup != nil && (r.Wakeup.At.IsZero() || r.Wakeup.Backoff < 0 || r.Wakeup.NotBefore.After(r.Wakeup.At)) {
 		return nil, fmt.Errorf("invalid wakeup in %s", name)
 	}
-	r.persisted, s.record = true, &r
+	s.record = &r
 	return &r, nil
 }
 
@@ -238,7 +234,7 @@ func (a *agenticController) prepareStoreLocked() error {
 	}
 	a.store = store
 	if a.options.stateTTL > 0 {
-		if err = store.retireLegacyImport(); err == nil {
+		if err = store.requireFreshPlans(); err == nil {
 			err = a.expireRecordsLocked(context.Background())
 		}
 		if err != nil {
@@ -340,7 +336,6 @@ func (a *agenticController) writeRecord(ctx context.Context, r *agenticRecord) e
 		s.fault = fmt.Errorf("syncing agentic state directory: %w", err)
 		return s.fault
 	}
-	r.persisted = true
 	previous, known := s.entries[name]
 	s.index(name, r.State)
 	if known {

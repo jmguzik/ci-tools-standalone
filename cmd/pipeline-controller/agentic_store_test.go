@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,11 +36,11 @@ func TestAgenticStateWriteFailureBlocksSideEffects(t *testing.T) {
 	}
 }
 
-func TestAgenticUnimportedDepartureWriteFailureBlocksReentry(t *testing.T) {
+func TestAgenticMissingStateDepartureWriteFailureBlocksReentry(t *testing.T) {
 	f, _ := mixedAgenticFixture(t)
 	f.gh.pr.Base.Ref = "release"
 	require.NoError(t, f.a.prepareStore())
-	// Persisting an unimported departure has the same durability boundary
+	// Persisting a missing-state departure has the same durability boundary
 	// as an active transition, even though it publishes no GitHub gate.
 	require.NoError(t, f.a.store.directory.Close())
 	require.Error(t, f.tryReconcile(nil))
@@ -167,79 +166,6 @@ func TestAgenticStoreUpdatesHeadAndDeletionRouting(t *testing.T) {
 			require.Empty(t, f.a.store.entries)
 			require.Empty(t, f.a.store.routes)
 			require.Empty(t, f.a.statusContexts)
-		})
-	}
-}
-
-func TestAgenticLegacyImportPreservesOnlyCurrentSelection(t *testing.T) {
-	for _, marker := range []string{"matching", "new-command", "other-head", "inactive", "wrong-generation", "interrupted-import"} {
-		t.Run(marker, func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
-			f.reconcile(t, nil)
-			f.reconcile(t, f.command(500, "remaining"))
-			gate, original := f.gate(t)
-			original.PlanCommentFloor, original.PlanNotBefore = 50, &original.ObservedAt
-			revision := agenticRevision{HeadSHA: original.HeadSHA, BaseBranch: original.BaseBranch, ObservedAt: original.ObservedAt, RevisionID: original.RevisionID, CommentFloor: 500, PlanFloor: 50}
-			// Include the old protocol fields, not only the replacement schema.
-			legacy := struct {
-				*agenticState
-				RevisionUpdate *agenticRevision `json:"revision_update,omitempty"`
-				Departure      *agenticRevision `json:"departure,omitempty"`
-			}{agenticState: original, RevisionUpdate: &revision}
-			metadata, err := agenticMetadata(agenticStateMarker, legacy)
-			require.NoError(t, err)
-			f.gh.checks[0].Output.Text = metadata
-			switch marker {
-			case "other-head", "interrupted-import":
-				revision.HeadSHA = strings.Repeat("c", 40)
-			case "inactive":
-				revision.Inactive = true
-			case "wrong-generation":
-				revision.RevisionID = "previous-observed-visit"
-			}
-			body, err := agenticMetadata(agenticRevisionMarker, revision)
-			require.NoError(t, err)
-			f.gh.comments = append(f.gh.comments, github.IssueComment{ID: 501, Body: body, User: github.User{Login: "controller[bot]"}})
-			if marker == "new-command" {
-				f.command(502, "remaining")
-			}
-			require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
-			if marker == "interrupted-import" {
-				f.gh.listCommentsError = io.ErrUnexpectedEOF
-				require.Error(t, f.tryReconcile(nil))
-				f.gh.listCommentsError = nil
-			}
-			f.reconcile(t, nil)
-			recoveredGate, state := f.gate(t)
-			require.Equal(t, gate.ID, recoveredGate.ID)
-			require.Equal(t, 1, f.jobs.creates, "migration created another execution")
-			require.NotContains(t, f.gh.checks[0].Output.Text, agenticStateMarker, "GitHub still stores recovery metadata")
-			if marker == "matching" || marker == "new-command" {
-				commandID := 500
-				if marker == "new-command" {
-					commandID = 502
-				}
-				require.True(t, state.Frozen)
-				require.Equal(t, original.Dispatch, state.Dispatch)
-				require.Equal(t, commandID, state.LastCommandID)
-				require.NotNil(t, state.Command)
-				require.Equal(t, commandID, state.Command.ID)
-				require.True(t, state.Command.Applied)
-				require.Equal(t, commandID, state.ManualRequestID)
-				require.Equal(t, original.PlanCommentFloor, state.PlanCommentFloor)
-				require.Equal(t, original.PlanNotBefore, state.PlanNotBefore)
-			} else {
-				require.False(t, state.Frozen)
-				require.Nil(t, state.Plan)
-				require.Nil(t, state.Dispatch)
-				require.Zero(t, state.ManualRequestID)
-				require.NotEqual(t, original.RevisionID, state.RevisionID)
-			}
-			// The imported record is authoritative after the one-time lookup.
-			reads := f.gh.listCheckRunsCalls
-			_, _, err = f.a.loadState("org", "repo", &f.gh.pr)
-			require.NoError(t, err)
-			require.Equal(t, reads, f.gh.listCheckRunsCalls)
 		})
 	}
 }

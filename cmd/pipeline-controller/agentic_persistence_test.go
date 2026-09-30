@@ -172,6 +172,7 @@ func TestAgenticGateTransferRetiresOwnerAfterMissedClose(t *testing.T) {
 	f.reconcile(t, nil)
 	oldGate, oldState := f.gate(t)
 	f.gh.pr.Number, f.gh.comments = 43, nil // #42 closed without a webhook.
+	f.plan(t, "job-b")                      // Reusing another PR's gate requires a post-tracking plan.
 	f.reconcile(t, nil)
 	siblingGate, siblingState := f.gate(t)
 	if siblingGate.ID != oldGate.ID || len(f.gh.checks) != 1 || siblingGate.Conclusion == "success" || siblingState.Number != 43 || siblingState.ManualRequestID != 0 || siblingState.Plan != nil {
