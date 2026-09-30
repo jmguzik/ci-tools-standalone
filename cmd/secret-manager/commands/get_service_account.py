@@ -36,7 +36,7 @@ def get_service_account(collection: str):
         response = client.access_secret_version(request={"name": name})
     except PermissionDenied:
         raise click.ClickException(
-            f"You don't have permission to access service account credentials for collection '{collection}'"
+            f"No updater service account is configured for collection '{collection}'"
         )
     except NotFound:
         raise click.ClickException(
