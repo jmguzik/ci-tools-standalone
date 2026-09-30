@@ -1,31 +1,12 @@
 package main
 
 import (
-	"context"
 	"reflect"
 
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/kube"
 )
-
-// Kind.WaitForSync includes this handler's initial delivery, not just cache sync.
-type readyProwJobSource struct {
-	source.SyncingSource
-	ready chan struct{}
-}
-
-func (s *readyProwJobSource) WaitForSync(ctx context.Context) error {
-	if err := s.SyncingSource.WaitForSync(ctx); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	close(s.ready)
-	return nil
-}
 
 func (r *reconciler) shouldReconcileProwJobCreate(create event.CreateEvent) bool {
 	pj, ok := create.Object.(*v1.ProwJob)
@@ -33,7 +14,7 @@ func (r *reconciler) shouldReconcileProwJobCreate(create event.CreateEvent) bool
 		return true
 	}
 	_, agentic := r.agentic.repoConfig(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.BaseRef)
-	return !agentic // Startup recovery handles these PRs after the watch is ready.
+	return !agentic // Restarts intentionally do not replay historical agentic jobs.
 }
 
 func (r *reconciler) shouldReconcileProwJobUpdate(update event.UpdateEvent) bool {

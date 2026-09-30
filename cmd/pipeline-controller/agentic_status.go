@@ -1,9 +1,12 @@
 package main
 
-import "sigs.k8s.io/prow/pkg/github"
+import (
+	"sigs.k8s.io/prow/pkg/github"
+	"sort"
+)
 
-// Caller holds mu. Retain positive interests until restart: configuration changes
-// must not hide a report for an execution already recorded in the journal.
+// Caller holds mu. Retain interests while records route this SHA: configuration
+// changes must not hide a report for an execution already recorded in the journal.
 func (a *agenticController) rememberStatusContexts(state *agenticState) {
 	if a.statusContexts == nil {
 		a.statusContexts = map[agenticWork]map[string]bool{}
@@ -19,6 +22,9 @@ func (a *agenticController) rememberStatusContexts(state *agenticState) {
 			contexts[job.Context] = true
 		}
 	}
+	for _, interest := range state.StatusInterests {
+		contexts[interest] = true
+	}
 	for _, witness := range state.FirstStage {
 		contexts[witness.Context] = true
 	}
@@ -32,6 +38,11 @@ func (a *agenticController) rememberStatusContexts(state *agenticState) {
 			contexts[execution.Context] = true
 		}
 	}
+	state.StatusInterests = state.StatusInterests[:0]
+	for interest := range contexts {
+		state.StatusInterests = append(state.StatusInterests, interest)
+	}
+	sort.Strings(state.StatusInterests)
 }
 
 func (a *agenticController) shouldHandleAgenticStatus(event github.StatusEvent) bool {

@@ -1,56 +1,14 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 )
-
-type fakeProwJobSyncSource struct {
-	source.SyncingSource
-	wait func(context.Context) error
-}
-
-func (s fakeProwJobSyncSource) WaitForSync(ctx context.Context) error { return s.wait(ctx) }
-
-func TestProwJobSourceReadiness(t *testing.T) {
-	for _, outcome := range []string{"synced", "error", "canceled"} {
-		t.Run(outcome, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			s := &readyProwJobSource{ready: make(chan struct{}), SyncingSource: fakeProwJobSyncSource{
-				wait: func(context.Context) error {
-					if outcome == "error" {
-						return errors.New("handler did not sync")
-					}
-					if outcome == "canceled" {
-						cancel() // Kind.WaitForSync can return nil on cancellation.
-					}
-					return nil
-				},
-			}}
-			err := s.WaitForSync(ctx)
-			if outcome == "synced" {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
-			}
-			select {
-			case <-s.ready:
-				require.Equal(t, "synced", outcome)
-			default:
-				require.NotEqual(t, "synced", outcome)
-			}
-		})
-	}
-}
 
 func TestAgenticProwJobInitialCreates(t *testing.T) {
 	f, _ := mixedAgenticFixture(t)
@@ -75,34 +33,56 @@ func TestAgenticProwJobInitialCreates(t *testing.T) {
 	}
 }
 
-func TestAgenticStartupWaitsForWatch(t *testing.T) {
-	for _, outcome := range []string{"recover", "cancel"} {
-		t.Run(outcome, func(t *testing.T) {
+func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
+	for _, phase := range []string{"untracked", "first-stage", "manual-trigger", "manual-plan", "empty-plan", "inflight", "completed"} {
+		t.Run(phase, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				f := newScheduledAgenticFixture(t, "auto")
-				ready := make(chan struct{})
-				f.a.prowJobWatchReady = ready
+				mode := "auto"
+				if phase == "manual-trigger" || phase == "manual-plan" {
+					mode = "manual"
+				}
+				f := newScheduledAgenticFixture(t, mode)
+				if phase != "untracked" {
+					if phase != "first-stage" {
+						f.passFirstStage(t)
+						if phase == "empty-plan" {
+							f.plan(t)
+						} else if phase != "manual-trigger" {
+							f.plan(t, "job-a")
+						}
+					}
+					f.reconcile(t, nil)
+					if phase == "completed" {
+						f.report(t, v1.PendingState)
+						f.reconcile(t, nil)
+					}
+					if phase == "empty-plan" || phase == "completed" {
+						gate, _ := f.gate(t)
+						require.Equal(t, "success", gate.Conclusion)
+					}
+				}
+				// A new process has no scheduler or SHA/context interest cache.
+				previous := f.a
+				require.NoError(t, previous.closeStore())
+				f.a = &agenticController{gh: previous.gh, jobs: previous.jobs, reader: previous.reader,
+					config: previous.config, watcher: previous.watcher, lgtmWatcher: previous.lgtmWatcher,
+					appID: previous.appID, logger: previous.logger, options: previous.options, now: previous.now}
+				reads, lists := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls
+				checks, comments, statuses := f.gh.listCheckRunsCalls, f.gh.listCommentsCalls, f.gh.getCombinedStatusCalls
+				writes, history := len(f.gh.checkWrites), f.gh.listStatusesCalls
 				stop := startAgenticRunner(f)
 				defer stop()
-				require.Zero(t, f.gh.getPullRequestsCalls)
-				require.Zero(t, f.gh.getPullRequestCalls)
-				require.Empty(t, f.gh.checkWrites)
-				if outcome == "cancel" {
-					stop()
-					require.Zero(t, f.gh.getPullRequestsCalls)
-					require.Nil(t, f.a.scheduler)
-					return
-				}
-				// Changes before the handler is ready must be seen by recovery,
-				// even though its initial ProwJob notifications will be skipped.
-				f.passFirstStage(t)
-				f.plan(t)
-				close(ready)
-				synctest.Wait()
-				check, _ := f.gate(t)
-				require.Equal(t, "success", check.Conclusion)
-				require.Equal(t, 2, f.gh.getPullRequestsCalls) // One scan plus the existing collision guard.
 				assertAgenticIdle(t, f, 24*time.Hour)
+				require.Equal(t, reads, f.gh.getPullRequestCalls)
+				require.Equal(t, lists, f.gh.getPullRequestsCalls)
+				require.Equal(t, checks, f.gh.listCheckRunsCalls)
+				require.Equal(t, comments, f.gh.listCommentsCalls)
+				require.Equal(t, statuses, f.gh.getCombinedStatusCalls)
+				require.Equal(t, history, f.gh.listStatusesCalls)
+				require.Len(t, f.gh.checkWrites, writes)
+				if phase == "untracked" {
+					require.Empty(t, f.gh.checks, "startup discovered a PR that had no persisted work")
+				}
 			})
 		})
 	}

@@ -214,7 +214,8 @@ Enable Chai in the main or LGTM enrollment configuration:
   mode: {trigger: auto, agentic: {mode: chai}}
 ```
 
-Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable)
+Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable),
+`--agentic-state-dir=/var/lib/pipeline-controller` (required outside dry run),
 and `--agentic-timeout=20m` (default); no repository-level trust/timeout.
 
 On PR creation/new commits, Chai posts its selected second-stage jobs without waiting for CI/LGTM:
@@ -244,14 +245,17 @@ cannot replace fallback or a dispatched selection; push a new commit to change i
 - `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
 
 `ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
-Recovery uses events, startup and transient retries; no periodic GitHub polling.
-Startup waits for the ProwJob watch, recovers each open PR once, and skips existing-job replay. Agentic updates react only to job/report/identity changes.
-Startup/status passes share PR listings; ownership, dispatch and first-success transitions still validate collisions freshly. Known SHAs ignore unrelated statuses; frozen contexts remain eligible after configuration changes, and unknown SHAs remain conservative.
+Recovery state lives in one JSON file per PR on a PVC; GitHub shows only the gate. Normal branches in mixed-mode repos may also have inactive records. New revisions reset state; observed PR closure deletes the file. Malformed state is preserved and blocks startup; repair or restore it.
+Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
+Enabling TTL permanently retires legacy GitHub-journal import in this directory, even if TTL is later disabled. Missing local state then requires a fresh post-tracking plan; tracked PRs still accept early plans for new commits.
+Restart restores known deadlines and unfinished actions from disk, without scanning GitHub or replaying existing jobs. There is no polling or missed-event catch-up; a missed event may require another event or manual command.
+Without prior TTL activation, existing GitHub journals migrate on the next PR event. Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
 
 Before enrolling:
 
 - Configure Chai's authenticated PR/comment delivery and matching identities; forward `status`, `pull_request` and `issue_comment` to the controller.
-- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch/create`. Run one controller; use distinct HEADs.
+- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch/create` in the ProwJob namespace. Use distinct HEADs.
+- Mount a durable, writable PVC supporting file locks, atomic rename and `fsync` at `--agentic-state-dir`; deploy one replica with `Recreate`. An exclusive file lock rejects a second writer. Back up the volume; do not prune open-PR state. Normal-only enrollment and dry run need no storage.
 - Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
 - Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.
 

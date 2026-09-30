@@ -24,7 +24,7 @@ func TestAgenticStatusFiltering(t *testing.T) {
 		{"empty-context", "", nil, false},
 		{"empty-sha", "ci/first", func(_ *agenticFixture, e *github.StatusEvent) { e.SHA = "" }, false},
 		{"unenrolled", "ci/first", func(_ *agenticFixture, e *github.StatusEvent) { e.Repo.Name = "normal" }, false},
-		{"unknown-sha", "unrelated/check", func(_ *agenticFixture, e *github.StatusEvent) { e.SHA = strings.Repeat("c", 40) }, true},
+		{"unknown-sha", "unrelated/check", func(_ *agenticFixture, e *github.StatusEvent) { e.SHA = strings.Repeat("c", 40) }, false},
 		{"before-recovery", "unrelated/check", func(f *agenticFixture, _ *github.StatusEvent) { f.a.statusContexts = nil }, true},
 		{"legacy", "ci/first", func(f *agenticFixture, _ *github.StatusEvent) {
 			f.a.watcher.config.Orgs[0].Repos[0].Mode.Agentic = AgenticConfig{}
@@ -45,7 +45,7 @@ func TestAgenticStatusFiltering(t *testing.T) {
 			lists, reads, writes := f.gh.getPullRequestsCalls, f.gh.getPullRequestCalls, len(f.gh.checkWrites)
 			f.a.handleStatus(f.a.logger, e)
 			if test.want {
-				require.Greater(t, f.gh.getPullRequestsCalls, lists)
+				require.Greater(t, f.gh.getPullRequestCalls, reads)
 			} else {
 				require.Equal(t, lists, f.gh.getPullRequestsCalls)
 				require.Equal(t, reads, f.gh.getPullRequestCalls)

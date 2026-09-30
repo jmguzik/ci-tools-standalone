@@ -962,10 +962,12 @@ func main() {
 		}
 	}
 	agentic := &agenticController{gh: githubClient, jobs: mgr.GetClient(), reader: mgr.GetAPIReader(), config: cfg,
-		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic,
-		prowJobWatchReady: reconciler.prowJobWatchReady}
+		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
 	if err := agentic.validateEnrollment(); err != nil {
 		logger.WithError(err).Fatal("invalid agentic configuration")
+	}
+	if err := agentic.prepareStore(); err != nil {
+		logger.WithError(err).Fatal("cannot open agentic recovery state")
 	}
 	watcher.setOnChange(agentic.configurationChanged)
 	lgtmWatcher.setOnChange(agentic.configurationChanged)
@@ -1008,7 +1010,12 @@ func main() {
 	})
 
 	interrupts.ListenAndServe(eventServer, time.Second*30)
-	interrupts.Run(agentic.Run)
+	interrupts.Run(func(ctx context.Context) {
+		if err := agentic.Run(ctx); err != nil {
+			logger.WithError(err).Error("Cannot start agentic recovery")
+			interrupts.Terminate()
+		}
+	})
 	interrupts.Run(func(ctx context.Context) {
 		if err := mgr.Start(ctx); err != nil {
 			logger.WithError(err).Fatal("controller manager exited with error")

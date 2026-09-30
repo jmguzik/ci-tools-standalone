@@ -103,7 +103,7 @@ type agenticJob struct {
 	Optional bool   `json:"optional,omitempty"`
 }
 
-// parseAgenticMetadata reads the controller's durable state and revision journal.
+// parseAgenticMetadata reads legacy state/revision metadata during lazy import.
 // Chai plans use parseAgenticPlan, not hidden JSON.
 func parseAgenticMetadata(body, marker string, into interface{}) error {
 	if len(body) > 64*1024 {
@@ -126,14 +126,6 @@ func parseAgenticMetadata(body, marker string, into interface{}) error {
 		return fmt.Errorf("metadata must contain exactly one JSON object")
 	}
 	return nil
-}
-
-func agenticMetadata(marker string, value interface{}) (string, error) {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return "", err
-	}
-	return marker + "\n" + string(raw) + "\n-->", nil
 }
 
 func formatAgenticReview(request agenticReviewRequest) string {

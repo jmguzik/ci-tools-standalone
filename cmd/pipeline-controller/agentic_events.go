@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -29,7 +28,7 @@ func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticS
 		return nil
 	}
 	// Once a gate observes a new revision, delayed deliveries of older commands
-	// cannot authorize it. Early commands already recorded in its journal survive
+	// cannot authorize it. Early commands already recorded on disk survive
 	// restarts without reinterpreting comment text against another HEAD.
 	if comment.CreatedAt.IsZero() || comment.CreatedAt.Before(state.ObservedAt) {
 		return nil
@@ -143,6 +142,7 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 			}
 		}
 		command.Applied = true
+		state.PendingDispatch = true // The command's resulting decision is not yet reconciled.
 		if err := a.saveState(gate, state, "", "Pipeline request accepted; waiting for dispatch prerequisites."); err != nil {
 			return err
 		}
@@ -210,6 +210,22 @@ func (a *agenticController) hasRepo(org, repo string) bool {
 	return false
 }
 
+func (a *agenticController) hasAgenticEnrollment() bool {
+	for _, watcher := range []*watcher{a.watcher, a.lgtmWatcher} {
+		if watcher == nil {
+			continue
+		}
+		for _, repos := range watcher.getConfig() {
+			for _, cfg := range repos {
+				if cfg.Agentic.enabled() {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // Legacy events carry snapshots. In a mixed-mode repository a delayed event
 // from a normal branch must not publish placeholders or /test commands after
 // the PR moves to an agentic branch. Normal-only repositories need no extra API
@@ -217,6 +233,12 @@ func (a *agenticController) hasRepo(org, repo string) bool {
 func (a *agenticController) allowLegacySnapshot(org, repo string, number int, head, base string) (bool, error) {
 	if !a.hasRepo(org, repo) {
 		return true, nil
+	}
+	a.mu.Lock()
+	stopped := a.stopped
+	a.mu.Unlock()
+	if stopped {
+		return false, nil
 	}
 	if _, enabled := a.repoConfig(org, repo, base); enabled {
 		return false, nil
@@ -252,60 +274,86 @@ func (a *agenticController) handleStatus(_ *logrus.Entry, event github.StatusEve
 	a.reconcileRepo(context.Background(), event.Repo.Owner.Login, event.Repo.Name, event.SHA)
 }
 
-// Run recovers open PRs once, then only events, Chai deadlines and targeted
-// transient-error retries cause GitHub reads. There is no periodic sweep.
-func (a *agenticController) Run(ctx context.Context) {
+// Restart restores local deadlines and explicitly unfinished actions only.
+// Missed events are accepted; there is no startup or periodic GitHub sweep.
+func (a *agenticController) Run(ctx context.Context) error {
+	a.mu.Lock()
+	a.stopped = false
+	a.mu.Unlock()
+	if err := a.prepareStore(); err != nil {
+		return fmt.Errorf("opening agentic state: %w", err)
+	}
 	a.startScheduling(ctx)
-	defer a.stopScheduling()
-	if a.prowJobWatchReady != nil {
-		select {
-		case <-a.prowJobWatchReady:
-		case <-ctx.Done():
-			return
+	defer func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.stopped = true
+		if a.maintenance != nil {
+			a.maintenance.Stop()
+			a.maintenance = nil
 		}
-	}
+		if a.scheduler != nil {
+			for _, pending := range a.scheduler.pending {
+				pending.timer.Stop()
+			}
+			a.scheduler = nil
+		}
+		if a.store != nil {
+			if err := a.store.close(); err != nil {
+				a.logger.WithError(err).Error("Cannot close agentic state directory")
+			}
+			a.store = nil
+		}
+	}()
 	if ctx.Err() != nil {
-		return
+		return nil
 	}
-	a.recoverOpenPullRequests(ctx)
+	if !a.hasAgenticEnrollment() || a.dryRun {
+		<-ctx.Done()
+		return nil
+	}
+	if err := a.restoreRecords(ctx); err != nil {
+		return fmt.Errorf("restoring agentic records: %w", err)
+	}
 	<-ctx.Done()
+	return nil
 }
 
-// Local config reloads may enroll existing PRs without producing a webhook.
-// Only an actual configuration change requests recovery, not each file check.
+// Reevaluate already tracked PRs on explicit configuration changes, without
+// discovering new PRs or scanning GitHub repositories.
 func (a *agenticController) configurationChanged() {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	s := a.scheduler
-	a.mu.Unlock()
+	if !a.hasAgenticEnrollment() && len(a.statusContexts) == 0 {
+		return
+	}
 	if s != nil && s.ctx.Err() == nil {
-		a.recoverOpenPullRequests(s.ctx)
-	}
-}
-
-func (a *agenticController) recoverOpenPullRequests(ctx context.Context) {
-	repos := map[string]bool{}
-	for _, watcher := range []*watcher{a.watcher, a.lgtmWatcher} {
-		if watcher == nil {
-			continue
-		}
-		for org, orgRepos := range watcher.getConfig() {
-			for repo, cfg := range orgRepos {
-				if cfg.Agentic.enabled() {
-					repos[org+"/"+repo] = true
-				}
-			}
-		}
-	}
-	ordered := make([]string, 0, len(repos))
-	for repo := range repos {
-		ordered = append(ordered, repo)
-	}
-	sort.Strings(ordered)
-	for _, fullRepo := range ordered {
-		if ctx.Err() != nil {
+		if a.dryRun {
 			return
 		}
-		org, repo, _ := strings.Cut(fullRepo, "/")
-		a.reconcileRepo(ctx, org, repo, "")
+		if err := a.prepareStoreLocked(); err != nil {
+			a.logger.WithError(err).Error("Cannot reload tracked agentic PRs")
+			return
+		}
+		if a.store == nil {
+			return
+		}
+		for _, name := range a.store.recordNames() {
+			if s.ctx.Err() != nil {
+				return
+			}
+			r, err := a.readStoredRecord(s.ctx, name)
+			if err != nil {
+				a.logger.WithError(err).Error("Cannot reload tracked agentic PR")
+				return
+			}
+			if r == nil {
+				continue
+			}
+			if err := a.reconcileWork(s.ctx, agenticWork{org: r.State.Org, repo: r.State.Repo, number: r.State.Number}, nil, 0); err != nil {
+				a.logger.WithError(err).Error("Cannot reevaluate tracked agentic PR")
+			}
+		}
 	}
 }

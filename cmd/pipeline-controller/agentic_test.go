@@ -26,31 +26,34 @@ import (
 )
 
 type fakeAgenticGitHub struct {
-	pr                    github.PullRequest
-	comments              []github.IssueComment
-	checks                []github.CheckRun
-	statuses              map[string][]github.Status
-	statusHistory         map[string][]github.Status
-	listStatusesCalls     int
-	listStatusesError     error
-	changes               []github.PullRequestChange
-	member                bool
-	collaborator          bool
-	statusWrites          int
-	checkWrites           []github.CheckRun
-	failCheck             bool
-	failCommentAfterWrite bool
-	listCommentsError     error
-	failEditComment       bool
-	otherPRs              []github.PullRequest
-	checkAttempts         int
-	failCheckAt           int
-	failAddLabel          bool
-	getPullRequestError   error
-	getPullRequestCalls   int
-	getPullRequestsError  error
-	getPullRequestsCalls  int
-	beforePullRequest     func(int)
+	pr                     github.PullRequest
+	comments               []github.IssueComment
+	checks                 []github.CheckRun
+	statuses               map[string][]github.Status
+	statusHistory          map[string][]github.Status
+	listStatusesCalls      int
+	listStatusesError      error
+	changes                []github.PullRequestChange
+	member                 bool
+	collaborator           bool
+	statusWrites           int
+	checkWrites            []github.CheckRun
+	failCheck              bool
+	failCheckAfterCreate   bool
+	failCommentAfterWrite  bool
+	listCommentsError      error
+	otherPRs               []github.PullRequest
+	checkAttempts          int
+	failCheckAt            int
+	failAddLabel           bool
+	getPullRequestError    error
+	getPullRequestCalls    int
+	getPullRequestsError   error
+	getPullRequestsCalls   int
+	beforePullRequest      func(int)
+	listCheckRunsCalls     int
+	listCommentsCalls      int
+	getCombinedStatusCalls int
 }
 
 func (f *fakeAgenticGitHub) GetPullRequest(_, _ string, _ int) (*github.PullRequest, error) {
@@ -86,28 +89,8 @@ func (f *fakeAgenticGitHub) nextCommentID() int {
 	return id
 }
 
-func (f *fakeAgenticGitHub) removeRevisionMarker() {
-	var kept []github.IssueComment
-	for _, comment := range f.comments {
-		if !strings.Contains(comment.Body, agenticRevisionMarker) {
-			kept = append(kept, comment)
-		}
-	}
-	f.comments = kept
-}
-func (f *fakeAgenticGitHub) EditComment(_, _ string, id int, body string) error {
-	if f.failEditComment {
-		return errors.New("comment edit failed")
-	}
-	for i := range f.comments {
-		if f.comments[i].ID == id {
-			f.comments[i].Body = body
-			return nil
-		}
-	}
-	return errors.New("unknown comment")
-}
 func (f *fakeAgenticGitHub) ListIssueComments(_, _ string, _ int) ([]github.IssueComment, error) {
+	f.listCommentsCalls++
 	return append([]github.IssueComment{}, f.comments...), f.listCommentsError
 }
 func (f *fakeAgenticGitHub) GetPullRequestChanges(_, _ string, _ int) ([]github.PullRequestChange, error) {
@@ -138,6 +121,7 @@ func (f *fakeAgenticGitHub) GetIssueLabels(_, _ string, _ int) ([]github.Label, 
 	return f.pr.Labels, nil
 }
 func (f *fakeAgenticGitHub) ListCheckRuns(_, _, sha string) (*github.CheckRunList, error) {
+	f.listCheckRunsCalls++
 	result := &github.CheckRunList{}
 	for _, check := range f.checks {
 		if check.HeadSHA == sha {
@@ -154,6 +138,10 @@ func (f *fakeAgenticGitHub) CreateCheckRun(_, _ string, check github.CheckRun) (
 	check.ID, check.App.ID = int64(len(f.checks)+1), 101
 	f.checks = append(f.checks, check)
 	f.checkWrites = append(f.checkWrites, check)
+	if f.failCheckAfterCreate {
+		f.failCheckAfterCreate = false
+		return 0, fmt.Errorf("response lost after creating check: %w", io.ErrUnexpectedEOF)
+	}
 	return check.ID, nil
 }
 func (f *fakeAgenticGitHub) UpdateCheckRun(_, _ string, id int64, check github.CheckRun) error {
@@ -180,7 +168,11 @@ func (f *fakeAgenticGitHub) UpdateCheckRun(_, _ string, id int64, check github.C
 		}
 		// Model a PATCH which retains omitted fields: a reopening implementation
 		// must not depend on an omitted conclusion clearing an old success.
+		text := old.Output.Text
 		old.Output = check.Output
+		if check.Output.Text == "" {
+			old.Output.Text = text
+		} // SDK omits an empty text field in PATCH.
 		f.checks[i] = old
 		f.checkWrites = append(f.checkWrites, old)
 		return nil
@@ -188,6 +180,7 @@ func (f *fakeAgenticGitHub) UpdateCheckRun(_, _ string, id int64, check github.C
 	return errors.New("unknown check")
 }
 func (f *fakeAgenticGitHub) GetCombinedStatus(_, _, sha string) (*github.CombinedStatus, error) {
+	f.getCombinedStatusCalls++
 	return &github.CombinedStatus{SHA: sha, Statuses: append([]github.Status{}, f.statuses[sha]...)}, nil
 }
 func (f *fakeAgenticGitHub) ListStatuses(_, _, sha string) ([]github.Status, error) {
@@ -221,6 +214,7 @@ func (j *agenticTestJobs) Create(ctx context.Context, object ctrlruntimeclient.O
 }
 
 type agenticFixture struct {
+	t    *testing.T
 	a    *agenticController
 	gh   *fakeAgenticGitHub
 	jobs *agenticTestJobs
@@ -230,7 +224,7 @@ type agenticFixture struct {
 
 func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	t.Helper()
-	f := &agenticFixture{now: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)}
+	f := &agenticFixture{t: t, now: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)}
 	static := []config.Presubmit{
 		{JobBase: config.JobBase{Name: "first-stage", Agent: "kubernetes"}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/first"}},
 		{JobBase: config.JobBase{Name: "job-a", Agent: "kubernetes", Annotations: map[string]string{"pipeline_run_if_changed": "^src/"}, Labels: map[string]string{"configured-label": "kept"}}, Reporter: config.Reporter{Context: "ci/job-a"}, Brancher: config.Brancher{Branches: []string{"^main$"}}},
@@ -249,7 +243,8 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	f.jobs = &agenticTestJobs{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	f.a = &agenticController{gh: f.gh, jobs: f.jobs, reader: f.jobs, config: func() *config.Config { return f.cfg },
 		watcher: &watcher{config: enrollment}, lgtmWatcher: &watcher{}, appID: 101, now: func() time.Time { return f.now }, logger: logrus.NewEntry(logrus.New()),
-		options: agenticOptions{timeout: defaultAgenticTimeout, trustedAuthors: flagutil.NewStrings("chai[bot]")}}
+		options: agenticOptions{timeout: defaultAgenticTimeout, trustedAuthors: flagutil.NewStrings("chai[bot]"), stateDir: t.TempDir()}}
+	t.Cleanup(func() { require.NoError(t, f.a.closeStore()) })
 	return f
 }
 
@@ -516,7 +511,7 @@ func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
 	require.Error(t, f.tryReconcile(f.command(500, "agent-review")), "expected lost comment response")
 	f.reconcile(t, nil)
 	_, state := f.gate(t)
-	if state.Review == nil || !state.ReviewPosted || state.Plan != nil || len(f.gh.comments) != 4 {
+	if state.Review == nil || !state.ReviewPosted || state.Plan != nil || len(f.gh.comments) != 3 {
 		t.Fatalf("fresh review failed to correlate/deduplicate: %+v; comments=%d", state, len(f.gh.comments))
 	}
 	f.passFirstStage(t)

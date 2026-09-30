@@ -16,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
 )
@@ -88,7 +87,6 @@ type reconciler struct {
 	lgtmWatcher        *watcher
 	pipelineAutoCache  *PipelineAutoCache
 	agentic            *agenticController
-	prowJobWatchReady  chan struct{}
 }
 
 func NewReconciler(
@@ -110,7 +108,6 @@ func NewReconciler(
 		watcher:            w,
 		lgtmWatcher:        lgtmW,
 		pipelineAutoCache:  pipelineAutoCache,
-		prowJobWatchReady:  make(chan struct{}),
 		closedPRsCache: closedPRsCache{
 			prs:       map[string]pullRequest{},
 			m:         sync.Mutex{},
@@ -121,13 +118,10 @@ func NewReconciler(
 	if err := builder.
 		ControllerManagedBy(mgr).
 		Named("pipeline-controller").
-		WatchesRawSource(&readyProwJobSource{
-			SyncingSource: source.Kind[ctrlruntimeclient.Object](mgr.GetCache(), &v1.ProwJob{}, &handler.EnqueueRequestForObject{}, predicate.Funcs{
-				CreateFunc: reconciler.shouldReconcileProwJobCreate,
-				UpdateFunc: reconciler.shouldReconcileProwJobUpdate,
-			}),
-			ready: reconciler.prowJobWatchReady,
-		}).
+		Watches(&v1.ProwJob{}, &handler.EnqueueRequestForObject{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc: reconciler.shouldReconcileProwJobCreate,
+			UpdateFunc: reconciler.shouldReconcileProwJobUpdate,
+		})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(reconciler); err != nil {
 		return nil, fmt.Errorf("failed to construct controller: %w", err)

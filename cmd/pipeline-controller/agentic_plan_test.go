@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -9,6 +10,14 @@ import (
 
 	"sigs.k8s.io/prow/pkg/github"
 )
+
+func agenticMetadata(marker string, value interface{}) (string, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return marker + "\n" + string(raw) + "\n-->", nil
+}
 
 // Chai is external; keep a representative producer here alongside literal
 // contract tests so integrations exercise the same format as the documentation.

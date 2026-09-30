@@ -31,15 +31,20 @@ func newScheduledAgenticFixture(t *testing.T, mode string) *agenticFixture {
 
 func startAgenticRunner(f *agenticFixture) func() {
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		f.a.Run(ctx)
+		done <- f.a.Run(ctx)
 	}()
 	synctest.Wait()
+	select {
+	case err := <-done:
+		require.NoError(f.t, err)
+		f.t.Fatal("agentic runner stopped before cancellation")
+	default:
+	}
 	return func() {
 		cancel()
-		<-done
+		require.NoError(f.t, <-done)
 	}
 }
 
@@ -62,27 +67,55 @@ func assertAgenticIdle(t *testing.T, f *agenticFixture, duration time.Duration) 
 	}
 }
 
-func TestAgenticRunDoesNotPoll(t *testing.T) {
-	for _, phase := range []string{"first-stage", "manual-trigger", "reported"} {
-		t.Run(phase, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				mode := "auto"
-				if phase == "manual-trigger" {
-					mode = "manual"
-				}
-				f := newScheduledAgenticFixture(t, mode)
-				if phase != "first-stage" {
-					f.passFirstStage(t)
-				}
-				if phase == "reported" {
-					f.plan(t) // No additional tests; startup can complete the gate.
-				}
-				stop := startAgenticRunner(f)
-				defer stop()
-				assertAgenticIdle(t, f, 24*time.Hour)
-			})
+func TestAgenticPersistWakeupOnlyWritesChanges(t *testing.T) {
+	f := newAgenticFixture(t, "manual")
+	f.reconcile(t, nil)
+	f.a.options.stateTTL = time.Hour
+	work := agenticWork{org: "org", repo: "repo", number: 42}
+	deadline := f.now.Add(20 * time.Minute)
+	for _, tc := range []struct {
+		name    string
+		wakeup  *agenticSavedWakeup
+		changed bool
+	}{
+		{name: "nil-to-nil"},
+		{name: "set", wakeup: &agenticSavedWakeup{At: deadline, Deadline: deadline}, changed: true},
+		{name: "unchanged", wakeup: &agenticSavedWakeup{At: deadline, Deadline: deadline}},
+		{name: "retry", wakeup: &agenticSavedWakeup{At: deadline, Deadline: deadline, Backoff: time.Minute, Comment: f.command(500, "remaining")}, changed: true},
+		{name: "clear", changed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ageAgenticRecord(t, f, 42, f.now.Add(-time.Minute))
+			before, err := os.Stat(path)
+			require.NoError(t, err)
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.False(t, f.a.persistWakeup(context.Background(), work, tc.wakeup))
+			after, err := os.Stat(path)
+			require.NoError(t, err)
+			updated, err := os.ReadFile(path)
+			require.NoError(t, err)
+			if tc.changed {
+				require.False(t, os.SameFile(before, after), "changed wakeup did not replace the record")
+				require.False(t, before.ModTime().Equal(after.ModTime()), "changed wakeup did not refresh retention")
+				require.NotEqual(t, data, updated)
+			} else {
+				require.True(t, os.SameFile(before, after), "unchanged wakeup rewrote the record")
+				require.True(t, before.ModTime().Equal(after.ModTime()), "unchanged wakeup refreshed retention")
+				require.Equal(t, data, updated)
+			}
+			r, err := f.a.readRecord(context.Background(), work)
+			require.NoError(t, err)
+			require.Equal(t, tc.wakeup, r.Wakeup)
 		})
 	}
+	t.Run("expired-nil", func(t *testing.T) {
+		path := ageAgenticRecord(t, f, 42, f.now.Add(-f.a.options.stateTTL))
+		require.True(t, f.a.persistWakeup(context.Background(), work, nil), "unchanged wakeup skipped expiry")
+		_, err := os.Stat(path)
+		require.True(t, os.IsNotExist(err))
+		require.Empty(t, f.a.store.entries, "expiry retained routing metadata")
+	})
 }
 
 func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
@@ -90,6 +123,7 @@ func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
 		f.passFirstStage(t)
 		stop := startAgenticRunner(f)
+		f.reconcile(t, nil)
 		_, original := f.gate(t)
 		if original.WaitingSince == nil || len(f.a.scheduler.pending) != 1 {
 			t.Fatal("missing one-shot Chai deadline")
@@ -131,6 +165,7 @@ func TestAgenticOverdueDeadlineRecoveredAtStartup(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
 		f.passFirstStage(t)
 		stop := startAgenticRunner(f)
+		f.reconcile(t, nil)
 		stop()
 		advanceAgenticTime(f, defaultAgenticTimeout+time.Minute)
 		stop = startAgenticRunner(f)
@@ -150,6 +185,7 @@ func TestAgenticEventsCancelChaiDeadline(t *testing.T) {
 				f.passFirstStage(t)
 				stop := startAgenticRunner(f)
 				defer stop()
+				f.reconcile(t, nil)
 				switch change {
 				case "plan":
 					f.plan(t, "job-a")
@@ -192,6 +228,7 @@ func TestAgenticTransientRetriesContinueUntilRecovery(t *testing.T) {
 				}
 				stop := startAgenticRunner(f)
 				defer stop()
+				_ = f.tryReconcile(nil)
 				if failing == "expired-deadline" {
 					f.gh.getPullRequestError = failure
 					advanceAgenticTime(f, defaultAgenticTimeout)
@@ -227,6 +264,7 @@ func TestAgenticInvalidPlanOnlyWaitsForDeadline(t *testing.T) {
 		f.plan(t, "unknown-job")
 		stop := startAgenticRunner(f)
 		defer stop()
+		_ = f.tryReconcile(nil)
 		reads := f.gh.getPullRequestCalls
 		advanceAgenticTime(f, defaultAgenticTimeout-time.Second)
 		if f.gh.getPullRequestCalls != reads || f.jobs.creates != 0 {
@@ -268,25 +306,23 @@ func TestAgenticInvalidPlanPersistenceFailureRetries(t *testing.T) {
 func TestAgenticNonRetryableErrorsWaitForEvent(t *testing.T) {
 	for _, tc := range []struct {
 		name, failure string
-		startup       bool
+		established   bool
 	}{
-		{"startup-unknown", "unclassified operational failure", true},
-		{"pending-deadline-auth", "return code not 2XX: 401 Unauthorized", false},
+		{"new-event-unknown", "unclassified operational failure", false},
+		{"pending-deadline-auth", "return code not 2XX: 401 Unauthorized", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newScheduledAgenticFixture(t, "auto")
 				f.passFirstStage(t)
-				if tc.startup {
-					f.gh.getPullRequestError = errors.New(tc.failure)
-				}
 				stop := startAgenticRunner(f)
 				defer stop()
-				f.plan(t, "job-a")
-				if !tc.startup {
-					f.gh.getPullRequestError = errors.New(tc.failure)
-					require.Error(t, f.tryReconcile(nil), "expected operational failure")
+				if tc.established {
+					f.reconcile(t, nil)
 				}
+				f.plan(t, "job-a")
+				f.gh.getPullRequestError = errors.New(tc.failure)
+				require.Error(t, f.tryReconcile(nil), "expected operational failure")
 				assertAgenticIdle(t, f, 24*time.Hour)
 				f.gh.getPullRequestError = nil
 				f.a.handlePullRequest(f.a.logger, github.PullRequestEvent{Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr})
@@ -298,12 +334,14 @@ func TestAgenticNonRetryableErrorsWaitForEvent(t *testing.T) {
 	}
 }
 
-func TestAgenticMalformedJournalWriteFailureRetries(t *testing.T) {
+func TestAgenticMalformedLegacyJournalWriteFailureRetries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
 		stop := startAgenticRunner(f)
 		defer stop()
-		f.gh.checks[0].Output.Text = "invalid saved state"
+		f.reconcile(t, nil)
+		f.gh.checks[0].Output.Text = agenticStateMarker + "\ninvalid saved state\n-->"
+		require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
 		f.gh.failCheck = true
 		if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil || !agenticRetryFor(err).transient {
 			t.Fatal("terminal journal error hid its transient failure-report error")
@@ -325,6 +363,7 @@ func TestAgenticRateLimitKeepsDeadlineAndOriginalCommand(t *testing.T) {
 				f.passFirstStage(t)
 				stop := startAgenticRunner(f)
 				defer stop()
+				f.reconcile(t, nil)
 				advanceAgenticTime(f, defaultAgenticTimeout-time.Second)
 				command := f.command(500, "required")
 				wait := 11 * time.Minute
@@ -369,6 +408,7 @@ func TestAgenticCommentRoutingFailurePreservesCommand(t *testing.T) {
 				}
 				stop := startAgenticRunner(f)
 				defer stop()
+				f.reconcile(t, nil)
 				commandName, delay, wantCreates := "remaining", agenticInitialBackoff, 0
 				if mode == "auto" {
 					advanceAgenticTime(f, defaultAgenticTimeout-time.Second)
@@ -394,6 +434,7 @@ func TestAgenticOverlappingFailuresPreserveCooldown(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "manual")
 		stop := startAgenticRunner(f)
 		defer stop()
+		f.reconcile(t, nil)
 		command := f.command(500, "remaining")
 		// Two routing reads can overlap outside a.mu. The later 503 result must
 		// not replace the earlier rate-limit hint with an ordinary short retry.
@@ -424,6 +465,7 @@ func TestAgenticRetryFinishesPartialDispatch(t *testing.T) {
 		f.jobs.failAt = 2
 		stop := startAgenticRunner(f)
 		defer stop()
+		_ = f.tryReconcile(nil)
 		if len(f.allJobs(t)) != 1 {
 			t.Fatal("did not reach a partial dispatch")
 		}
@@ -452,6 +494,8 @@ func TestAgenticShutdownStopsTimers(t *testing.T) {
 					f.gh.getPullRequestError = io.ErrUnexpectedEOF
 				}
 				stop := startAgenticRunner(f)
+				_ = f.tryReconcile(nil)
+				require.Len(t, f.a.scheduler.pending, 1, "fixture did not create the timer being canceled")
 				stop()
 				reads := f.gh.getPullRequestCalls
 				advanceAgenticTime(f, 24*time.Hour)
@@ -479,8 +523,8 @@ func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
 		}
 		require.NoError(t, os.WriteFile(w.filePath, enabled, 0600))
 		require.NoError(t, w.reloadConfig())
-		if f.gh.getPullRequestsCalls == 0 || len(f.gh.checks) != 1 {
-			t.Fatal("new enrollment did not recover existing PRs")
+		if f.gh.getPullRequestsCalls != 0 || len(f.gh.checks) != 0 {
+			t.Fatal("new enrollment scanned previously untracked PRs")
 		}
 		reads, lists := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls
 		for range 3 {
