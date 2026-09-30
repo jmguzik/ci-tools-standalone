@@ -202,29 +202,14 @@ func normalAgenticSelection(static []config.Presubmit, pr *github.PullRequest, g
 	changes := config.NewGitHubDeferredChangedFilesProvider(ghc, org, repo, pr.Number)
 	names := []string{}
 	for _, p := range static {
-		if !agenticSecondStage(p) || !p.CouldRun(pr.Base.Ref) || p.SkipReport {
+		if !agenticAllowedJob(p) || !p.CouldRun(pr.Base.Ref) || p.SkipReport {
 			continue
 		}
-		run, hasRun := p.Annotations["pipeline_run_if_changed"]
-		skip, hasSkip := p.Annotations["pipeline_skip_if_only_changed"]
-		if run != "" || skip != "" {
-			copy := []config.Presubmit{p}
-			if run != "" {
-				copy[0].RegexpChangeMatcher = config.RegexpChangeMatcher{RunIfChanged: run}
-			} else {
-				copy[0].RegexpChangeMatcher = config.RegexpChangeMatcher{SkipIfOnlyChanged: skip}
-			}
-			if err := config.SetPresubmitRegexes(copy); err != nil {
-				return nil, err
-			}
-			_, shouldRun, err := copy[0].RegexpChangeMatcher.ShouldRun(changes)
-			if err != nil {
-				return nil, err
-			}
-			if shouldRun {
-				names = append(names, p.Name)
-			}
-		} else if !p.Optional && !hasRun && !hasSkip {
+		shouldRun, err := pipelineAnnotationMatches(p, changes)
+		if err != nil {
+			return nil, err
+		}
+		if shouldRun {
 			names = append(names, p.Name)
 		}
 	}

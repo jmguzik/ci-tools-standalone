@@ -117,17 +117,33 @@ func TestAgenticStoreUpdatesHeadAndDeletionRouting(t *testing.T) {
 		t.Run(cleanup, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
 			f.reconcile(t, nil)
-			for _, sha := range []string{strings.Repeat("c", 40), strings.Repeat("d", 40)} {
+			for i, sha := range []string{strings.Repeat("c", 40), strings.Repeat("d", 40)} {
 				old := agenticWork{org: "org", repo: "repo", sha: f.gh.pr.Head.SHA}
+				if i == 0 {
+					other := f.gh.pr
+					other.Number = 43
+					require.NoError(t, f.a.writeRecord(context.Background(), &agenticRecord{State: newAgenticState("org", "repo", &other, f.now)}))
+				}
 				f.gh.pr.Head.SHA = sha
 				f.reconcile(t, nil)
 				records, err := f.a.listRecords(context.Background(), old)
 				require.NoError(t, err)
+				if i == 0 {
+					// The shared SHA stays routed until its remaining PR is deleted.
+					require.Len(t, records, 1)
+					require.Equal(t, 43, records[0].State.Number)
+					require.True(t, f.a.statusContexts[old]["ci/first"], "changing one PR hid another PR's reports")
+					require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 43))
+					records, err = f.a.listRecords(context.Background(), old)
+					require.NoError(t, err)
+				}
+				// On the second push, the head change itself must prune orphaned interests.
 				require.Empty(t, records)
 				require.NotContains(t, f.a.statusContexts, old)
 				records, err = f.a.listRecords(context.Background(), agenticWork{org: "org", repo: "repo", sha: sha})
 				require.NoError(t, err)
 				require.Len(t, records, 1)
+				require.Len(t, f.a.store.routes, 1, "only the current SHA should remain indexed")
 				require.Len(t, f.a.statusContexts, 1)
 			}
 			if cleanup == "ttl" {
@@ -135,59 +151,24 @@ func TestAgenticStoreUpdatesHeadAndDeletionRouting(t *testing.T) {
 				ageAgenticRecord(t, f, 42, f.now.Add(-time.Hour))
 				require.NoError(t, f.a.expireRecordsLocked(context.Background()))
 			} else {
-				require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
+				other := f.gh.pr
+				other.Number = 43
+				require.NoError(t, f.a.writeRecord(context.Background(), &agenticRecord{State: newAgenticState("org", "repo", &other, f.now)}))
+				gates := len(f.gh.checks)
+				f.gh.pr.State = github.PullRequestStateClosed
+				f.reconcile(t, nil)
+				records, err := f.a.listRecords(context.Background())
+				require.NoError(t, err)
+				require.Len(t, records, 1)
+				require.Equal(t, 43, records[0].State.Number, "observed closure deleted another PR's record")
+				require.Len(t, f.gh.checks, gates)
+				require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 43))
 			}
 			require.Empty(t, f.a.store.entries)
 			require.Empty(t, f.a.store.routes)
 			require.Empty(t, f.a.statusContexts)
 		})
 	}
-}
-
-func TestAgenticHeadChangePreservesOtherPRStatusInterests(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.reconcile(t, nil)
-	old := agenticWork{org: "org", repo: "repo", sha: f.gh.pr.Head.SHA}
-	other := f.gh.pr
-	other.Number = 43
-	require.NoError(t, f.a.writeRecord(context.Background(), &agenticRecord{State: newAgenticState("org", "repo", &other, f.now)}))
-	f.gh.pr.Head.SHA = strings.Repeat("c", 40)
-	f.reconcile(t, nil)
-	require.True(t, f.a.statusContexts[old]["ci/first"], "changing one PR hid another PR's reports")
-	require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 43))
-	require.NotContains(t, f.a.statusContexts, old)
-	require.Len(t, f.a.statusContexts, 1)
-	require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 42))
-	require.Empty(t, f.a.statusContexts)
-}
-
-func TestAgenticUnchangedGatePersistsStateWithoutPublication(t *testing.T) {
-	f := newAgenticFixture(t, "manual")
-	f.reconcile(t, nil)
-	gate, state := f.gate(t)
-	writes := len(f.gh.checkWrites)
-	state.LastCommandID = 500
-	require.NoError(t, f.a.saveState(&gate, state, gate.Conclusion, gate.Output.Summary))
-	r, err := f.a.readRecord(context.Background(), agenticWork{org: "org", repo: "repo", number: 42})
-	require.NoError(t, err)
-	require.Equal(t, 500, r.State.LastCommandID)
-	require.Nil(t, r.Desired, "unchanged publication left unfinished intent")
-	require.False(t, r.Reopen)
-	require.Len(t, f.gh.checkWrites, writes)
-}
-
-func TestAgenticMalformedRecordClosesOwnedSuccess(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto")
-	f.reconcile(t, nil)
-	require.Equal(t, "success", f.gh.checks[0].Conclusion)
-	name := filepath.Join(f.a.options.stateDir, agenticRecordName("org", "repo", 42)+".json")
-	require.NoError(t, os.WriteFile(name, []byte("invalid"), 0600))
-	require.Error(t, f.tryReconcile(nil))
-	require.Equal(t, "failure", f.gh.checks[0].Conclusion)
-	require.Zero(t, f.jobs.creates)
-	preserved, err := os.ReadFile(name)
-	require.NoError(t, err)
-	require.Equal(t, "invalid", string(preserved))
 }
 
 func TestAgenticLegacyImportPreservesOnlyCurrentSelection(t *testing.T) {

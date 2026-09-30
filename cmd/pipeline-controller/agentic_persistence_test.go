@@ -82,15 +82,7 @@ func TestAgenticShutdownDropsLateEvents(t *testing.T) {
 		f.a.handleStatus(f.a.logger, github.StatusEvent{Repo: f.gh.pr.Base.Repo, SHA: f.gh.pr.Head.SHA, Context: "ci/first", State: "success"})
 		f.a.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: github.IssueCommentActionCreated,
 			Repo: f.gh.pr.Base.Repo, Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: *command})
-		require.Equal(t, before.getPullRequestCalls, f.gh.getPullRequestCalls)
-		require.Equal(t, before.getPullRequestsCalls, f.gh.getPullRequestsCalls)
-		require.Equal(t, before.listCheckRunsCalls, f.gh.listCheckRunsCalls)
-		require.Equal(t, before.listCommentsCalls, f.gh.listCommentsCalls)
-		require.Equal(t, before.getCombinedStatusCalls, f.gh.getCombinedStatusCalls)
-		require.Equal(t, before.listStatusesCalls, f.gh.listStatusesCalls)
-		require.Len(t, f.gh.comments, len(before.comments))
-		require.Len(t, f.gh.checkWrites, len(before.checkWrites))
-		require.Equal(t, before.statusWrites, f.gh.statusWrites)
+		require.Equal(t, before, *f.gh)
 		require.Zero(t, f.jobs.creates)
 		require.Nil(t, f.a.store)
 	})
@@ -132,17 +124,6 @@ func TestAgenticFailedProjectionRepublishesAfterRecovery(t *testing.T) {
 	f.gh.listCommentsError = nil
 	f.reconcile(t, nil)
 	require.Equal(t, "success", f.gh.checks[0].Conclusion)
-}
-
-func TestAgenticObservedClosureDeletesOnlyItsRecord(t *testing.T) {
-	f := newAgenticFixture(t, "manual")
-	f.reconcile(t, nil)
-	f.gh.pr.State = github.PullRequestStateClosed
-	f.reconcile(t, nil)
-	records, err := f.a.listRecords(context.Background())
-	require.NoError(t, err)
-	require.Empty(t, records)
-	require.Len(t, f.gh.checks, 1)
 }
 
 func TestAgenticAppliedRerunIntentResumesAfterRestart(t *testing.T) {
@@ -192,6 +173,10 @@ func TestAgenticGateTransferRetiresOwnerAfterMissedClose(t *testing.T) {
 	oldGate, oldState := f.gate(t)
 	f.gh.pr.Number, f.gh.comments = 43, nil // #42 closed without a webhook.
 	f.reconcile(t, nil)
+	siblingGate, siblingState := f.gate(t)
+	if siblingGate.ID != oldGate.ID || len(f.gh.checks) != 1 || siblingGate.Conclusion == "success" || siblingState.Number != 43 || siblingState.ManualRequestID != 0 || siblingState.Plan != nil {
+		t.Fatal("closed sibling left a competing successful gate or stale authorization")
+	}
 	r, err := f.a.readRecord(context.Background(), agenticWork{org: "org", repo: "repo", number: 42})
 	require.NoError(t, err)
 	require.True(t, r.State.Inactive)

@@ -56,11 +56,13 @@ func TestAgenticUnboundInitialCommandRequiresRepost(t *testing.T) {
 }
 
 func TestAgenticEarlyPlanRevisionBoundaries(t *testing.T) {
-	for _, transition := range []string{"new-head", "new-head-after-retarget", "same-head-retarget", "revisited-head", "inactive-new-head"} {
+	for _, transition := range []string{"new-head", "new-head-after-retarget", "same-head-retarget", "revisited-base", "revisited-head", "inactive-new-head"} {
 		t.Run(transition, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
 			oldPlan := f.plan(t, "job-a")
 			f.reconcile(t, nil)
+			f.reconcile(t, f.command(400, "required"))
+			_, original := f.gate(t)
 			originalSHA := f.gh.pr.Head.SHA
 			f.now = f.now.Add(time.Minute)
 			switch transition {
@@ -71,6 +73,10 @@ func TestAgenticEarlyPlanRevisionBoundaries(t *testing.T) {
 				f.gh.pr.Head.SHA = strings.Repeat("c", 40)
 			case "same-head-retarget":
 				f.gh.pr.Base.Ref = "release"
+			case "revisited-base":
+				f.gh.pr.Base.Ref = "release"
+				f.reconcile(t, nil)
+				f.gh.pr.Base.Ref = "main"
 			case "revisited-head":
 				f.gh.pr.Head.SHA = strings.Repeat("c", 40)
 				f.reconcile(t, nil)
@@ -90,10 +96,14 @@ func TestAgenticEarlyPlanRevisionBoundaries(t *testing.T) {
 				oldPlan.ID = 501 // A later reply for the old SHA must still be ignored.
 				f.gh.comments = append(f.gh.comments, oldPlan)
 			}
-			f.passFirstStage(t)
 			f.now = f.now.Add(time.Second)
 			f.reconcile(t, nil)
+			_, pending := f.gate(t)
+			require.NotEqual(t, original.RevisionID, pending.RevisionID)
+			f.passFirstStage(t)
+			f.reconcile(t, nil)
 			_, state := f.gate(t)
+			require.Equal(t, pending.RevisionID, state.RevisionID, "first-stage readiness replayed an older revision")
 			require.GreaterOrEqual(t, state.LastCommandID, 500)
 			require.Zero(t, state.ManualRequestID, "early command rebound to a new revision")
 			require.Nil(t, state.Command)
@@ -154,28 +164,6 @@ func TestAgenticRetargetDoesNotReuseFirstStageStatus(t *testing.T) {
 	}
 }
 
-func TestAgenticRevisionRecordCannotReplayOldRequests(t *testing.T) {
-	f := newAgenticFixture(t, "manual")
-	f.plan(t, "job-b")
-	f.reconcile(t, nil)
-	f.reconcile(t, f.command(500, "required"))
-	_, original := f.gate(t)
-	f.gh.pr.Base.Ref = "release"
-	f.reconcile(t, nil)
-	f.gh.pr.Base.Ref = "main"
-	f.reconcile(t, nil)
-	_, pending := f.gate(t)
-	if pending.RevisionID == original.RevisionID {
-		t.Fatal("fresh revision update was not journaled")
-	}
-	f.passFirstStage(t)
-	f.reconcile(t, nil)
-	_, state := f.gate(t)
-	if state.RevisionID != pending.RevisionID || state.Plan != nil || state.ManualRequestID != 0 || f.jobs.creates != 0 {
-		t.Fatal("failed marker update rolled the gate back to an old plan/request")
-	}
-}
-
 func TestAgenticFirstStageWitnessSurvivesGarbageCollection(t *testing.T) {
 	f := newReadyAgenticFixture(t, "auto")
 	f.reconcile(t, nil)
@@ -222,20 +210,6 @@ func TestAgenticSharedSHAKeepsOwnersJournalOnConflictAndReadError(t *testing.T) 
 	}
 }
 
-func TestAgenticClosedSiblingGateIsReusedWithoutAuthorization(t *testing.T) {
-	f := newReadyAgenticFixture(t, "manual")
-	f.reconcile(t, nil)
-	f.reconcile(t, f.command(500, "remaining"))
-	gate, _ := f.gate(t)
-	f.gh.pr.Number = 43 // the old PR is closed and absent from GetPullRequests
-	f.gh.comments = nil
-	f.reconcile(t, nil)
-	check, state := f.gate(t)
-	if check.ID != gate.ID || len(f.gh.checks) != 1 || check.Conclusion == "success" || state.Number != 43 || state.ManualRequestID != 0 || state.Plan != nil {
-		t.Fatal("closed sibling left a competing successful gate or stale authorization")
-	}
-}
-
 func TestAgenticFailedReopeningCannotDispatch(t *testing.T) {
 	f := newReadyAgenticFixture(t, "auto", "job-a")
 	f.reconcile(t, nil)
@@ -251,12 +225,20 @@ func TestAgenticFailedReopeningCannotDispatch(t *testing.T) {
 	require.Equal(t, 2, f.jobs.creates, "recorded rerun was not recovered after reopening succeeded")
 }
 
-func TestAgenticUnchangedGateIgnoresServerOutputFields(t *testing.T) {
+func TestAgenticUnchangedGatePersistsStateAndIgnoresServerOutputFields(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.reconcile(t, nil)
 	f.gh.checks[0].Output.AnnotationsURL = "https://api.github.com/check-runs/1/annotations"
 	f.gh.checks[0].Conclusion = "failure" // omitted PATCH conclusion is retained
+	gate, state := f.gate(t)
 	before := f.gh.checkAttempts
+	state.LastCommandID = 500
+	require.NoError(t, f.a.saveState(&gate, state, gate.Conclusion, gate.Output.Summary))
+	r, err := f.a.readRecord(context.Background(), agenticWork{org: "org", repo: "repo", number: 42})
+	require.NoError(t, err)
+	require.Equal(t, 500, r.State.LastCommandID)
+	require.Nil(t, r.Desired, "unchanged publication left unfinished intent")
+	require.False(t, r.Reopen)
 	for range 3 {
 		f.reconcile(t, nil)
 	}
@@ -422,10 +404,10 @@ func TestAgenticSupersededReportRecovery(t *testing.T) {
 func TestAgenticMalformedJournalFailsClosed(t *testing.T) {
 	for _, corruption := range []string{"metadata", "head", "external-id", "request", "dispatch"} {
 		t.Run(corruption, func(t *testing.T) {
-			f := newAgenticFixture(t, "auto")
-			f.plan(t, "job-a")
+			f := newReadyAgenticFixture(t, "auto")
 			f.reconcile(t, nil)
-			_, state := f.gate(t)
+			gate, state := f.gate(t)
+			require.Equal(t, "success", gate.Conclusion)
 			r := state.record
 			switch corruption {
 			case "head":
@@ -444,11 +426,14 @@ func TestAgenticMalformedJournalFailsClosed(t *testing.T) {
 			}
 			path := filepath.Join(f.a.options.stateDir, agenticRecordName("org", "repo", 42)+".json")
 			require.NoError(t, os.WriteFile(path, body, 0600))
-			f.passFirstStage(t)
 			require.Error(t, f.tryReconcile(nil), "corrupted journal was treated as a fresh dispatch decision")
-			if f.jobs.creates != 0 || len(f.gh.checks) != 1 {
-				t.Fatal("recovery did not fail closed while preserving diagnostic state")
-			}
+			require.Zero(t, f.jobs.creates)
+			require.Len(t, f.gh.checks, 1)
+			require.Equal(t, gate.ID, f.gh.checks[0].ID)
+			require.Equal(t, "failure", f.gh.checks[0].Conclusion)
+			preserved, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, body, preserved)
 		})
 	}
 }
@@ -557,14 +542,14 @@ func TestAgenticRetryFinishesInactiveDeparture(t *testing.T) {
 	f.gh.failCheck = true
 	require.Error(t, f.tryReconcile(nil), "expected gate update failure")
 	f.gh.failCheck = false
-	f.a.reconcileRepo(context.Background(), "org", "repo", "")
+	f.reconcile(t, nil)
 	r, err := f.a.readRecord(context.Background(), agenticWork{org: "org", repo: "repo", number: 42})
 	require.NoError(t, err)
 	if !r.State.Inactive || r.Desired != nil || f.gh.checks[0].Conclusion != "failure" || len(f.gh.checks) != 1 || f.jobs.creates != 0 {
-		t.Fatal("startup recovery did not finish the tracked inactive departure")
+		t.Fatal("retry did not finish the tracked inactive departure")
 	}
 	writes, comments := len(f.gh.checkWrites), len(f.gh.comments)
-	f.a.reconcileRepo(context.Background(), "org", "repo", "")
+	f.reconcile(t, nil)
 	if len(f.gh.checkWrites) != writes || len(f.gh.comments) != comments {
 		t.Fatal("already-recorded departure caused repeated writes")
 	}

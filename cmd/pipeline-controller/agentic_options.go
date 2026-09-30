@@ -52,17 +52,8 @@ func (o *agenticOptions) validateEnabled() error {
 }
 
 func (a *agenticController) validateEnrollment() error {
-	for _, watcher := range []*watcher{a.watcher, a.lgtmWatcher} {
-		if watcher == nil {
-			continue
-		}
-		for _, repos := range watcher.getConfig() {
-			for _, cfg := range repos {
-				if cfg.Agentic.enabled() {
-					return a.options.validateEnabled()
-				}
-			}
-		}
+	if a.hasAgenticEnrollment() {
+		return a.options.validateEnabled()
 	}
 	return nil
 }

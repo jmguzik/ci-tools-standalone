@@ -288,21 +288,14 @@ func (a *agenticController) Run(ctx context.Context) error {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		a.stopped = true
-		if a.maintenance != nil {
-			a.maintenance.Stop()
-			a.maintenance = nil
-		}
 		if a.scheduler != nil {
 			for _, pending := range a.scheduler.pending {
 				pending.timer.Stop()
 			}
 			a.scheduler = nil
 		}
-		if a.store != nil {
-			if err := a.store.close(); err != nil {
-				a.logger.WithError(err).Error("Cannot close agentic state directory")
-			}
-			a.store = nil
+		if err := a.closeStoreLocked(); err != nil {
+			a.logger.WithError(err).Error("Cannot close agentic state directory")
 		}
 	}()
 	if ctx.Err() != nil {

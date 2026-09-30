@@ -135,24 +135,6 @@ func TestAgenticMissingGlobalTrustFailsClosed(t *testing.T) {
 	}
 }
 
-func TestAgenticUsesGlobalTimeout(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.a.options.timeout = 5 * time.Minute
-	f.passFirstStage(t)
-	f.reconcile(t, nil)
-	f.now = f.now.Add(5*time.Minute - time.Second)
-	f.reconcile(t, nil)
-	if f.jobs.creates != 0 {
-		t.Fatal("fallback ran before the global deadline")
-	}
-	f.now = f.now.Add(time.Second)
-	f.reconcile(t, nil)
-	_, state := f.gate(t)
-	if state.Plan == nil || state.Plan.Source != "timeout" || f.jobs.creates != 2 {
-		t.Fatalf("global timeout was not used: %+v; creates=%d", state.Plan, f.jobs.creates)
-	}
-}
-
 func TestAgenticUsesGlobalAuthor(t *testing.T) {
 	f := newAgenticFixture(t, "auto")
 	f.a.options.trustedAuthors = flagutil.NewStrings("deployment-bot")

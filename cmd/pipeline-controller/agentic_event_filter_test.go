@@ -79,6 +79,12 @@ func TestAgenticProwJobUpdateLegacyAndUnknownObjects(t *testing.T) {
 	if !r.shouldReconcileProwJobUpdate(update) {
 		t.Fatal("legacy branch's real update was filtered")
 	}
+	current.ResourceVersion = old.ResourceVersion
+	r.agentic = nil
+	if !r.shouldReconcileProwJobUpdate(update) {
+		t.Fatal("normal-only controller update behavior changed")
+	}
+	r.agentic = f.a
 	old.Spec.Refs.Repo, current.Spec.Refs.Repo = "normal", "normal"
 	current.ResourceVersion = old.ResourceVersion
 	if !r.shouldReconcileProwJobUpdate(update) {

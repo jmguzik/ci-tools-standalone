@@ -11,14 +11,13 @@ import (
 func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
 	for _, action := range []string{"ownership", "dispatch", "missing-job", "first-success", "lookup-error"} {
 		t.Run(action, func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
-			switch action {
-			case "dispatch", "lookup-error":
-				f = newAgenticFixture(t, "auto")
+			f := newAgenticFixture(t, "auto")
+			if action == "dispatch" || action == "lookup-error" {
 				f.reconcile(t, nil)
-				f.plan(t, "job-a")
-				f.passFirstStage(t)
-			case "missing-job", "first-success":
+			}
+			f.plan(t, "job-a")
+			f.passFirstStage(t)
+			if action == "missing-job" || action == "first-success" {
 				f.reconcile(t, nil)
 				if action == "missing-job" {
 					f.deleteJobs(t, f.allJobs(t)...)

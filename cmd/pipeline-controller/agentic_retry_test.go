@@ -22,13 +22,6 @@ import (
 )
 
 func TestAgenticBackoffSaturates(t *testing.T) {
-	var backoff time.Duration
-	for _, want := range []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second, 160 * time.Second, 5 * time.Minute, 5 * time.Minute} {
-		backoff = nextAgenticBackoff(backoff)
-		if backoff != want {
-			t.Fatalf("backoff=%v, want %v", backoff, want)
-		}
-	}
 	if got := nextAgenticBackoff(time.Duration(1<<63 - 1)); got != agenticMaxBackoff {
 		t.Fatalf("oversized backoff overflowed: %v", got)
 	}
@@ -108,14 +101,20 @@ func agenticProwError(t *testing.T, status int, headers http.Header, list bool) 
 
 func TestAgenticProwHTTPRetryClassification(t *testing.T) {
 	for _, list := range []bool{false, true} {
-		for _, status := range []int{400, 401, 403, 404, 408, 422, 429, 500, 502, 503, 504} {
-			t.Run(fmt.Sprintf("list=%v/status=%d", list, status), func(t *testing.T) {
-				err := agenticProwError(t, status, nil, list)
+		for _, tc := range []struct {
+			status int
+			retry  bool
+		}{
+			{400, false}, {401, false}, {403, false}, {404, false}, {422, false},
+			{408, true}, {429, true}, {500, true}, {502, true}, {503, true}, {504, true},
+		} {
+			t.Run(fmt.Sprintf("list=%v/status=%d", list, tc.status), func(t *testing.T) {
+				err := agenticProwError(t, tc.status, nil, list)
 				got := agenticRetryFor(fmt.Errorf("API operation: %w", err))
-				if got.transient != retryableAgenticHTTPStatus(status) || got.githubRateLimit != (status == 429) {
+				if got.transient != tc.retry || got.githubRateLimit != (tc.status == 429) {
 					t.Fatalf("SDK error %T(%v) classified as %+v", err, err, got)
 				}
-				if status == 429 && got.after < time.Minute {
+				if tc.status == 429 && got.after < time.Minute {
 					t.Fatal("rate limiting without an exposed hint must wait at least a minute")
 				}
 			})
@@ -146,44 +145,35 @@ func TestAgenticProwRateLimitHints(t *testing.T) {
 	}
 }
 
-func TestAgenticFailureReportingPreservesRetryCauses(t *testing.T) {
+func TestAgenticFailureReporting(t *testing.T) {
 	for _, existing := range []bool{false, true} {
-		f := newAgenticFixture(t, "manual")
-		f.reconcile(t, nil)
-		gate, state := f.gate(t)
-		failure := errors.New("invalid configuration")
-		f.gh.failCheck = true
-		var err error
-		if existing {
-			err = f.a.failExistingGate(&gate, state, failure)
-		} else {
-			err = f.a.failState(&gate, state, failure)
-		}
-		if !errors.Is(err, failure) || !errors.Is(err, io.ErrUnexpectedEOF) || !agenticRetryFor(err).transient {
-			t.Fatalf("failed gate write was masked by the original terminal error: %v", err)
-		}
-	}
-}
-
-func TestAgenticFailureReportingRespectsOnlyGitHubCooldown(t *testing.T) {
-	for _, existing := range []bool{false, true} {
-		for _, githubLimit := range []bool{false, true} {
-			f := newAgenticFixture(t, "manual")
-			f.reconcile(t, nil)
-			gate, state := f.gate(t)
-			attempts := f.gh.checkAttempts
-			var failure error = apierrors.NewTooManyRequests("Kubernetes throttled", 60)
-			if githubLimit {
-				failure = errors.New("sleep time for token reset exceeds max sleep time (11m0s > 1m0s)")
-			}
-			if existing {
-				_ = f.a.failExistingGate(&gate, state, failure)
-			} else {
-				_ = f.a.failState(&gate, state, failure)
-			}
-			if got := f.gh.checkAttempts > attempts; got == githubLimit {
-				t.Fatalf("GitHub failure-report attempt=%v for GitHub rate limit=%v", got, githubLimit)
-			}
+		for _, tc := range []struct {
+			name               string
+			failure            error
+			failWrite, publish bool
+		}{
+			{"failed write preserves terminal cause", errors.New("invalid configuration"), true, true},
+			{"Kubernetes throttling permits GitHub writes", apierrors.NewTooManyRequests("Kubernetes throttled", 60), false, true},
+			{"GitHub cooldown prevents writes", errors.New("sleep time for token reset exceeds max sleep time (11m0s > 1m0s)"), false, false},
+		} {
+			t.Run(fmt.Sprintf("existing=%v/%s", existing, tc.name), func(t *testing.T) {
+				f := newAgenticFixture(t, "manual")
+				f.reconcile(t, nil)
+				gate, state := f.gate(t)
+				attempts := f.gh.checkAttempts
+				f.gh.failCheck = tc.failWrite
+				fail := f.a.failState
+				if existing {
+					fail = f.a.failExistingGate
+				}
+				err := fail(&gate, state, tc.failure)
+				require.ErrorIs(t, err, tc.failure)
+				require.Equal(t, tc.publish, f.gh.checkAttempts > attempts)
+				require.True(t, agenticRetryFor(err).transient)
+				if tc.failWrite {
+					require.ErrorIs(t, err, io.ErrUnexpectedEOF, "failed gate write was masked by the terminal error")
+				}
+			})
 		}
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -460,22 +459,6 @@ func TestAgenticEmptyPlanIsExplicitAndAuthorized(t *testing.T) {
 				t.Fatal("explicit empty plan did not settle after prerequisites")
 			}
 		})
-	}
-}
-
-func TestAgenticPartialDispatchRecovery(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a", "job-b")
-	f.jobs.failAt = 2
-	require.Error(t, f.tryReconcile(nil), "expected partial-dispatch failure")
-	check, before := f.gate(t)
-	if check.Conclusion != "failure" || len(f.allJobs(t)) != 1 {
-		t.Fatal("failure was not recorded after partial dispatch")
-	}
-	f.jobs.failAt = 0
-	f.reconcile(t, nil)
-	_, after := f.gate(t)
-	if len(f.allJobs(t)) != 2 || f.jobs.creates != 3 || !reflect.DeepEqual(before.Dispatch, after.Dispatch) {
-		t.Fatal("recovery duplicated work or changed the persisted execution identities")
 	}
 }
 

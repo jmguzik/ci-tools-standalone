@@ -124,21 +124,19 @@ func (s *agenticStore) index(name string, state *agenticState) {
 	s.unindex(name)
 	work := agenticWork{org: state.Org, repo: state.Repo, number: state.Number, sha: state.HeadSHA}
 	s.entries[name] = work
-	for _, key := range []agenticWork{{org: work.org, repo: work.repo}, {org: work.org, repo: work.repo, sha: work.sha}} {
-		if s.routes[key] == nil {
-			s.routes[key] = map[string]bool{}
-		}
-		s.routes[key][name] = true
+	key := agenticWork{org: work.org, repo: work.repo, sha: work.sha}
+	if s.routes[key] == nil {
+		s.routes[key] = map[string]bool{}
 	}
+	s.routes[key][name] = true
 }
 
 func (s *agenticStore) unindex(name string) {
 	if old, ok := s.entries[name]; ok {
-		for _, key := range []agenticWork{{org: old.org, repo: old.repo}, {org: old.org, repo: old.repo, sha: old.sha}} {
-			delete(s.routes[key], name)
-			if len(s.routes[key]) == 0 {
-				delete(s.routes, key)
-			}
+		key := agenticWork{org: old.org, repo: old.repo, sha: old.sha}
+		delete(s.routes[key], name)
+		if len(s.routes[key]) == 0 {
+			delete(s.routes, key)
 		}
 		delete(s.entries, name)
 	}
@@ -256,6 +254,10 @@ func (a *agenticController) prepareStoreLocked() error {
 func (a *agenticController) closeStore() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.closeStoreLocked()
+}
+
+func (a *agenticController) closeStoreLocked() error {
 	if a.maintenance != nil {
 		a.maintenance.Stop()
 		a.maintenance = nil

@@ -9,8 +9,8 @@ import (
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-// number == 0 denotes a repository lookup, optionally restricted to a status
-// event's SHA. Routing uses local records, never a repository-wide GitHub scan.
+// number == 0 routes a status event's SHA through local records, never a
+// repository-wide GitHub scan.
 type agenticWork struct {
 	org, repo string
 	number    int
@@ -48,7 +48,7 @@ func (a *agenticController) reconcile(ctx context.Context, org, repo string, num
 }
 
 // Caller holds mu, including timer callbacks. Failed operations retry only
-// their own PR/repository with capped backoff; idle work has no timer.
+// their own PR/SHA with capped backoff; idle work has no timer.
 func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork, comment *github.IssueComment, backoff time.Duration) (err error) {
 	if a.stopped {
 		return nil
@@ -78,7 +78,7 @@ func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork,
 	if work.number != 0 {
 		return a.reconcilePull(ctx, work.org, work.repo, work.number, comment, &deadline)
 	}
-	if !a.hasRepo(work.org, work.repo) {
+	if work.sha == "" || !a.hasRepo(work.org, work.repo) {
 		return nil
 	}
 	records, err := a.listRecords(ctx, work)
@@ -89,10 +89,10 @@ func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork,
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if r.State.Org != work.org || r.State.Repo != work.repo || (work.sha != "" && r.State.HeadSHA != work.sha) {
+		if r.State.Org != work.org || r.State.Repo != work.repo || r.State.HeadSHA != work.sha {
 			continue
 		}
-		if work.sha != "" && r.State.Inactive && r.Desired == nil && r.Wakeup == nil {
+		if r.State.Inactive && r.Desired == nil && r.Wakeup == nil {
 			continue // Statuses must not wake ordinary-branch departure records.
 		}
 		pull := agenticWork{org: work.org, repo: work.repo, number: r.State.Number}

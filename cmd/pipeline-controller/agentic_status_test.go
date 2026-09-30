@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -56,10 +55,20 @@ func TestAgenticStatusFiltering(t *testing.T) {
 }
 
 func TestAgenticStatusKeepsFrozenContextsAfterConfigRemoval(t *testing.T) {
-	for _, restart := range []bool{false, true} {
-		t.Run(map[bool]string{false: "retained", true: "restart"}[restart], func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
+	for _, phase := range []string{"retained", "restart", "failed-write"} {
+		t.Run(phase, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
 			f.reconcile(t, nil)
+			f.plan(t, "job-a")
+			f.passFirstStage(t)
+			f.gh.failCheck = phase == "failed-write"
+			if f.gh.failCheck {
+				require.Error(t, f.tryReconcile(nil))
+				f.gh.failCheck = false
+			} else {
+				f.reconcile(t, nil)
+				f.report(t, v1.PendingState) // Pending is a valid dispatch report, too.
+			}
 			var jobs []config.Presubmit
 			for _, job := range f.cfg.GetPresubmitsStatic("org/repo") {
 				if job.Name != "job-a" {
@@ -67,26 +76,21 @@ func TestAgenticStatusKeepsFrozenContextsAfterConfigRemoval(t *testing.T) {
 				}
 			}
 			require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": jobs}))
-			if restart {
+			if phase == "restart" {
 				f.a.statusContexts = nil
 			}
-			f.report(t, v1.PendingState) // Pending is a valid dispatch report, too.
+			reads := f.gh.getPullRequestCalls
 			f.a.handleStatus(f.a.logger, github.StatusEvent{Repo: f.gh.pr.Base.Repo, SHA: f.gh.pr.Head.SHA, Context: "ci/job-a", State: github.StatusPending})
+			require.Greater(t, f.gh.getPullRequestCalls, reads, "config removal hid a recorded context")
 			check, _ := f.gate(t)
-			require.Equal(t, "success", check.Conclusion)
-			require.True(t, f.a.statusContexts[agenticWork{org: "org", repo: "repo", sha: f.gh.pr.Head.SHA}]["ci/job-a"])
+			if phase == "failed-write" {
+				require.NotEqual(t, "success", check.Conclusion)
+				require.Zero(t, f.jobs.creates, "removed definition authorized an execution")
+			} else {
+				require.Equal(t, "success", check.Conclusion)
+			}
 		})
 	}
-}
-
-func TestAgenticStatusRetainsSelectionBeforeFailedWrite(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.reconcile(t, nil)
-	f.passFirstStage(t)
-	f.plan(t, "job-a")
-	f.gh.failCheck = true
-	require.Error(t, f.a.reconcile(context.Background(), "org", "repo", 42, nil))
-	require.True(t, f.a.statusContexts[agenticWork{org: "org", repo: "repo", sha: f.gh.pr.Head.SHA}]["ci/job-a"])
 }
 
 func TestAgenticStatusKeepsRemovedFirstStageContext(t *testing.T) {

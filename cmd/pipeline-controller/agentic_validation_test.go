@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -47,28 +45,6 @@ func TestAgenticConfigValidation(t *testing.T) {
 				t.Fatalf("unexpected repository configuration: %+v", item)
 			}
 		})
-	}
-}
-
-func TestAgenticConfigReloadKeepsLastGoodConfiguration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	write := func(body string) {
-		t.Helper()
-		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
-	}
-	write("orgs:\n- org: org\n  repos:\n  - name: repo\n    branches: [main]\n    mode:\n      trigger: manual\n      agentic:\n        mode: chai\n")
-	w := newWatcher(path, nil)
-	require.NoError(t, w.reloadConfig())
-	before := w.getConfig()
-	write("orgs:\n- org: org\n  repos:\n  - name: repo\n    mode:\n      agentic:\n        mode: chai\n        trusted_authors: [untrusted]\n")
-	if err := w.reloadConfig(); err == nil {
-		t.Fatal("expected invalid reload to fail")
-	}
-	if after := w.getConfig(); !reflect.DeepEqual(before, after) {
-		t.Fatalf("invalid reload replaced live configuration: %+v", after)
-	}
-	if got := before["org"]["repo"]; !got.Agentic.enabled() || got.Trigger != "manual" || !reflect.DeepEqual(got.Branches, []string{"main"}) {
-		t.Fatalf("watcher lost agentic mode or branch scope: %+v", got)
 	}
 }
 

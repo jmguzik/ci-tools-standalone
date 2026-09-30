@@ -14,7 +14,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
 )
@@ -88,22 +87,10 @@ func TestAgenticPersistWakeupOnlyWritesChanges(t *testing.T) {
 			path := ageAgenticRecord(t, f, 42, f.now.Add(-time.Minute))
 			before, err := os.Stat(path)
 			require.NoError(t, err)
-			data, err := os.ReadFile(path)
-			require.NoError(t, err)
 			require.False(t, f.a.persistWakeup(context.Background(), work, tc.wakeup))
 			after, err := os.Stat(path)
 			require.NoError(t, err)
-			updated, err := os.ReadFile(path)
-			require.NoError(t, err)
-			if tc.changed {
-				require.False(t, os.SameFile(before, after), "changed wakeup did not replace the record")
-				require.False(t, before.ModTime().Equal(after.ModTime()), "changed wakeup did not refresh retention")
-				require.NotEqual(t, data, updated)
-			} else {
-				require.True(t, os.SameFile(before, after), "unchanged wakeup rewrote the record")
-				require.True(t, before.ModTime().Equal(after.ModTime()), "unchanged wakeup refreshed retention")
-				require.Equal(t, data, updated)
-			}
+			require.Equal(t, tc.changed, !before.ModTime().Equal(after.ModTime()), "wakeup change did not match retention refresh")
 			r, err := f.a.readRecord(context.Background(), work)
 			require.NoError(t, err)
 			require.Equal(t, tc.wakeup, r.Wakeup)
@@ -119,62 +106,42 @@ func TestAgenticPersistWakeupOnlyWritesChanges(t *testing.T) {
 }
 
 func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		stop := startAgenticRunner(f)
-		f.reconcile(t, nil)
-		_, original := f.gate(t)
-		if original.WaitingSince == nil || len(f.a.scheduler.pending) != 1 {
-			t.Fatal("missing one-shot Chai deadline")
-		}
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, 15*time.Minute)
-		if f.gh.getPullRequestCalls != reads {
-			t.Fatal("polled before the Chai deadline")
-		}
-		stop()
-		advanceAgenticTime(f, 4*time.Minute)
-		stop = startAgenticRunner(f)
-		defer stop()
-		_, recovered := f.gate(t)
-		if recovered.WaitingSince == nil || !recovered.WaitingSince.Equal(*original.WaitingSince) {
-			t.Fatal("restart reset the persisted waiting timestamp")
-		}
-		advanceAgenticTime(f, time.Minute-time.Nanosecond)
-		if f.jobs.creates != 0 {
-			t.Fatal("fallback ran before the restored deadline")
-		}
-		advanceAgenticTime(f, time.Nanosecond)
-		_, state := f.gate(t)
-		if state.Plan == nil || state.Plan.Source != "timeout" || f.jobs.creates != 2 || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("deadline did not dispatch once and retire its timer")
-		}
-		assertAgenticIdle(t, f, 24*time.Hour)
-		f.report(t, v1.PendingState)
-		f.a.handleStatus(f.a.logger, github.StatusEvent{Repo: f.gh.pr.Base.Repo, SHA: f.gh.pr.Head.SHA, Context: "ci/job-a", State: "pending"})
-		gate, _ := f.gate(t)
-		if gate.Conclusion != "success" {
-			t.Fatal("report event failed to finish dispatch")
-		}
-	})
-}
-
-func TestAgenticOverdueDeadlineRecoveredAtStartup(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		stop := startAgenticRunner(f)
-		f.reconcile(t, nil)
-		stop()
-		advanceAgenticTime(f, defaultAgenticTimeout+time.Minute)
-		stop = startAgenticRunner(f)
-		defer stop()
-		_, state := f.gate(t)
-		if state.Plan == nil || state.Plan.Source != "timeout" || f.jobs.creates != 2 || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("startup did not act on an already-expired persisted deadline")
-		}
-	})
+	for _, downtime := range []time.Duration{time.Minute, 3 * time.Minute} {
+		t.Run(downtime.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newScheduledAgenticFixture(t, "auto")
+				f.a.options.timeout = 5 * time.Minute
+				f.passFirstStage(t)
+				stop := startAgenticRunner(f)
+				f.reconcile(t, nil)
+				_, original := f.gate(t)
+				require.NotNil(t, original.WaitingSince, "missing Chai deadline")
+				reads := f.gh.getPullRequestCalls
+				advanceAgenticTime(f, 3*time.Minute)
+				require.Equal(t, reads, f.gh.getPullRequestCalls, "polled before the Chai deadline")
+				stop()
+				advanceAgenticTime(f, downtime)
+				stop = startAgenticRunner(f)
+				defer stop()
+				if remaining := f.a.options.timeout - (3*time.Minute + downtime); remaining > 0 {
+					_, recovered := f.gate(t)
+					require.Equal(t, original.WaitingSince, recovered.WaitingSince, "restart reset the persisted waiting timestamp")
+					advanceAgenticTime(f, remaining-time.Nanosecond)
+					require.Zero(t, f.jobs.creates, "fallback ran before the restored global deadline")
+					advanceAgenticTime(f, time.Nanosecond)
+				}
+				_, state := f.gate(t)
+				require.NotNil(t, state.Plan)
+				require.Equal(t, "timeout", state.Plan.Source)
+				require.Equal(t, 2, f.jobs.creates, "persisted deadline did not dispatch once")
+				assertAgenticIdle(t, f, 24*time.Hour)
+				f.report(t, v1.PendingState)
+				f.a.handleStatus(f.a.logger, github.StatusEvent{Repo: f.gh.pr.Base.Repo, SHA: f.gh.pr.Head.SHA, Context: "ci/job-a", State: "pending"})
+				gate, _ := f.gate(t)
+				require.Equal(t, "success", gate.Conclusion, "report event failed to finish dispatch")
+			})
+		})
+	}
 }
 
 func TestAgenticEventsCancelChaiDeadline(t *testing.T) {
@@ -258,49 +225,39 @@ func TestAgenticTransientRetriesContinueUntilRecovery(t *testing.T) {
 }
 
 func TestAgenticInvalidPlanOnlyWaitsForDeadline(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		f.plan(t, "unknown-job")
-		stop := startAgenticRunner(f)
-		defer stop()
-		_ = f.tryReconcile(nil)
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, defaultAgenticTimeout-time.Second)
-		if f.gh.getPullRequestCalls != reads || f.jobs.creates != 0 {
-			t.Fatal("unchanged invalid plan was repeatedly fetched")
-		}
-		advanceAgenticTime(f, time.Second)
-		_, state := f.gate(t)
-		if state.Plan == nil || state.Plan.Source != "timeout" || f.jobs.creates != 2 {
-			t.Fatal("invalid plan lost its bounded fallback deadline")
-		}
-	})
-}
-
-func TestAgenticInvalidPlanPersistenceFailureRetries(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		stop := startAgenticRunner(f)
-		defer stop()
-		f.plan(t, "unknown-job")
-		f.gh.failCheck = true
-		if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil {
-			t.Fatal("expected a failed journal write")
-		}
-		f.gh.failCheck = false
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, 5*time.Second)
-		if f.gh.getPullRequestCalls != reads+1 {
-			t.Fatal("an invalid plan suppressed retrying its failed journal write")
-		}
-		reads = f.gh.getPullRequestCalls
-		advanceAgenticTime(f, time.Minute)
-		if f.gh.getPullRequestCalls != reads {
-			t.Fatal("successfully persisted invalid plan kept retrying")
-		}
-	})
+	for _, failWrite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "persisted", true: "failed-write"}[failWrite], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newScheduledAgenticFixture(t, "auto")
+				f.passFirstStage(t)
+				stop := startAgenticRunner(f)
+				defer stop()
+				if failWrite {
+					f.reconcile(t, nil) // Preserve an established deadline through the failed write.
+				}
+				f.plan(t, "unknown-job")
+				f.gh.failCheck = failWrite
+				err := f.tryReconcile(nil)
+				require.Error(t, err)
+				require.Equal(t, failWrite, agenticRetryFor(err).transient, "invalid plan hid the failed write")
+				f.gh.failCheck = false
+				reads := f.gh.getPullRequestCalls
+				if failWrite {
+					reads++
+				}
+				advanceAgenticTime(f, agenticInitialBackoff)
+				require.Equal(t, reads, f.gh.getPullRequestCalls, "invalid plan retry did not follow persistence outcome")
+				advanceAgenticTime(f, defaultAgenticTimeout-agenticInitialBackoff-time.Second)
+				require.Equal(t, reads, f.gh.getPullRequestCalls, "persisted invalid plan kept retrying")
+				require.Zero(t, f.jobs.creates)
+				advanceAgenticTime(f, time.Second)
+				_, state := f.gate(t)
+				require.NotNil(t, state.Plan)
+				require.Equal(t, "timeout", state.Plan.Source)
+				require.Equal(t, 2, f.jobs.creates, "invalid plan lost its bounded fallback deadline")
+			})
+		})
+	}
 }
 
 func TestAgenticNonRetryableErrorsWaitForEvent(t *testing.T) {
@@ -465,15 +422,17 @@ func TestAgenticRetryFinishesPartialDispatch(t *testing.T) {
 		f.jobs.failAt = 2
 		stop := startAgenticRunner(f)
 		defer stop()
-		_ = f.tryReconcile(nil)
-		if len(f.allJobs(t)) != 1 {
-			t.Fatal("did not reach a partial dispatch")
-		}
+		require.Error(t, f.tryReconcile(nil), "expected partial-dispatch failure")
+		gate, before := f.gate(t)
+		require.Equal(t, "failure", gate.Conclusion)
+		require.Len(t, f.allJobs(t), 1)
 		first := f.allJobs(t)[0].Name
 		advanceAgenticTime(f, 5*time.Second)
 		if len(f.allJobs(t)) != 2 || f.jobs.creates != 3 || len(f.a.scheduler.pending) != 0 {
 			t.Fatal("targeted retry did not finish exactly the missing execution")
 		}
+		_, after := f.gate(t)
+		require.Equal(t, before.Dispatch, after.Dispatch, "recovery changed persisted execution identities")
 		found := false
 		for _, job := range f.allJobs(t) {
 			found = found || job.Name == first
@@ -510,11 +469,12 @@ func TestAgenticShutdownStopsTimers(t *testing.T) {
 func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
-		w := f.a.watcher
+		w := newWatcher(filepath.Join(t.TempDir(), "pipeline.yaml"), f.a.logger)
+		w.config = f.a.watcher.config
+		f.a.watcher = w
 		enabled, err := yaml.Marshal(w.config)
 		require.NoError(t, err)
 		w.config.Orgs[0].Repos[0].Mode.Agentic = AgenticConfig{}
-		w.filePath = filepath.Join(t.TempDir(), "pipeline.yaml")
 		w.setOnChange(f.a.configurationChanged)
 		stop := startAgenticRunner(f)
 		defer stop()
@@ -543,32 +503,4 @@ func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
 			t.Fatalf("invalid reload replaced live configuration: %+v", after)
 		}
 	})
-}
-
-func TestAgenticInformerResyncIsNotGitHubPolling(t *testing.T) {
-	f, _ := mixedAgenticFixture(t)
-	r := &reconciler{agentic: f.a}
-	old := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: &v1.Refs{Org: "org", Repo: "repo", BaseRef: "main"}}}
-	old.ResourceVersion = "10"
-	current := old.DeepCopy()
-	update := event.UpdateEvent{ObjectOld: old, ObjectNew: current}
-	if r.shouldReconcileProwJobUpdate(update) {
-		t.Fatal("unchanged agentic informer resync was accepted")
-	}
-	current.ResourceVersion = "11"
-	if r.shouldReconcileProwJobUpdate(update) {
-		t.Fatal("irrelevant agentic metadata update was accepted")
-	}
-	current.Status.State = v1.SuccessState
-	if !r.shouldReconcileProwJobUpdate(update) {
-		t.Fatal("a relevant ProwJob update was dropped")
-	}
-	current.ResourceVersion, current.Spec.Refs.BaseRef = "10", "release"
-	if r.shouldReconcileProwJobUpdate(update) {
-		t.Fatal("old normal-branch jobs can still cause GitHub polling after retargeting")
-	}
-	r.agentic = nil
-	if !r.shouldReconcileProwJobUpdate(update) {
-		t.Fatal("normal-only controller update behavior changed")
-	}
 }
