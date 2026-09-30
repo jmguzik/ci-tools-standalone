@@ -245,6 +245,8 @@ cannot replace fallback or a dispatched selection; push a new commit to change i
 
 `ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
 Recovery uses events, startup and transient retries; no periodic GitHub polling.
+Startup waits for the ProwJob watch, recovers each open PR once, and skips existing-job replay. Agentic updates react only to job/report/identity changes.
+Startup/status passes share PR listings; ownership, dispatch and first-success transitions still validate collisions freshly. Known SHAs ignore unrelated statuses; frozen contexts remain eligible after configuration changes, and unknown SHAs remain conservative.
 
 Before enrolling:
 

@@ -118,6 +118,9 @@ type agenticController struct {
 	options     agenticOptions
 	mu          sync.Mutex
 	scheduler   *agenticScheduler // protected by mu; only deadlines and transient-error retries
+
+	prowJobWatchReady <-chan struct{}
+	statusContexts    map[agenticWork]map[string]bool // positive interests only; protected by mu
 }
 
 func (a *agenticController) repoConfig(org, repo, branch string) (RepoConfig, bool) {
@@ -250,6 +253,7 @@ func validateAgenticState(state *agenticState) error {
 }
 
 func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState, conclusion, summary string) error {
+	a.rememberStatusContexts(state)
 	metadata, err := agenticMetadata(agenticStateMarker, state)
 	if err != nil {
 		return err
@@ -323,7 +327,7 @@ func (a *agenticController) failExistingGate(gate *github.CheckRun, state *agent
 
 // Called with mu held. A deadline is returned only while actually waiting for
 // Chai, never merely because first-stage jobs or a trigger are still pending.
-func (a *agenticController) reconcilePull(ctx context.Context, org, repo string, number int, comment *github.IssueComment, deadline *time.Time) error {
+func (a *agenticController) reconcilePull(ctx context.Context, org, repo string, number int, comment *github.IssueComment, deadline *time.Time, inventory *agenticPullInventory) error {
 	pr, err := a.gh.GetPullRequest(org, repo, number)
 	if err != nil {
 		return err
@@ -357,6 +361,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		return err
 	}
 	// Recheck on reconciliation too: enrollment can change after startup.
+	a.rememberStatusContexts(state)
 	if err := a.options.validateEnabled(); err != nil {
 		return a.failExistingGate(gate, state, err)
 	}
@@ -366,21 +371,42 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 	}
 	// CheckRuns are commit-scoped, so two enrolled PRs with the same HEAD
 	// cannot safely own independent instances of this required gate.
-	prs, err := a.gh.GetPullRequests(org, repo)
-	if err != nil {
+	collisionFresh := false
+	checkCollision := func(requireFresh bool) error {
+		if requireFresh && collisionFresh {
+			return nil
+		}
+		var prs []github.PullRequest
+		if !requireFresh && inventory.matches(pr) {
+			prs = inventory.prs
+		} else {
+			var err error
+			prs, err = a.gh.GetPullRequests(org, repo)
+			if err != nil {
+				return err
+			}
+			collisionFresh = true
+			if inventory != nil {
+				inventory.prs = prs
+			}
+		}
+		for _, other := range prs {
+			if other.Number == number || other.Head.SHA != pr.Head.SHA {
+				continue
+			}
+			if _, enabled := a.repoConfig(org, repo, other.Base.Ref); enabled {
+				return fmt.Errorf("PRs #%d and #%d share a commit-scoped dispatch gate; use distinct HEAD commits", number, other.Number)
+			}
+		}
+		return nil
+	}
+	// A pass snapshot cannot authorize taking ownership of a missing/sibling
+	// gate. Stable recovery may reuse it, but dispatch transitions revalidate.
+	if err := checkCollision(gate.ID == 0 || state.resetRevision); err != nil {
+		// Preserve the owner's journal, including frozen selections/executions.
 		return a.failExistingGate(gate, state, err)
 	}
-	for _, other := range prs {
-		if other.Number == number || other.Head.SHA != pr.Head.SHA {
-			continue
-		}
-		if _, enabled := a.repoConfig(org, repo, other.Base.Ref); enabled {
-			err := fmt.Errorf("PRs #%d and #%d share a commit-scoped dispatch gate; use distinct HEAD commits", number, other.Number)
-			// Preserve the owner's journal: a collision must not erase a locked
-			// fallback or a partially dispatched plan belonging to the sibling PR.
-			return a.failExistingGate(gate, state, err)
-		}
-	}
+	ensureFreshCollision := func() error { return checkCollision(true) }
 	state, err = a.ensureRevision(gate, state, pr, comments)
 	if err != nil {
 		return a.failState(gate, state, err)
@@ -469,6 +495,9 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		}
 	}
 	if state.Dispatch == nil {
+		if err := ensureFreshCollision(); err != nil {
+			return a.failState(gate, state, err)
+		}
 		if err := a.prepareDispatch(state, static, pr, latest); err != nil {
 			return a.failState(gate, state, err)
 		}
@@ -476,7 +505,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 			return err
 		}
 	}
-	return a.dispatch(ctx, gate, state, static, pr, statuses)
+	return a.dispatch(ctx, gate, state, static, pr, statuses, ensureFreshCollision)
 }
 
 func hasAgenticLabel(pr *github.PullRequest, name string) bool {
@@ -557,7 +586,7 @@ func (a *agenticController) prepareDispatch(state *agenticState, static []config
 	return nil
 }
 
-func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun, state *agenticState, static []config.Presubmit, pr *github.PullRequest, statuses *github.CombinedStatus) error {
+func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun, state *agenticState, static []config.Presubmit, pr *github.PullRequest, statuses *github.CombinedStatus, ensureFreshCollision func() error) error {
 	// Only superseded reports need history. Share one lookup across executions;
 	// first-stage readiness continues to use current statuses exclusively.
 	var history *github.CombinedStatus
@@ -603,6 +632,9 @@ func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun,
 			}
 		}
 		if apierrors.IsNotFound(err) && !execution.Adopted {
+			if err := ensureFreshCollision(); err != nil {
+				return a.failState(gate, state, err)
+			}
 			// Refresh immediately before creating jobs. A stale ProwJob event or
 			// plan must never dispatch work on an old revision.
 			current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
@@ -660,6 +692,11 @@ func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun,
 		}
 	}
 	if allReported {
+		if gate.Status != "completed" || gate.Conclusion != "success" {
+			if err := ensureFreshCollision(); err != nil {
+				return a.failState(gate, state, err)
+			}
+		}
 		current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
 		if err != nil {
 			return a.failState(gate, state, err)

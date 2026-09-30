@@ -962,7 +962,8 @@ func main() {
 		}
 	}
 	agentic := &agenticController{gh: githubClient, jobs: mgr.GetClient(), reader: mgr.GetAPIReader(), config: cfg,
-		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
+		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic,
+		prowJobWatchReady: reconciler.prowJobWatchReady}
 	if err := agentic.validateEnrollment(); err != nil {
 		logger.WithError(err).Fatal("invalid agentic configuration")
 	}

@@ -12,10 +12,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
 )
@@ -87,6 +88,7 @@ type reconciler struct {
 	lgtmWatcher        *watcher
 	pipelineAutoCache  *PipelineAutoCache
 	agentic            *agenticController
+	prowJobWatchReady  chan struct{}
 }
 
 func NewReconciler(
@@ -108,6 +110,7 @@ func NewReconciler(
 		watcher:            w,
 		lgtmWatcher:        lgtmW,
 		pipelineAutoCache:  pipelineAutoCache,
+		prowJobWatchReady:  make(chan struct{}),
 		closedPRsCache: closedPRsCache{
 			prs:       map[string]pullRequest{},
 			m:         sync.Mutex{},
@@ -118,25 +121,18 @@ func NewReconciler(
 	if err := builder.
 		ControllerManagedBy(mgr).
 		Named("pipeline-controller").
-		For(&v1.ProwJob{}, builder.WithPredicates(predicate.Funcs{UpdateFunc: reconciler.shouldReconcileProwJobUpdate})).
+		WatchesRawSource(&readyProwJobSource{
+			SyncingSource: source.Kind[ctrlruntimeclient.Object](mgr.GetCache(), &v1.ProwJob{}, &handler.EnqueueRequestForObject{}, predicate.Funcs{
+				CreateFunc: reconciler.shouldReconcileProwJobCreate,
+				UpdateFunc: reconciler.shouldReconcileProwJobUpdate,
+			}),
+			ready: reconciler.prowJobWatchReady,
+		}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(reconciler); err != nil {
 		return nil, fmt.Errorf("failed to construct controller: %w", err)
 	}
 	return reconciler, nil
-}
-
-func (r *reconciler) shouldReconcileProwJobUpdate(update event.UpdateEvent) bool {
-	pj, ok := update.ObjectNew.(*v1.ProwJob)
-	if !ok || pj.Spec.Refs == nil {
-		return true
-	}
-	if !r.agentic.hasRepo(pj.Spec.Refs.Org, pj.Spec.Refs.Repo) {
-		return true // Preserve normal-only repository behavior.
-	}
-	// Include old normal-branch jobs: their PR may now target an agentic branch.
-	// Informer resyncs are not changes and must not become GitHub polling.
-	return update.ObjectOld != nil && update.ObjectOld.GetResourceVersion() != pj.ResourceVersion
 }
 
 func (r *reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

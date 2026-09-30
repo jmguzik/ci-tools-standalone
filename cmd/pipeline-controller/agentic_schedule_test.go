@@ -512,8 +512,12 @@ func TestAgenticInformerResyncIsNotGitHubPolling(t *testing.T) {
 		t.Fatal("unchanged agentic informer resync was accepted")
 	}
 	current.ResourceVersion = "11"
+	if r.shouldReconcileProwJobUpdate(update) {
+		t.Fatal("irrelevant agentic metadata update was accepted")
+	}
+	current.Status.State = v1.SuccessState
 	if !r.shouldReconcileProwJobUpdate(update) {
-		t.Fatal("a real ProwJob update was dropped")
+		t.Fatal("a relevant ProwJob update was dropped")
 	}
 	current.ResourceVersion, current.Spec.Refs.BaseRef = "10", "release"
 	if r.shouldReconcileProwJobUpdate(update) {

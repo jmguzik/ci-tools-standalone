@@ -29,6 +29,23 @@ type agenticScheduler struct {
 	pending map[agenticWork]*agenticWakeup
 }
 
+// A repository pass shares its complete listing only until that pass returns.
+// Independent events and scheduled retries always start without an inventory.
+type agenticPullInventory struct {
+	prs []github.PullRequest
+}
+
+func (i *agenticPullInventory) matches(pr *github.PullRequest) bool {
+	if i != nil {
+		for _, listed := range i.prs {
+			if listed.Number == pr.Number {
+				return listed.Head.SHA == pr.Head.SHA && listed.Base.Ref == pr.Base.Ref && listed.Base.SHA == pr.Base.SHA
+			}
+		}
+	}
+	return false
+}
+
 // An invalid plan waits for another comment or the existing Chai deadline;
 // repeatedly fetching the same invalid input would not repair it.
 type agenticPlanPendingError struct{ error }
@@ -59,6 +76,10 @@ func (a *agenticController) reconcile(ctx context.Context, org, repo string, num
 // Caller holds mu, including timer callbacks. Failed operations retry only
 // their own PR/repository with capped backoff; idle work has no timer.
 func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork, comment *github.IssueComment, backoff time.Duration) (err error) {
+	return a.reconcileWorkWithInventory(ctx, work, comment, backoff, nil)
+}
+
+func (a *agenticController) reconcileWorkWithInventory(ctx context.Context, work agenticWork, comment *github.IssueComment, backoff time.Duration, inventory *agenticPullInventory) (err error) {
 	if a.scheduler != nil {
 		if previous := a.scheduler.pending[work]; previous != nil {
 			if previous.comment != nil {
@@ -79,7 +100,7 @@ func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork,
 		return err
 	}
 	if work.number != 0 {
-		return a.reconcilePull(ctx, work.org, work.repo, work.number, comment, &deadline)
+		return a.reconcilePull(ctx, work.org, work.repo, work.number, comment, &deadline, inventory)
 	}
 	if !a.hasRepo(work.org, work.repo) {
 		return nil
@@ -88,6 +109,7 @@ func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork,
 	if err != nil {
 		return err
 	}
+	inventory = &agenticPullInventory{prs: prs}
 	for _, pr := range prs {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -96,7 +118,7 @@ func (a *agenticController) reconcileWork(ctx context.Context, work agenticWork,
 			continue
 		}
 		pull := agenticWork{org: work.org, repo: work.repo, number: pr.Number}
-		if err := a.reconcileWork(ctx, pull, nil, 0); err != nil {
+		if err := a.reconcileWorkWithInventory(ctx, pull, nil, 0, inventory); err != nil {
 			a.logger.WithError(err).WithField("pr", pr.Number).Error("Agentic recovery failed")
 		}
 	}

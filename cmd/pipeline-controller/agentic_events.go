@@ -246,6 +246,9 @@ func (a *agenticController) reconcileRepo(ctx context.Context, org, repo, sha st
 }
 
 func (a *agenticController) handleStatus(_ *logrus.Entry, event github.StatusEvent) {
+	if !a.shouldHandleAgenticStatus(event) {
+		return
+	}
 	a.reconcileRepo(context.Background(), event.Repo.Owner.Login, event.Repo.Name, event.SHA)
 }
 
@@ -254,6 +257,16 @@ func (a *agenticController) handleStatus(_ *logrus.Entry, event github.StatusEve
 func (a *agenticController) Run(ctx context.Context) {
 	a.startScheduling(ctx)
 	defer a.stopScheduling()
+	if a.prowJobWatchReady != nil {
+		select {
+		case <-a.prowJobWatchReady:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	a.recoverOpenPullRequests(ctx)
 	<-ctx.Done()
 }
