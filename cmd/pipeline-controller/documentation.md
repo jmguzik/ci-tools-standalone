@@ -6,6 +6,11 @@ The Pipeline Controller is a tool that manages the execution of second-stage tes
 
 The Pipeline Controller operates in three distinct modes, each offering different levels of automation for triggering second-stage tests. Second-stage tests are tests that run after the initial required tests pass, typically integration tests, optional tests, or tests that depend on specific file changes.
 
+Each mode can optionally use [agentic job selection](agentic.md): Chai supplies
+the second-stage list in a PR comment; the controller dispatches it with a
+restart-safe gate and a bounded fallback to normal selection. The instructions
+below describe normal selection unless stated otherwise.
+
 ## Three Operating Modes
 
 ### 1. Manual Mode
@@ -208,4 +213,3 @@ To enroll repository with the pipeline controller, you need to add it to the app
 ### For Manual or Automatic Mode
 
 Repository needs to be added to the main pipeline controller configuration file. Contact your platform team or CI/CD administrators to have your repository added with the desired mode (`manual` or `auto`).
-

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"sync"
@@ -10,13 +11,45 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// AgenticConfig selects a planner without changing the repository's trigger mode.
+type AgenticConfig struct {
+	Mode string `yaml:"mode,omitempty"`
+}
+
+func (a AgenticConfig) enabled() bool { return a.Mode == "chai" }
+
+func (a *AgenticConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var raw struct {
+		Mode  string                 `yaml:"mode,omitempty"`
+		Extra map[string]interface{} `yaml:",inline"`
+	}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+	for key := range raw.Extra {
+		return fmt.Errorf("unsupported repository agentic option %q; timeout and trusted authors are controller flags", key)
+	}
+	a.Mode = raw.Mode
+	return a.validate()
+}
+
+func (a AgenticConfig) validate() error {
+	if a.Mode != "" && !a.enabled() {
+		return fmt.Errorf("unsupported agentic mode %q", a.Mode)
+	}
+	return nil
+}
+
+type RepoMode struct {
+	Trigger string        `yaml:"trigger,omitempty"`
+	Agentic AgenticConfig `yaml:"agentic,omitempty"`
+}
+
 // RepoItem represents a repository configuration that can be either a string or an object
 type RepoItem struct {
 	Name     string
 	Branches []string
-	Mode     struct {
-		Trigger string
-	}
+	Mode     RepoMode
 }
 
 // UnmarshalYAML implements custom unmarshaling to support both string and object formats
@@ -33,9 +66,7 @@ func (r *RepoItem) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type rawRepo struct {
 		Name     string   `yaml:"name"`
 		Branches []string `yaml:"branches,omitempty"`
-		Mode     struct {
-			Trigger string `yaml:"trigger"`
-		} `yaml:"mode,omitempty"`
+		Mode     RepoMode `yaml:"mode,omitempty"`
 	}
 	var raw rawRepo
 	if err := unmarshal(&raw); err != nil {
@@ -44,9 +75,15 @@ func (r *RepoItem) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 	r.Name = raw.Name
 	r.Branches = raw.Branches
-	r.Mode.Trigger = raw.Mode.Trigger
+	r.Mode = raw.Mode
 	if r.Mode.Trigger == "" {
 		r.Mode.Trigger = "auto" // default to auto if not specified
+	}
+	if err := r.Mode.Agentic.validate(); err != nil {
+		return fmt.Errorf("repository %s: %w", r.Name, err)
+	}
+	if r.Mode.Agentic.enabled() && r.Mode.Trigger != "auto" && r.Mode.Trigger != "manual" && r.Mode.Trigger != "lgtm" {
+		return fmt.Errorf("repository %s: unsupported trigger %q", r.Name, r.Mode.Trigger)
 	}
 	return nil
 }
@@ -63,6 +100,7 @@ type enabledConfig struct {
 type RepoConfig struct {
 	Trigger  string
 	Branches []string // If empty, all branches are enabled
+	Agentic  AgenticConfig
 }
 
 // watcher struct encapsulates the file watcher and configuration
@@ -71,6 +109,7 @@ type watcher struct {
 	config   enabledConfig
 	mutex    sync.Mutex
 	logger   *logrus.Entry
+	onChange func()
 }
 
 func newWatcher(filePath string, logger *logrus.Entry) *watcher {
@@ -117,9 +156,6 @@ func (w *watcher) getConfigCopy() enabledConfig {
 }
 
 func (w *watcher) reloadConfig() error {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-
 	yamlFile, err := os.Open(w.filePath)
 	if err != nil {
 		return err
@@ -128,12 +164,27 @@ func (w *watcher) reloadConfig() error {
 	defer yamlFile.Close()
 
 	decoder := yaml.NewDecoder(yamlFile)
-	err = decoder.Decode(&w.config)
+	var next enabledConfig
+	err = decoder.Decode(&next)
 	if err != nil {
 		return err
 	}
+	w.mutex.Lock()
+	changed := !reflect.DeepEqual(w.config, next)
+	w.config = next
+	onChange := w.onChange
+	w.mutex.Unlock()
+	if changed && onChange != nil {
+		onChange() // Outside the lock: listeners may read the new configuration.
+	}
 
 	return nil
+}
+
+func (w *watcher) setOnChange(onChange func()) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	w.onChange = onChange
 }
 
 func (w *watcher) getConfig() map[string]map[string]RepoConfig {
@@ -147,6 +198,7 @@ func (w *watcher) getConfig() map[string]map[string]RepoConfig {
 			repoConfigs[repo.Name] = RepoConfig{
 				Trigger:  repo.Mode.Trigger,
 				Branches: repo.Branches,
+				Agentic:  repo.Mode.Agentic,
 			}
 		}
 		ret[org.Org] = repoConfigs
