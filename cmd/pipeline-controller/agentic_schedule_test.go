@@ -483,3 +483,35 @@ func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
 		}
 	})
 }
+
+type agenticConfigLogWriter func([]byte) (int, error)
+
+func (write agenticConfigLogWriter) Write(data []byte) (int, error) { return write(data) }
+
+func TestAgenticConfigurationChangesAllowInterleavedDeletion(t *testing.T) {
+	f := newAgenticFixture(t, "auto")
+	for _, number := range []int{42, 43} {
+		pr := f.gh.pr
+		pr.Number = number
+		require.NoError(t, f.a.writeRecord(t.Context(), &agenticRecord{State: newAgenticState("org", "repo", &pr, f.now)}))
+	}
+	f.a.startScheduling(t.Context())
+	names := f.a.store.recordNames()
+	second := f.a.store.entries[names[1]]
+	f.gh.getPullRequestError = errors.New("permanent PR read failure")
+	interleaved := false
+	f.a.logger.Logger.SetOutput(agenticConfigLogWriter(func(data []byte) (int, error) {
+		// The first PR's error log is a deterministic boundary before the next
+		// tracked PR. Other controller work must be able to take mu here.
+		if strings.Contains(string(data), "Cannot reevaluate tracked agentic PR") && f.a.mu.TryLock() {
+			defer f.a.mu.Unlock()
+			require.NoError(t, f.a.deleteRecord(t.Context(), second.org, second.repo, second.number))
+			interleaved = true
+		}
+		return len(data), nil
+	}))
+	f.a.configurationChanged()
+	require.True(t, interleaved, "configuration batch retained mu between tracked PRs")
+	require.Equal(t, 1, f.gh.getPullRequestCalls, "batch reconciled a record deleted after its snapshot")
+	require.Len(t, f.a.store.entries, 1, "interleaved deletion disturbed another record")
+}

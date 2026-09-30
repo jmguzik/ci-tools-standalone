@@ -313,40 +313,44 @@ func (a *agenticController) Run(ctx context.Context) error {
 }
 
 // Reevaluate already tracked PRs on explicit configuration changes, without
-// discovering new PRs or scanning GitHub repositories.
+// discovering new PRs or scanning GitHub repositories. Release mu between PRs
+// so the batch does not prevent webhook, timer, or shutdown work from running.
 func (a *agenticController) configurationChanged() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	s := a.scheduler
-	if !a.hasAgenticEnrollment() && len(a.statusContexts) == 0 {
+	if a.stopped || a.dryRun || s == nil || s.ctx.Err() != nil || (!a.hasAgenticEnrollment() && len(a.statusContexts) == 0) {
+		a.mu.Unlock()
 		return
 	}
-	if s != nil && s.ctx.Err() == nil {
-		if a.dryRun {
+	if err := a.prepareStoreLocked(); err != nil {
+		a.mu.Unlock()
+		a.logger.WithError(err).Error("Cannot reload tracked agentic PRs")
+		return
+	}
+	if a.store == nil {
+		a.mu.Unlock()
+		return
+	}
+	names := a.store.recordNames()
+	a.mu.Unlock()
+	for _, name := range names {
+		a.mu.Lock()
+		if a.stopped || a.scheduler != s || s.ctx.Err() != nil {
+			a.mu.Unlock()
 			return
 		}
-		if err := a.prepareStoreLocked(); err != nil {
-			a.logger.WithError(err).Error("Cannot reload tracked agentic PRs")
+		r, err := a.readStoredRecord(s.ctx, name)
+		if err != nil {
+			a.mu.Unlock()
+			a.logger.WithError(err).Error("Cannot reload tracked agentic PR")
 			return
 		}
-		if a.store == nil {
-			return
+		if r != nil {
+			err = a.reconcileWork(s.ctx, agenticWork{org: r.State.Org, repo: r.State.Repo, number: r.State.Number}, nil, 0)
 		}
-		for _, name := range a.store.recordNames() {
-			if s.ctx.Err() != nil {
-				return
-			}
-			r, err := a.readStoredRecord(s.ctx, name)
-			if err != nil {
-				a.logger.WithError(err).Error("Cannot reload tracked agentic PR")
-				return
-			}
-			if r == nil {
-				continue
-			}
-			if err := a.reconcileWork(s.ctx, agenticWork{org: r.State.Org, repo: r.State.Repo, number: r.State.Number}, nil, 0); err != nil {
-				a.logger.WithError(err).Error("Cannot reevaluate tracked agentic PR")
-			}
+		a.mu.Unlock()
+		if err != nil {
+			a.logger.WithError(err).Error("Cannot reevaluate tracked agentic PR")
 		}
 	}
 }
