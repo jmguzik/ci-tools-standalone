@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/prow/pkg/github"
@@ -93,9 +94,7 @@ func agenticProwError(t *testing.T, status int, headers http.Header, list bool) 
 				Body: io.NopCloser(strings.NewReader(`{"message":"test failure"}`)), Request: request}, nil
 		}),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if list {
 		_, err = client.GetPullRequests("org", "repo")
 	} else {

@@ -36,21 +36,27 @@ func formatAgenticRevision(revision agenticRevision) string {
 	return fmt.Sprintf("Agentic tests: %s `%s` → `%s`.\n\n%s", status, short, revision.BaseBranch, metadata)
 }
 
-func (a *agenticController) ensureRevision(gate *github.CheckRun, state *agenticState, pr *github.PullRequest, comments []github.IssueComment) (*agenticState, error) {
+func (a *agenticController) revisionComment(comments []github.IssueComment) (*github.IssueComment, int, error) {
 	isBot, err := a.gh.BotUserChecker()
 	if err != nil {
-		return state, err
+		return nil, 0, err
 	}
 	var marker *github.IssueComment
 	var floor int
 	for i := range comments {
 		comment := &comments[i]
-		if comment.ID > floor {
-			floor = comment.ID
-		}
+		floor = max(floor, comment.ID)
 		if isBot(comment.User.Login) && strings.Contains(comment.Body, agenticRevisionMarker) && (marker == nil || comment.ID > marker.ID) {
 			marker = comment
 		}
+	}
+	return marker, floor, nil
+}
+
+func (a *agenticController) ensureRevision(gate *github.CheckRun, state *agenticState, pr *github.PullRequest, comments []github.IssueComment) (*agenticState, error) {
+	marker, floor, err := a.revisionComment(comments)
+	if err != nil {
+		return state, err
 	}
 	var revision agenticRevision
 	if state.RevisionUpdate != nil && !state.resetRevision {
@@ -126,20 +132,9 @@ func (a *agenticController) invalidateDeparture(org, repo string, pr *github.Pul
 	if err != nil {
 		return err
 	}
-	isBot, err := a.gh.BotUserChecker()
+	marker, floor, err := a.revisionComment(comments)
 	if err != nil {
 		return err
-	}
-	var marker *github.IssueComment
-	var floor int
-	for i := range comments {
-		comment := &comments[i]
-		if comment.ID > floor {
-			floor = comment.ID
-		}
-		if isBot(comment.User.Login) && strings.Contains(comment.Body, agenticRevisionMarker) && (marker == nil || comment.ID > marker.ID) {
-			marker = comment
-		}
 	}
 	var previous agenticRevision
 	if marker != nil {
@@ -226,7 +221,7 @@ func (a *agenticController) recoverCommands(gate *github.CheckRun, state *agenti
 		if comment.ID <= state.LastCommandID || comment.CreatedAt.Before(state.ObservedAt) || comment.CreatedAt.IsZero() || comment.UpdatedAt.After(comment.CreatedAt) {
 			continue
 		}
-		if err := a.recordCommand(gate, state, cfg, pr, comment); err != nil {
+		if err := a.recordCommand(gate, state, comment); err != nil {
 			return err
 		}
 		if err := a.applyCommand(gate, state, cfg, pr, comments); err != nil {

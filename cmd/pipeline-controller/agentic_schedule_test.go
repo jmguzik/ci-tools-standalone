@@ -6,11 +6,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
@@ -45,10 +47,19 @@ func advanceAgenticTime(f *agenticFixture, duration time.Duration) {
 	// Publish fixture edits/observations to future callbacks. synctest.Wait
 	// synchronizes callbacks that finished, not ones whose timer is still due.
 	f.a.mu.Lock()
-	f.a.mu.Unlock()
+	f.a.mu.Unlock() //nolint:staticcheck // SA2001: intentional happens-before barrier for future scheduler callbacks.
 	time.Sleep(duration)
 	synctest.Wait()
 	f.now = time.Now()
+}
+
+func assertAgenticIdle(t *testing.T, f *agenticFixture, duration time.Duration) {
+	t.Helper()
+	reads, lists, writes := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls, len(f.gh.checkWrites)
+	advanceAgenticTime(f, duration)
+	if f.gh.getPullRequestCalls != reads || f.gh.getPullRequestsCalls != lists || len(f.gh.checkWrites) != writes || len(f.a.scheduler.pending) != 0 {
+		t.Fatal("idle controller polled GitHub or retained a recurring timer")
+	}
 }
 
 func TestAgenticRunDoesNotPoll(t *testing.T) {
@@ -68,12 +79,7 @@ func TestAgenticRunDoesNotPoll(t *testing.T) {
 				}
 				stop := startAgenticRunner(f)
 				defer stop()
-				reads, lists := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls
-				writes := len(f.gh.checkWrites)
-				advanceAgenticTime(f, 24*time.Hour)
-				if f.gh.getPullRequestCalls != reads || f.gh.getPullRequestsCalls != lists || len(f.gh.checkWrites) != writes || len(f.a.scheduler.pending) != 0 {
-					t.Fatal("idle controller polled GitHub or retained a recurring timer")
-				}
+				assertAgenticIdle(t, f, 24*time.Hour)
 			})
 		})
 	}
@@ -110,11 +116,7 @@ func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
 		if state.Plan == nil || state.Plan.Source != "timeout" || f.jobs.creates != 2 || len(f.a.scheduler.pending) != 0 {
 			t.Fatal("deadline did not dispatch once and retire its timer")
 		}
-		reads = f.gh.getPullRequestCalls
-		advanceAgenticTime(f, 24*time.Hour)
-		if f.gh.getPullRequestCalls != reads {
-			t.Fatal("controller polled dispatched jobs while waiting for reports")
-		}
+		assertAgenticIdle(t, f, 24*time.Hour)
 		f.report(t, v1.PendingState)
 		f.a.handleStatus(f.a.logger, github.StatusEvent{Repo: f.gh.pr.Base.Repo, SHA: f.gh.pr.Head.SHA, Context: "ci/job-a", State: "pending"})
 		gate, _ := f.gate(t)
@@ -164,11 +166,7 @@ func TestAgenticEventsCancelChaiDeadline(t *testing.T) {
 				if len(f.a.scheduler.pending) != 0 {
 					t.Fatal("obsolete deadline was not canceled")
 				}
-				reads := f.gh.getPullRequestCalls
-				advanceAgenticTime(f, time.Hour)
-				if f.gh.getPullRequestCalls != reads {
-					t.Fatal("canceled deadline still read GitHub")
-				}
+				assertAgenticIdle(t, f, time.Hour)
 			})
 		})
 	}
@@ -216,11 +214,7 @@ func TestAgenticTransientRetriesContinueUntilRecovery(t *testing.T) {
 				if f.jobs.creates != 1 || len(f.a.scheduler.pending) != 0 {
 					t.Fatal("transient recovery needed a new event after five attempts")
 				}
-				expected = calls()
-				advanceAgenticTime(f, 24*time.Hour)
-				if calls() != expected {
-					t.Fatal("successful recovery left an idle polling timer")
-				}
+				assertAgenticIdle(t, f, 24*time.Hour)
 			})
 		})
 	}
@@ -271,43 +265,37 @@ func TestAgenticInvalidPlanPersistenceFailureRetries(t *testing.T) {
 	})
 }
 
-func TestAgenticCommentRoutingFailureRetriesCommand(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "manual")
-		stop := startAgenticRunner(f)
-		defer stop()
-		command := f.command(500, "remaining")
-		f.gh.getPullRequestError = io.ErrUnexpectedEOF
-		f.a.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: github.IssueCommentActionCreated,
-			Repo: f.gh.pr.Base.Repo, Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: *command})
-		f.gh.getPullRequestError = nil
-		advanceAgenticTime(f, 5*time.Second)
-		_, state := f.gate(t)
-		if state.ManualRequestID != command.ID || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("routing failure lost the delivered manual command")
-		}
-	})
-}
-
-func TestAgenticUnknownErrorWaitsForEvent(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		f.plan(t, "job-a")
-		f.gh.getPullRequestError = errors.New("unclassified operational failure")
-		stop := startAgenticRunner(f)
-		defer stop()
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, 24*time.Hour)
-		if f.gh.getPullRequestCalls != reads || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("unclassified error caused recurring reads")
-		}
-		f.gh.getPullRequestError = nil
-		f.a.handlePullRequest(f.a.logger, github.PullRequestEvent{Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr})
-		if f.jobs.creates != 1 {
-			t.Fatal("relevant event did not reactivate failed work")
-		}
-	})
+func TestAgenticNonRetryableErrorsWaitForEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name, failure string
+		startup       bool
+	}{
+		{"startup-unknown", "unclassified operational failure", true},
+		{"pending-deadline-auth", "return code not 2XX: 401 Unauthorized", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newScheduledAgenticFixture(t, "auto")
+				f.passFirstStage(t)
+				if tc.startup {
+					f.gh.getPullRequestError = errors.New(tc.failure)
+				}
+				stop := startAgenticRunner(f)
+				defer stop()
+				f.plan(t, "job-a")
+				if !tc.startup {
+					f.gh.getPullRequestError = errors.New(tc.failure)
+					require.Error(t, f.tryReconcile(nil), "expected operational failure")
+				}
+				assertAgenticIdle(t, f, 24*time.Hour)
+				f.gh.getPullRequestError = nil
+				f.a.handlePullRequest(f.a.logger, github.PullRequestEvent{Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr})
+				if f.jobs.creates != 1 {
+					t.Fatal("relevant event did not reactivate failed work")
+				}
+			})
+		})
+	}
 }
 
 func TestAgenticMalformedJournalWriteFailureRetries(t *testing.T) {
@@ -325,11 +313,7 @@ func TestAgenticMalformedJournalWriteFailureRetries(t *testing.T) {
 		if f.gh.checks[0].Conclusion != "failure" || len(f.a.scheduler.pending) != 0 || f.jobs.creates != 0 {
 			t.Fatal("failure-report recovery did not stop after recording the terminal error")
 		}
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, time.Hour)
-		if f.gh.getPullRequestCalls != reads {
-			t.Fatal("unchanged corrupted state kept retrying")
-		}
+		assertAgenticIdle(t, f, time.Hour)
 	})
 }
 
@@ -375,24 +359,34 @@ func TestAgenticRateLimitKeepsDeadlineAndOriginalCommand(t *testing.T) {
 	}
 }
 
-func TestAgenticNearerDeadlinePreservesFailedCommand(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		stop := startAgenticRunner(f)
-		defer stop()
-		advanceAgenticTime(f, defaultAgenticTimeout-time.Second)
-		command := f.command(500, "required")
-		f.gh.getPullRequestError = io.ErrUnexpectedEOF
-		f.a.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: f.gh.pr.Base.Repo,
-			Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: *command})
-		f.gh.getPullRequestError = nil
-		advanceAgenticTime(f, time.Second)
-		_, state := f.gate(t)
-		if f.jobs.creates != 2 || state.ForceRequestID != command.ID || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("nearer Chai deadline was lost or discarded the failed routing command")
-		}
-	})
+func TestAgenticCommentRoutingFailurePreservesCommand(t *testing.T) {
+	for _, mode := range []string{"manual", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newScheduledAgenticFixture(t, mode)
+				if mode == "auto" {
+					f.passFirstStage(t)
+				}
+				stop := startAgenticRunner(f)
+				defer stop()
+				commandName, delay, wantCreates := "remaining", agenticInitialBackoff, 0
+				if mode == "auto" {
+					advanceAgenticTime(f, defaultAgenticTimeout-time.Second)
+					commandName, delay, wantCreates = "required", time.Second, 2
+				}
+				command := f.command(500, commandName)
+				f.gh.getPullRequestError = io.ErrUnexpectedEOF
+				f.a.handleIssueComment(f.a.logger, github.IssueCommentEvent{Action: github.IssueCommentActionCreated,
+					Repo: f.gh.pr.Base.Repo, Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: *command})
+				f.gh.getPullRequestError = nil
+				advanceAgenticTime(f, delay)
+				_, state := f.gate(t)
+				if state.ManualRequestID != command.ID || (mode == "auto" && state.ForceRequestID != command.ID) || f.jobs.creates != wantCreates || len(f.a.scheduler.pending) != 0 {
+					t.Fatal("retry or nearer Chai deadline lost the delivered manual command")
+				}
+			})
+		})
+	}
 }
 
 func TestAgenticOverlappingFailuresPreserveCooldown(t *testing.T) {
@@ -418,38 +412,6 @@ func TestAgenticOverlappingFailuresPreserveCooldown(t *testing.T) {
 		_, state := f.gate(t)
 		if state.ManualRequestID != command.ID || len(f.a.scheduler.pending) != 0 {
 			t.Fatal("coalesced retry did not recover the original command")
-		}
-	})
-}
-
-func TestAgenticTerminalErrorCancelsObsoleteDeadline(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		stop := startAgenticRunner(f)
-		defer stop()
-		f.gh.getPullRequestError = errors.New("return code not 2XX: 401 Unauthorized")
-		if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil {
-			t.Fatal("expected authorization failure")
-		}
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, 24*time.Hour)
-		if f.gh.getPullRequestCalls != reads || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("terminal error kept its obsolete Chai deadline alive")
-		}
-	})
-}
-
-func TestAgenticShutdownCancelsContinuingRetry(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.gh.getPullRequestError = io.ErrUnexpectedEOF
-		stop := startAgenticRunner(f)
-		stop()
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, time.Hour)
-		if f.gh.getPullRequestCalls != reads || f.a.scheduler != nil {
-			t.Fatal("cancellation retained a transient-recovery timer")
 		}
 	})
 }
@@ -480,18 +442,25 @@ func TestAgenticRetryFinishesPartialDispatch(t *testing.T) {
 	})
 }
 
-func TestAgenticShutdownStopsDeadline(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		f := newScheduledAgenticFixture(t, "auto")
-		f.passFirstStage(t)
-		stop := startAgenticRunner(f)
-		stop()
-		reads := f.gh.getPullRequestCalls
-		advanceAgenticTime(f, 24*time.Hour)
-		if f.a.scheduler != nil || f.gh.getPullRequestCalls != reads || f.jobs.creates != 0 {
-			t.Fatal("shutdown left a live reconciliation timer")
-		}
-	})
+func TestAgenticShutdownStopsTimers(t *testing.T) {
+	for _, timer := range []string{"deadline", "transient-retry"} {
+		t.Run(timer, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newScheduledAgenticFixture(t, "auto")
+				f.passFirstStage(t)
+				if timer == "transient-retry" {
+					f.gh.getPullRequestError = io.ErrUnexpectedEOF
+				}
+				stop := startAgenticRunner(f)
+				stop()
+				reads := f.gh.getPullRequestCalls
+				advanceAgenticTime(f, 24*time.Hour)
+				if f.a.scheduler != nil || f.gh.getPullRequestCalls != reads || f.jobs.creates != 0 {
+					t.Fatal("shutdown left a live reconciliation timer")
+				}
+			})
+		})
+	}
 }
 
 func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
@@ -499,9 +468,7 @@ func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
 		w := f.a.watcher
 		enabled, err := yaml.Marshal(w.config)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		w.config.Orgs[0].Repos[0].Mode.Agentic = AgenticConfig{}
 		w.filePath = filepath.Join(t.TempDir(), "pipeline.yaml")
 		w.setOnChange(f.a.configurationChanged)
@@ -510,30 +477,26 @@ func TestAgenticConfigurationRecoveryOnlyOnChanges(t *testing.T) {
 		if f.gh.getPullRequestsCalls != 0 {
 			t.Fatal("normal-only startup performed an agentic scan")
 		}
-		if err := os.WriteFile(w.filePath, enabled, 0600); err != nil {
-			t.Fatal(err)
-		}
-		if err := w.reloadConfig(); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(w.filePath, enabled, 0600))
+		require.NoError(t, w.reloadConfig())
 		if f.gh.getPullRequestsCalls == 0 || len(f.gh.checks) != 1 {
 			t.Fatal("new enrollment did not recover existing PRs")
 		}
 		reads, lists := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls
 		for range 3 {
-			if err := w.reloadConfig(); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, w.reloadConfig())
 		}
 		if f.gh.getPullRequestCalls != reads || f.gh.getPullRequestsCalls != lists {
 			t.Fatal("unchanged local config checks caused GitHub polling")
 		}
 		invalid := strings.Replace(string(enabled), "mode: chai", "mode: unknown", 1)
-		if err := os.WriteFile(w.filePath, []byte(invalid), 0600); err != nil {
-			t.Fatal(err)
-		}
+		before := w.getConfig()
+		require.NoError(t, os.WriteFile(w.filePath, []byte(invalid), 0600))
 		if err := w.reloadConfig(); err == nil || f.gh.getPullRequestsCalls != lists {
 			t.Fatal("invalid configuration triggered recovery")
+		}
+		if after := w.getConfig(); !reflect.DeepEqual(before, after) {
+			t.Fatalf("invalid reload replaced live configuration: %+v", after)
 		}
 	})
 }

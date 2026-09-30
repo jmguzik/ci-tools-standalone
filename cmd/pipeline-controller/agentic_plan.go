@@ -65,7 +65,7 @@ func parseAgenticPlan(body string) (agenticPlan, error) {
 			plan.Jobs = append(plan.Jobs, agenticPlanJobRE.FindStringSubmatch(line)[1])
 		case line == "None.":
 			if plan.Jobs != nil || plan.Rationale != "" {
-				return plan, fmt.Errorf("None. cannot be combined with another job list")
+				return plan, fmt.Errorf("empty selection cannot be combined with a job list")
 			}
 			empty, plan.Jobs = true, []string{}
 		case agenticRequestRE.MatchString(line):
@@ -82,7 +82,7 @@ func parseAgenticPlan(body string) (agenticPlan, error) {
 				return plan, fmt.Errorf("reason must not be blank")
 			}
 		default:
-			return plan, fmt.Errorf("unrecognized plan line: use job bullets, None., Request: or Reason:")
+			return plan, fmt.Errorf("unrecognized plan line: use job bullets, None., Request or Reason")
 		}
 	}
 	if plan.Jobs == nil {

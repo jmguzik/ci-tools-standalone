@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -302,7 +303,7 @@ func (a *agenticController) failState(gate *github.CheckRun, state *agenticState
 		return err // Do not immediately spend another request on a rate-limited API.
 	}
 	if saveErr := a.saveState(gate, state, "failure", err.Error()); saveErr != nil {
-		return fmt.Errorf("%w (recording failure: %w)", err, saveErr)
+		return errors.Join(err, fmt.Errorf("recording failure: %w", saveErr))
 	}
 	return err
 }
@@ -315,7 +316,7 @@ func (a *agenticController) failExistingGate(gate *github.CheckRun, state *agent
 		return a.failState(gate, state, err)
 	}
 	if writeErr := a.gh.UpdateCheckRun(state.Org, state.Repo, gate.ID, github.CheckRun{Status: "completed", Conclusion: "failure", Output: github.CheckRunOutput{Title: "Dispatch blocked", Summary: err.Error(), Text: gate.Output.Text}}); writeErr != nil {
-		return fmt.Errorf("%w (recording failure: %w)", err, writeErr)
+		return errors.Join(err, fmt.Errorf("recording failure: %w", writeErr))
 	}
 	return err
 }
@@ -350,7 +351,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		// our own check, preserving the malformed data for diagnosis.
 		if gate != nil && gate.ID != 0 {
 			if writeErr := a.gh.UpdateCheckRun(org, repo, gate.ID, github.CheckRun{Status: "completed", Conclusion: "failure", Output: github.CheckRunOutput{Title: "Cannot recover dispatch", Summary: err.Error(), Text: gate.Output.Text}}); writeErr != nil {
-				return fmt.Errorf("%w (recording failure: %w)", err, writeErr)
+				return errors.Join(err, fmt.Errorf("recording failure: %w", writeErr))
 			}
 		}
 		return err
@@ -395,7 +396,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		if err := a.explainUnboundCommand(state, *comment, comments); err != nil {
 			return err
 		}
-		if err := a.recordCommand(gate, state, cfg, pr, *comment); err != nil {
+		if err := a.recordCommand(gate, state, *comment); err != nil {
 			return err
 		}
 	}
@@ -536,7 +537,7 @@ func (a *agenticController) prepareDispatch(state *agenticState, static []config
 	}
 	resolved, err := resolveAgenticJobs(names, static, state.BaseBranch)
 	if err != nil || !reflect.DeepEqual(resolved, state.Plan.Jobs) {
-		return fmt.Errorf("selected job definitions changed; refusing to dispatch: %v", err)
+		return errors.Join(errors.New("selected job definitions changed; refusing to dispatch"), err)
 	}
 	requestID, force := "initial", false
 	if state.ForceRequestID > 0 {

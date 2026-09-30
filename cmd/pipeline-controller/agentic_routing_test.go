@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -21,9 +22,7 @@ func mixedAgenticFixture(t *testing.T) (*agenticFixture, *clientWrapper) {
 	agentic := f.a.watcher
 	agentic.config.Orgs[0].Repos[0].Branches = []string{"main"}
 	var normal enabledConfig
-	if err := yaml.Unmarshal([]byte("orgs:\n- org: org\n  repos:\n  - name: repo\n    branches: [release]\n    mode:\n      trigger: auto\n"), &normal); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, yaml.Unmarshal([]byte("orgs:\n- org: org\n  repos:\n  - name: repo\n    branches: [release]\n    mode:\n      trigger: auto\n"), &normal))
 	f.a.watcher, f.a.lgtmWatcher = &watcher{config: normal}, agentic
 	provider := &ConfigDataProvider{updatedPresubmits: map[string]presubmitTests{
 		"org/repo": {protected: []config.Presubmit{{JobBase: config.JobBase{Name: "repo-release-protected"},
@@ -68,9 +67,7 @@ func TestAgenticMixedModeRejectsStaleProwJob(t *testing.T) {
 		f, cw := mixedAgenticFixture(t)
 		pj := &v1.ProwJob{ObjectMeta: metav1.ObjectMeta{Name: "old-first-stage", Namespace: "ci"}, Spec: v1.ProwJobSpec{Type: v1.PresubmitJob, Job: "first-stage",
 			Refs: &v1.Refs{Org: "org", Repo: "repo", BaseRef: "release", Pulls: []v1.Pull{{Number: 42, SHA: f.gh.pr.Head.SHA}}}}}
-		if err := f.jobs.Client.Create(context.Background(), pj); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, f.jobs.Client.Create(context.Background(), pj))
 		if lookupFails {
 			f.gh.getPullRequestError = errors.New("GitHub unavailable")
 		}
@@ -143,9 +140,7 @@ func TestAgenticStaleNormalEventReconcilesCurrentAgenticRevision(t *testing.T) {
 }
 
 func TestAgenticBatchRetestsDoNotChangePRSelection(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.plan(t, "job-a")
-	f.passFirstStage(t)
+	f := newReadyAgenticFixture(t, "auto", "job-a")
 	f.reconcile(t, nil)
 	gate, _ := f.gate(t)
 	writes := len(f.gh.checkWrites)
@@ -154,13 +149,9 @@ func TestAgenticBatchRetestsDoNotChangePRSelection(t *testing.T) {
 	pj := &v1.ProwJob{ObjectMeta: metav1.ObjectMeta{Name: "tide-extra-job", Namespace: "ci"},
 		Spec: v1.ProwJobSpec{Type: v1.BatchJob, Job: "job-b", Refs: &v1.Refs{Org: "org", Repo: "repo", BaseRef: "main",
 			Pulls: []v1.Pull{{Number: 42, SHA: f.gh.pr.Head.SHA}, {Number: 43, SHA: "another-head"}}}}}
-	if err := f.jobs.Client.Create(context.Background(), pj); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, f.jobs.Client.Create(context.Background(), pj))
 	r := &reconciler{pjclientset: f.jobs, agentic: f.a}
-	if err := r.reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: pj.Namespace, Name: pj.Name}}); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, r.reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: pj.Namespace, Name: pj.Name}}))
 	current, state := f.gate(t)
 	if len(f.gh.checkWrites) != writes || current.Output.Text != gate.Output.Text || len(state.Plan.Jobs) != 1 || state.Plan.Jobs[0].Name != "job-a" {
 		t.Fatal("batch retest changed the PR-scoped selection or gate")
@@ -170,10 +161,8 @@ func TestAgenticBatchRetestsDoNotChangePRSelection(t *testing.T) {
 func TestAgenticCommandAuthorization(t *testing.T) {
 	for _, author := range []string{"member", "collaborator", "outsider"} {
 		t.Run(author, func(t *testing.T) {
-			f := newAgenticFixture(t, "manual")
+			f := newReadyAgenticFixture(t, "manual", "job-a")
 			f.gh.member, f.gh.collaborator = author == "member", author == "collaborator"
-			f.plan(t, "job-a")
-			f.passFirstStage(t)
 			f.reconcile(t, nil)
 			f.reconcile(t, f.command(500, "required"))
 			_, state := f.gate(t)

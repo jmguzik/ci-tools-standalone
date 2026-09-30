@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/flagutil"
@@ -41,9 +42,7 @@ func TestAgenticConfigValidation(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			if item.Name != "repo" || item.Mode.Trigger != tc.trigger || item.Mode.Agentic.enabled() != tc.enabled {
 				t.Fatalf("unexpected repository configuration: %+v", item)
 			}
@@ -55,15 +54,11 @@ func TestAgenticConfigReloadKeepsLastGoodConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	write := func(body string) {
 		t.Helper()
-		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
 	}
 	write("orgs:\n- org: org\n  repos:\n  - name: repo\n    branches: [main]\n    mode:\n      trigger: manual\n      agentic:\n        mode: chai\n")
 	w := newWatcher(path, nil)
-	if err := w.reloadConfig(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, w.reloadConfig())
 	before := w.getConfig()
 	write("orgs:\n- org: org\n  repos:\n  - name: repo\n    mode:\n      agentic:\n        mode: chai\n        trusted_authors: [untrusted]\n")
 	if err := w.reloadConfig(); err == nil {
@@ -80,9 +75,7 @@ func TestAgenticConfigReloadKeepsLastGoodConfiguration(t *testing.T) {
 func TestAgenticMetadataEnvelope(t *testing.T) {
 	revision := agenticRevision{HeadSHA: strings.Repeat("a", 40), BaseBranch: "main", ObservedAt: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC), RevisionID: "revision"}
 	body, err := agenticMetadata(agenticRevisionMarker, revision)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	var decoded agenticRevision
 	if err := parseAgenticMetadata("Controller tracking comment\n\n"+body+"\n", agenticRevisionMarker, &decoded); err != nil || !reflect.DeepEqual(decoded, revision) {
 		t.Fatalf("controller journal did not round-trip: %+v / %v", decoded, err)
@@ -142,9 +135,7 @@ func agenticValidationJobs(t *testing.T) []config.Presubmit {
 		{JobBase: config.JobBase{Name: "empty-annotation", Annotations: map[string]string{"pipeline_run_if_changed": ""}}, Reporter: config.Reporter{Context: "ci/empty"}},
 		{JobBase: config.JobBase{Name: "release"}, Brancher: config.Brancher{Branches: []string{"^release$"}}, Reporter: config.Reporter{Context: "ci/release"}},
 	}
-	if err := config.SetPresubmitRegexes(jobs); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, config.SetPresubmitRegexes(jobs))
 	return jobs
 }
 
@@ -186,9 +177,7 @@ func TestAgenticResolveJobsValidation(t *testing.T) {
 				}
 				return
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			if got == nil || len(got) != len(tc.names) {
 				t.Fatalf("lost explicit job list: %+v", got)
 			}
@@ -206,8 +195,7 @@ func TestAgenticResolveJobsValidation(t *testing.T) {
 
 func TestAgenticReadPlanTrustAndIdentity(t *testing.T) {
 	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	makeComment := func(t *testing.T, id int, author string, plan agenticPlan) github.IssueComment {
-		t.Helper()
+	makeComment := func(id int, author string, plan agenticPlan) github.IssueComment {
 		return github.IssueComment{ID: id, User: github.User{Login: author}, Body: formatAgenticPlan(plan)}
 	}
 	for _, tc := range []struct {
@@ -230,11 +218,11 @@ func TestAgenticReadPlanTrustAndIdentity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := agenticPlan{HeadSHA: head, BaseBranch: "main", Jobs: []string{"protected"}, Rationale: "Relevant changes."}
-			comments := []github.IssueComment{makeComment(t, 10, "chai", plan)}
+			comments := []github.IssueComment{makeComment(10, "chai", plan)}
 			if tc.mutate != nil {
 				tc.mutate(&plan)
 			}
-			comments = append(comments, makeComment(t, 20, tc.author, plan))
+			comments = append(comments, makeComment(20, tc.author, plan))
 			state := &agenticState{HeadSHA: head, BaseBranch: "main"}
 			a := &agenticController{options: agenticOptions{trustedAuthors: flagutil.NewStrings("chai")}}
 			err := a.readPlan(state, agenticValidationJobs(t), comments)
@@ -269,9 +257,7 @@ func TestAgenticFallbackSelectionRules(t *testing.T) {
 			}
 			pr := &github.PullRequest{Number: 42, Base: github.PullRequestBranch{Ref: tc.branch}}
 			jobs, err := normalAgenticSelection(agenticValidationJobs(t), pr, &fakeGhClient{changes: changes}, "org", "repo")
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			names := make([]string, 0, len(jobs))
 			for _, job := range jobs {
 				names = append(names, job.Name)
@@ -288,9 +274,7 @@ func TestAgenticFallbackRunAnnotationPrecedence(t *testing.T) {
 	static[1].Annotations["pipeline_skip_if_only_changed"] = "^docs/"
 	pr := &github.PullRequest{Number: 42, Base: github.PullRequestBranch{Ref: "main"}}
 	jobs, err := normalAgenticSelection(static, pr, &fakeGhClient{changes: []github.PullRequestChange{{Filename: "other/file"}}}, "org", "repo")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	for _, job := range jobs {
 		if job.Name == "annotated" {
 			t.Fatal("skip annotation overrode the run annotation")

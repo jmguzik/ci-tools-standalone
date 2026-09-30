@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,18 +70,30 @@ func (f *fakeAgenticGitHub) GetPullRequests(_, _ string) ([]github.PullRequest, 
 	return append([]github.PullRequest{f.pr}, f.otherPRs...), f.getPullRequestsError
 }
 func (f *fakeAgenticGitHub) CreateComment(_, _ string, _ int, body string) error {
-	id := 100
-	for _, comment := range f.comments {
-		if comment.ID >= id {
-			id = comment.ID + 1
-		}
-	}
-	f.comments = append(f.comments, github.IssueComment{ID: id, Body: body, User: github.User{Login: "controller[bot]"}})
+	f.comments = append(f.comments, github.IssueComment{ID: f.nextCommentID(), Body: body, User: github.User{Login: "controller[bot]"}})
 	if f.failCommentAfterWrite {
 		f.failCommentAfterWrite = false
 		return fmt.Errorf("response lost after creating comment: %w", io.ErrUnexpectedEOF)
 	}
 	return nil
+}
+
+func (f *fakeAgenticGitHub) nextCommentID() int {
+	id := 100
+	for _, comment := range f.comments {
+		id = max(id, comment.ID+1)
+	}
+	return id
+}
+
+func (f *fakeAgenticGitHub) removeRevisionMarker() {
+	var kept []github.IssueComment
+	for _, comment := range f.comments {
+		if !strings.Contains(comment.Body, agenticRevisionMarker) {
+			kept = append(kept, comment)
+		}
+	}
+	f.comments = kept
 }
 func (f *fakeAgenticGitHub) EditComment(_, _ string, id int, body string) error {
 	if f.failEditComment {
@@ -225,20 +238,14 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 		{JobBase: config.JobBase{Name: "optional-job", Agent: "kubernetes", Annotations: map[string]string{"pipeline_run_if_changed": "^docs/"}}, Optional: true, Reporter: config.Reporter{Context: "ci/optional"}},
 	}
 	f.cfg = &config.Config{ProwConfig: config.ProwConfig{ProwJobNamespace: "ci"}}
-	if err := f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
 	f.gh = &fakeAgenticGitHub{member: true, statuses: map[string][]github.Status{}, changes: []github.PullRequestChange{{Filename: "src/main.go"}},
 		pr: github.PullRequest{Number: 42, State: github.PullRequestStateOpen, CreatedAt: f.now.Add(-time.Hour),
 			Head: github.PullRequestBranch{SHA: strings.Repeat("a", 40)}, Base: github.PullRequestBranch{Ref: "main", SHA: strings.Repeat("b", 40), Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}, HTMLURL: "https://github.com/org/repo"}}}}
 	var enrollment enabledConfig
-	if err := yaml.Unmarshal([]byte(fmt.Sprintf("orgs:\n- org: org\n  repos:\n  - name: repo\n    branches: [main, release]\n    mode:\n      trigger: %s\n      agentic:\n        mode: chai\n", mode)), &enrollment); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, yaml.Unmarshal([]byte(fmt.Sprintf("orgs:\n- org: org\n  repos:\n  - name: repo\n    branches: [main, release]\n    mode:\n      trigger: %s\n      agentic:\n        mode: chai\n", mode)), &enrollment))
 	scheme := runtime.NewScheme()
-	if err := v1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, v1.AddToScheme(scheme))
 	f.jobs = &agenticTestJobs{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
 	f.a = &agenticController{gh: f.gh, jobs: f.jobs, reader: f.jobs, config: func() *config.Config { return f.cfg },
 		watcher: &watcher{config: enrollment}, lgtmWatcher: &watcher{}, appID: 101, now: func() time.Time { return f.now }, logger: logrus.NewEntry(logrus.New()),
@@ -246,11 +253,22 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	return f
 }
 
+// Prepare a current plan and first-stage success without yet reconciling.
+func newReadyAgenticFixture(t *testing.T, mode string, jobs ...string) *agenticFixture {
+	t.Helper()
+	f := newAgenticFixture(t, mode)
+	f.plan(t, jobs...)
+	f.passFirstStage(t)
+	return f
+}
+
+func (f *agenticFixture) tryReconcile(command *github.IssueComment) error {
+	return f.a.reconcile(context.Background(), "org", "repo", f.gh.pr.Number, command)
+}
+
 func (f *agenticFixture) reconcile(t *testing.T, command *github.IssueComment) {
 	t.Helper()
-	if err := f.a.reconcile(context.Background(), "org", "repo", 42, command); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, f.tryReconcile(command))
 }
 
 func (f *agenticFixture) command(id int, command string) *github.IssueComment {
@@ -265,13 +283,7 @@ func (f *agenticFixture) plan(t *testing.T, names ...string) github.IssueComment
 		names = []string{}
 	}
 	body := formatAgenticPlan(agenticPlan{HeadSHA: f.gh.pr.Head.SHA, BaseBranch: f.gh.pr.Base.Ref, Jobs: names, Rationale: "Relevant tests."})
-	id := 100
-	for _, comment := range f.gh.comments {
-		if comment.ID >= id {
-			id = comment.ID + 1
-		}
-	}
-	comment := github.IssueComment{ID: id, Body: body, User: github.User{Login: "chai[bot]", Type: github.UserTypeBot}, CreatedAt: f.now}
+	comment := github.IssueComment{ID: f.gh.nextCommentID(), Body: body, User: github.User{Login: "chai[bot]", Type: github.UserTypeBot}, CreatedAt: f.now}
 	f.gh.comments = append(f.gh.comments, comment)
 	return comment
 }
@@ -279,18 +291,14 @@ func (f *agenticFixture) plan(t *testing.T, names ...string) github.IssueComment
 func (f *agenticFixture) gate(t *testing.T) (github.CheckRun, *agenticState) {
 	t.Helper()
 	check, state, err := f.a.loadState("org", "repo", &f.gh.pr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	return *check, state
 }
 
 func (f *agenticFixture) allJobs(t *testing.T) []v1.ProwJob {
 	t.Helper()
 	var jobs v1.ProwJobList
-	if err := f.jobs.List(context.Background(), &jobs); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, f.jobs.List(context.Background(), &jobs))
 	var selected []v1.ProwJob
 	for _, pj := range jobs.Items {
 		if pj.Spec.Job != "first-stage" {
@@ -300,14 +308,21 @@ func (f *agenticFixture) allJobs(t *testing.T) []v1.ProwJob {
 	return selected
 }
 
+func (f *agenticFixture) deleteJobs(t *testing.T, jobs ...v1.ProwJob) {
+	t.Helper()
+	for _, pj := range jobs {
+		require.NoError(t, f.jobs.Delete(context.Background(), &pj))
+	}
+}
+
 func (f *agenticFixture) passFirstStage(t *testing.T) {
 	t.Helper()
 	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "first", nil)
 	pj.Name, pj.Namespace = "first-"+f.gh.pr.Head.SHA[:8]+"-"+f.gh.pr.Base.Ref, "ci"
 	pj.CreationTimestamp = metav1.NewTime(f.now.Add(-time.Minute))
 	pj.Status.State, pj.Status.URL = v1.SuccessState, "https://prow/first-stage/1"
-	if err := f.jobs.Client.Create(context.Background(), &pj); err != nil && !apierrors.IsAlreadyExists(err) {
-		t.Fatal(err)
+	if err := f.jobs.Client.Create(context.Background(), &pj); !apierrors.IsAlreadyExists(err) {
+		require.NoError(t, err)
 	}
 	f.gh.statuses[f.gh.pr.Head.SHA] = []github.Status{{Context: "ci/first", State: github.StatusSuccess, TargetURL: "https://prow/first-stage/1"}}
 }
@@ -318,9 +333,7 @@ func (f *agenticFixture) report(t *testing.T, state v1.ProwJobState) {
 		pj.Status.State = state
 		pj.Status.URL = "https://prow/view/" + pj.Name
 		pj.Status.PrevReportStates = map[string]v1.ProwJobState{"github-reporter": state}
-		if err := f.jobs.Update(context.Background(), &pj); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, f.jobs.Update(context.Background(), &pj))
 		status := github.StatusPending
 		if state == v1.FailureState {
 			status = github.StatusFailure
@@ -337,46 +350,30 @@ func (f *agenticFixture) report(t *testing.T, state v1.ProwJobState) {
 }
 
 func TestAgenticDispatchAndReporting(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.plan(t, "job-a")
-	f.passFirstStage(t)
+	f := newReadyAgenticFixture(t, "auto", "job-a")
 	f.reconcile(t, nil)
 	check, state := f.gate(t)
 	if check.Status != "in_progress" || state.Dispatch == nil || !state.Frozen || len(f.allJobs(t)) != 1 {
 		t.Fatalf("expected a closed gate and one execution, got %+v / %+v", check, state)
 	}
-	if !strings.Contains(check.Output.Summary, "Test selection is locked for this commit. Later Chai plans are ignored; push a new commit to change the selection.") {
-		t.Fatal("dispatch check did not explain that later Chai plans are ignored")
-	}
+	require.Contains(t, check.Output.Summary, "Test selection is locked for this commit. Later Chai plans are ignored; push a new commit to change the selection.", "dispatch check must explain the selection lock")
 	pj := f.allJobs(t)[0]
 	if pj.Spec.Job != "job-a" || !pj.Spec.Report || pj.Labels["configured-label"] != "kept" || pj.Annotations["pipeline_run_if_changed"] != "^src/" {
 		t.Fatalf("lost selected job definition/metadata: %+v", pj)
 	}
-	if f.gh.statusWrites != 0 {
-		t.Fatal("controller created per-job placeholders")
-	}
+	require.Zero(t, f.gh.statusWrites, "controller created per-job placeholders")
 	f.report(t, v1.FailureState)
 	f.reconcile(t, nil)
 	check, state = f.gate(t)
 	if check.Conclusion != "success" || !state.Dispatch.Executions[0].Reported {
 		t.Fatal("gate did not open after the requested execution reported")
 	}
-	if !strings.Contains(check.Output.Summary, "Test selection is locked for this commit.") {
-		t.Fatal("completed dispatch check lost the selection-lock explanation")
-	}
-	if f.gh.statuses[f.gh.pr.Head.SHA][1].State != github.StatusFailure {
-		t.Fatal("real job failure was overwritten")
-	}
+	require.Contains(t, check.Output.Summary, "Test selection is locked for this commit.", "completed dispatch check lost the selection-lock explanation")
+	require.Equal(t, github.StatusFailure, f.gh.statuses[f.gh.pr.Head.SHA][1].State, "real job failure was overwritten")
 	// Durable evidence survives controller restart and ProwJob garbage collection.
-	for _, pj := range f.allJobs(t) {
-		if err := f.jobs.Delete(context.Background(), &pj); err != nil {
-			t.Fatal(err)
-		}
-	}
+	f.deleteJobs(t, f.allJobs(t)...)
 	f.reconcile(t, nil)
-	if f.jobs.creates != 1 {
-		t.Fatal("recreated an execution already durably acknowledged")
-	}
+	require.Equal(t, 1, f.jobs.creates, "recreated an execution already durably acknowledged")
 }
 
 func TestAgenticManualEarlyRequestAndRevisionBinding(t *testing.T) {
@@ -389,20 +386,14 @@ func TestAgenticManualEarlyRequestAndRevisionBinding(t *testing.T) {
 	if state.ManualRequestID != 500 || state.Dispatch != nil || state.WaitingSince != nil || len(f.allJobs(t)) != 0 {
 		t.Fatalf("early command was not durably deferred: %+v", state)
 	}
-	if strings.Contains(check.Output.Summary, "Test selection is locked for this commit.") {
-		t.Fatal("check described a pending selection as locked")
-	}
+	require.NotContains(t, check.Output.Summary, "Test selection is locked for this commit.", "check described a pending selection as locked")
 	f.now = f.now.Add(time.Minute)
 	f.passFirstStage(t)
 	f.reconcile(t, nil)
-	if len(f.allJobs(t)) != 1 {
-		t.Fatal("recorded manual request was lost on restart")
-	}
+	require.Len(t, f.allJobs(t), 1, "recorded manual request was lost on restart")
 	// A repeated delivery does not force a second run.
 	f.reconcile(t, request)
-	if len(f.allJobs(t)) != 1 {
-		t.Fatal("redelivered command duplicated a dispatch")
-	}
+	require.Len(t, f.allJobs(t), 1, "redelivered command duplicated a dispatch")
 	f.gh.pr.Head.SHA = strings.Repeat("c", 40)
 	f.now = f.now.Add(time.Minute)
 	f.passFirstStage(t)
@@ -414,9 +405,7 @@ func TestAgenticManualEarlyRequestAndRevisionBinding(t *testing.T) {
 	}
 	f.reconcile(t, request)
 	_, state = f.gate(t)
-	if state.ManualRequestID != 0 {
-		t.Fatal("delayed old command authorized a new HEAD")
-	}
+	require.Zero(t, state.ManualRequestID, "delayed old command authorized a new HEAD")
 }
 
 func TestAgenticTimeoutWaitsForPrerequisitesAndIgnoresLatePlans(t *testing.T) {
@@ -456,9 +445,7 @@ func TestAgenticEmptyPlanIsExplicitAndAuthorized(t *testing.T) {
 			f.plan(t)
 			f.reconcile(t, nil)
 			check, _ := f.gate(t)
-			if check.Conclusion == "success" {
-				t.Fatal("empty plan bypassed first-stage success")
-			}
+			require.NotEqual(t, "success", check.Conclusion, "empty plan bypassed first-stage success")
 			f.passFirstStage(t)
 			f.reconcile(t, nil)
 			check, _ = f.gate(t)
@@ -482,13 +469,9 @@ func TestAgenticEmptyPlanIsExplicitAndAuthorized(t *testing.T) {
 }
 
 func TestAgenticPartialDispatchRecovery(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.plan(t, "job-a", "job-b")
-	f.passFirstStage(t)
+	f := newReadyAgenticFixture(t, "auto", "job-a", "job-b")
 	f.jobs.failAt = 2
-	if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil {
-		t.Fatal("expected partial-dispatch failure")
-	}
+	require.Error(t, f.tryReconcile(nil), "expected partial-dispatch failure")
 	check, before := f.gate(t)
 	if check.Conclusion != "failure" || len(f.allJobs(t)) != 1 {
 		t.Fatal("failure was not recorded after partial dispatch")
@@ -502,9 +485,7 @@ func TestAgenticPartialDispatchRecovery(t *testing.T) {
 }
 
 func TestAgenticRerunClosesSameGateAndRejectsOldReports(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.plan(t, "job-a")
-	f.passFirstStage(t)
+	f := newReadyAgenticFixture(t, "auto", "job-a")
 	f.reconcile(t, nil)
 	f.report(t, v1.PendingState)
 	f.reconcile(t, nil)
@@ -524,9 +505,7 @@ func TestAgenticRerunClosesSameGateAndRejectsOldReports(t *testing.T) {
 	}
 	f.reconcile(t, nil)
 	check, _ = f.gate(t)
-	if check.Conclusion == "success" {
-		t.Fatal("older same-context report satisfied the new execution")
-	}
+	require.NotEqual(t, "success", check.Conclusion, "older same-context report satisfied the new execution")
 }
 
 func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
@@ -534,9 +513,7 @@ func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
 	f.plan(t, "job-a")
 	f.reconcile(t, nil)
 	f.gh.failCommentAfterWrite = true
-	if err := f.a.reconcile(context.Background(), "org", "repo", 42, f.command(500, "agent-review")); err == nil {
-		t.Fatal("expected lost comment response")
-	}
+	require.Error(t, f.tryReconcile(f.command(500, "agent-review")), "expected lost comment response")
 	f.reconcile(t, nil)
 	_, state := f.gate(t)
 	if state.Review == nil || !state.ReviewPosted || state.Plan != nil || len(f.gh.comments) != 4 {
@@ -559,31 +536,19 @@ func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
 }
 
 func TestAgenticNoDispatchWithoutDurableGate(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.plan(t, "job-a")
-	f.passFirstStage(t)
+	f := newReadyAgenticFixture(t, "auto", "job-a")
 	f.gh.failCheck = true
-	if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil {
-		t.Fatal("expected gate persistence failure")
-	}
-	if f.jobs.creates != 0 {
-		t.Fatal("dispatched jobs before recording their identities")
-	}
+	require.Error(t, f.tryReconcile(nil), "expected gate persistence failure")
+	require.Zero(t, f.jobs.creates, "dispatched jobs before recording their identities")
 }
 
 func TestAgenticFirstStageNewerRunWinsOverOldSuccess(t *testing.T) {
-	f := newAgenticFixture(t, "auto")
-	f.plan(t)
-	f.passFirstStage(t)
+	f := newReadyAgenticFixture(t, "auto")
 	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "first", nil)
 	pj.Name, pj.Namespace, pj.CreationTimestamp = "new-first-stage", "ci", metav1.NewTime(f.now)
 	pj.Status.State = v1.PendingState
-	if err := f.jobs.Client.Create(context.Background(), &pj); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
 	f.reconcile(t, nil)
 	check, _ := f.gate(t)
-	if check.Conclusion == "success" {
-		t.Fatal("old GitHub success bypassed a newer pending first-stage execution")
-	}
+	require.NotEqual(t, "success", check.Conclusion, "old GitHub success bypassed a newer pending first-stage execution")
 }

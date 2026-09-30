@@ -23,7 +23,7 @@ func validAgenticCommand(command string) bool {
 	}
 }
 
-func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticState, cfg RepoConfig, pr *github.PullRequest, comment github.IssueComment) error {
+func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticState, comment github.IssueComment) error {
 	matches := agenticCommandRE.FindAllStringSubmatch(comment.Body, -1)
 	if len(matches) != 1 || comment.ID <= state.LastCommandID || comment.ID <= 0 {
 		return nil

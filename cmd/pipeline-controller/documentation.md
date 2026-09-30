@@ -6,10 +6,8 @@ The Pipeline Controller is a tool that manages the execution of second-stage tes
 
 The Pipeline Controller operates in three distinct modes, each offering different levels of automation for triggering second-stage tests. Second-stage tests are tests that run after the initial required tests pass, typically integration tests, optional tests, or tests that depend on specific file changes.
 
-Each mode can optionally use [agentic job selection](agentic.md): Chai supplies
-the second-stage list in a PR comment; the controller dispatches it with a
-restart-safe gate and a bounded fallback to normal selection. The instructions
-below describe normal selection unless stated otherwise.
+All modes support [agentic selection](#agentic-selection-chai). Otherwise,
+the normal-selection behavior below applies.
 
 ## Three Operating Modes
 
@@ -205,6 +203,55 @@ If you manually trigger some second-stage tests (using `/test <job-name>`) in Au
 3. Re-evaluates from scratch whenever the PR HEAD changes
 
 This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
+
+## Agentic Selection (Chai)
+
+Enable Chai in the main or LGTM enrollment configuration:
+
+```yaml
+- name: example
+  branches: [main]
+  mode: {trigger: auto, agentic: {mode: chai}}
+```
+
+Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable)
+and `--agentic-timeout=20m` (default); no repository-level trust/timeout.
+
+On PR creation/new commits, Chai posts its selected second-stage jobs without waiting for CI/LGTM:
+
+```markdown
+Chai test plan for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`
+
+- `pull-ci-example-main-e2e`
+```
+
+Use the full 40-character SHA, `None.` for no jobs and an optional final `Reason: ...`.
+The controller validates trusted author, revision and eligible job names, not relevance.
+For re-review, Chai verifies controller identity/current refs and echoes the 32-character `Request:` ID:
+
+```markdown
+Chai test selection requested for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`.
+
+Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
+```
+
+Dispatch, including manual commands, waits for first-stage success and the existing
+trigger. The timeout starts then and falls back to normal selection. Late plans
+cannot replace fallback or a dispatched selection; push a new commit to change it.
+
+- `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs.
+- `/pipeline agent-review` requests a fresh plan and clears opt-out before dispatch; use it after a same-SHA base retarget.
+- `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
+
+`ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
+Recovery uses events, startup and transient retries; no periodic GitHub polling.
+
+Before enrolling:
+
+- Configure Chai's authenticated PR/comment delivery and matching identities; forward `status`, `pull_request` and `issue_comment` to the controller.
+- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch/create`. Run one controller; use distinct HEADs.
+- Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
+- Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.
 
 ## Enrolling Repository
 

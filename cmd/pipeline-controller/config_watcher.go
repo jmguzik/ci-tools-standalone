@@ -131,28 +131,11 @@ func (w *watcher) watch() {
 	ticker := time.NewTicker(3 * time.Minute)
 	defer ticker.Stop()
 
-	// Store previous config for comparison
-	prevConfig := w.getConfigCopy()
-
 	for range ticker.C {
 		if err := w.reloadConfig(); err != nil {
 			w.logger.WithError(err).Error("Failed to reload config")
-			continue
-		}
-
-		currentConfig := w.getConfigCopy()
-		if !reflect.DeepEqual(currentConfig, prevConfig) {
-			w.logger.Info("Config change detected, config reloaded successfully")
-			prevConfig = currentConfig
 		}
 	}
-}
-
-// getConfigCopy returns a deep copy of the current config for comparison
-func (w *watcher) getConfigCopy() enabledConfig {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-	return w.config
 }
 
 func (w *watcher) reloadConfig() error {
@@ -174,6 +157,9 @@ func (w *watcher) reloadConfig() error {
 	w.config = next
 	onChange := w.onChange
 	w.mutex.Unlock()
+	if changed && w.logger != nil {
+		w.logger.Info("Config change detected, config reloaded successfully")
+	}
 	if changed && onChange != nil {
 		onChange() // Outside the lock: listeners may read the new configuration.
 	}

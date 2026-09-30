@@ -22,10 +22,8 @@ func nextAgenticBackoff(previous time.Duration) time.Duration {
 	if previous <= 0 {
 		return agenticInitialBackoff
 	}
-	if previous >= agenticMaxBackoff/2 {
-		return agenticMaxBackoff // Saturate before multiplying, including huge inputs.
-	}
-	return previous * 2
+	// Clamp before multiplying, including huge inputs.
+	return min(previous, agenticMaxBackoff/2) * 2
 }
 
 type agenticRetryInfo struct {
