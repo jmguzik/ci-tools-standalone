@@ -41,7 +41,7 @@ func (r *reconciler) shouldReconcileProwJobUpdate(update event.UpdateEvent) bool
 		old.Status.PrevReportStates["github-reporter"] != current.Status.PrevReportStates["github-reporter"] {
 		return true
 	}
-	for _, label := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.ProwJobTypeLabel, "pipeline.openshift.io/dispatch"} {
+	for _, label := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.ProwJobTypeLabel} {
 		if old.Labels[label] != current.Labels[label] {
 			return true
 		}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,14 +14,11 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/github"
 	"sigs.k8s.io/prow/pkg/kube"
-	"sigs.k8s.io/prow/pkg/pjutil"
 )
 
 type agenticGitHubClient interface {
@@ -51,17 +49,19 @@ type agenticCommand struct {
 }
 
 type agenticExecution struct {
-	Job      string `json:"job"`
-	Context  string `json:"context"`
-	Name     string `json:"prowjob"`
-	Adopted  bool   `json:"adopted,omitempty"`
-	Reported bool   `json:"reported,omitempty"`
-	URL      string `json:"url,omitempty"`
+	Job          string   `json:"job"`
+	Context      string   `json:"context"`
+	Name         string   `json:"prowjob,omitempty"`
+	Previous     []string `json:"previous,omitempty"`
+	Acknowledged bool     `json:"acknowledged,omitempty"`
+	Reported     bool     `json:"reported,omitempty"`
+	URL          string   `json:"url,omitempty"`
 }
 
 type agenticDispatch struct {
 	ID         string             `json:"id"`
-	BaseSHA    string             `json:"base_sha"`
+	Comment    string             `json:"comment,omitempty"`
+	Posted     bool               `json:"posted,omitempty"`
 	Executions []agenticExecution `json:"executions"`
 }
 
@@ -71,9 +71,8 @@ type agenticFirstStageWitness struct {
 }
 
 // The per-PR filesystem record is authoritative. No dispatch is allowed
-// before its exact execution names have been saved there. A single active
-// controller replica serializes transitions; deterministic names additionally
-// make retries safe after a lost Kubernetes or GitHub response.
+// before its selection and comment request have been saved there. Hook owns
+// ProwJob creation; the controller observes the resulting executions.
 type agenticState struct {
 	Version          int                                 `json:"version"`
 	Org              string                              `json:"org"`
@@ -105,8 +104,7 @@ type agenticState struct {
 
 type agenticController struct {
 	gh          agenticGitHubClient
-	jobs        ctrlruntimeclient.Client
-	reader      ctrlruntimeclient.Reader // uncached: dispatch recovery must see newly created jobs
+	reader      ctrlruntimeclient.Reader // uncached: observe Hook-created jobs
 	config      config.Getter
 	watcher     *watcher
 	lgtmWatcher *watcher
@@ -281,12 +279,12 @@ func validateAgenticState(state *agenticState) error {
 	if state.Dispatch == nil {
 		return nil
 	}
-	if !state.Frozen || state.Dispatch.ID == "" || state.Dispatch.BaseSHA == "" || len(state.Dispatch.Executions) != len(jobs) {
+	if !state.Frozen || state.Dispatch.ID == "" || state.Dispatch.Executions == nil || len(state.Dispatch.Executions) != len(jobs) {
 		return fmt.Errorf("invalid persisted dispatch")
 	}
 	seen := map[string]bool{}
 	for _, execution := range state.Dispatch.Executions {
-		if execution.Name == "" || jobs[execution.Job] != execution.Context || seen[execution.Job] || (execution.Reported && execution.URL == "") {
+		if jobs[execution.Job] != execution.Context || seen[execution.Job] || (execution.Reported && (!execution.Acknowledged || execution.URL == "" || execution.Name == "")) || (execution.Name != "" && len(execution.Previous) != 0) {
 			return fmt.Errorf("invalid persisted execution")
 		}
 		seen[execution.Job] = true
@@ -576,18 +574,27 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 			return a.saveState(gate, state, "", "Waiting for Chai's selected jobs (bounded by the configured timeout).")
 		}
 	}
-	if state.Dispatch == nil {
+	prepare := state.Dispatch == nil || state.Dispatch.ID != agenticDispatchID(state)
+	if prepare || !state.Dispatch.Posted {
+		names := make([]string, 0, len(state.Plan.Jobs))
+		for _, job := range state.Plan.Jobs {
+			names = append(names, job.Name)
+		}
+		resolved, err := resolveAgenticJobs(names, static, state.BaseBranch)
+		if err != nil || !reflect.DeepEqual(resolved, state.Plan.Jobs) {
+			return a.failState(gate, state, errors.Join(errors.New("selected job definitions changed; refusing to dispatch"), err))
+		}
+	}
+	if prepare {
 		if err := checkCollision(); err != nil {
 			return a.failState(gate, state, err)
 		}
-		if err := a.prepareDispatch(state, static, pr, latest); err != nil {
-			return a.failState(gate, state, err)
-		}
+		a.prepareDispatch(state, static, pr, latest, pjs.Items)
 		if err := a.saveState(gate, state, "", "Dispatching selected jobs; waiting for their own GitHub reports."); err != nil {
 			return err
 		}
 	}
-	return a.dispatch(ctx, gate, state, static, pr, statuses, checkCollision)
+	return a.dispatch(gate, state, pr, pjs.Items, statuses, comments, checkCollision)
 }
 
 func hasAgenticLabel(pr *github.PullRequest, name string) bool {
@@ -638,39 +645,73 @@ func (a *agenticController) readPlan(state *agenticState, static []config.Presub
 	return nil
 }
 
-func (a *agenticController) prepareDispatch(state *agenticState, static []config.Presubmit, pr *github.PullRequest, latest map[string]*v1.ProwJob) error {
-	if pr.Base.SHA == "" {
-		return fmt.Errorf("pull request is missing its base commit")
-	}
-	names := make([]string, 0, len(state.Plan.Jobs))
+func agenticDispatchID(state *agenticState) string {
+	return agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, state.RevisionID, strconv.Itoa(state.ManualRequestID))
+}
+
+func (a *agenticController) prepareDispatch(state *agenticState, static []config.Presubmit, pr *github.PullRequest, latest map[string]*v1.ProwJob, existing []v1.ProwJob) {
+	force := state.ForceRequestID > 0
+	dispatch := &agenticDispatch{ID: agenticDispatchID(state), Executions: []agenticExecution{}}
+	var commands []config.Presubmit
 	for _, job := range state.Plan.Jobs {
-		names = append(names, job.Name)
-	}
-	resolved, err := resolveAgenticJobs(names, static, state.BaseBranch)
-	if err != nil || !reflect.DeepEqual(resolved, state.Plan.Jobs) {
-		return errors.Join(errors.New("selected job definitions changed; refusing to dispatch"), err)
-	}
-	requestID, force := "initial", false
-	if state.ForceRequestID > 0 {
-		requestID, force = strconv.Itoa(state.ForceRequestID), true
-	}
-	dispatch := &agenticDispatch{ID: agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, state.RevisionID, requestID), BaseSHA: pr.Base.SHA, Executions: []agenticExecution{}}
-	for _, job := range state.Plan.Jobs {
-		execution := agenticExecution{Job: job.Name, Context: job.Context, Name: "pipeline-" + agenticID(dispatch.ID, job.Name)}
+		execution := agenticExecution{Job: job.Name, Context: job.Context}
 		if pj := latest[job.Name]; !force && pj != nil && pj.Spec.Report && pj.Spec.Context == job.Context {
-			execution.Name, execution.Adopted = pj.Name, true
+			execution.Name = pj.Name
 			execution.URL = pj.Status.URL
+		} else if !force && state.Dispatch != nil && slices.ContainsFunc(state.Dispatch.Executions, func(old agenticExecution) bool {
+			if old.Job == job.Name && old.Context == job.Context && (old.Reported || old.Acknowledged) {
+				execution = old // Keep durable evidence when the ProwJob was collected.
+				return true
+			}
+			return false
+		}) {
+			// Already reported; /remaining must not rerun collected jobs.
+		} else {
+			// Names, not timestamps: Kubernetes creation times have second
+			// precision, so a forced rerun must exclude every existing run.
+			for _, pj := range existing {
+				if pj.Spec.Job == job.Name && matchesAgenticPull(&pj, state.Org, state.Repo, pr) {
+					execution.Previous = append(execution.Previous, pj.Name)
+				}
+			}
+			for _, definition := range static {
+				if definition.Name == job.Name && definition.CouldRun(state.BaseBranch) {
+					commands = append(commands, definition)
+					break
+				}
+			}
 		}
 		dispatch.Executions = append(dispatch.Executions, execution)
+	}
+	if len(commands) != 0 {
+		dispatch.Comment = fmt.Sprintf("Scheduling selected tests for `%s` → `%s`:%s\n\n<!-- pipeline-controller:dispatch:%s -->", state.HeadSHA, state.BaseBranch, testCommands(commands), dispatch.ID)
 	}
 	state.Dispatch = dispatch
 	state.Frozen = true
 	state.PendingDispatch = true
 	state.WaitingSince = nil
-	return nil
 }
 
-func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun, state *agenticState, static []config.Presubmit, pr *github.PullRequest, statuses *github.CombinedStatus, ensureFreshCollision func() error) error {
+func (a *agenticController) dispatch(gate *github.CheckRun, state *agenticState, pr *github.PullRequest, pjs []v1.ProwJob, statuses *github.CombinedStatus, comments []github.IssueComment, ensureFreshCollision func() error) error {
+	if !state.Dispatch.Posted {
+		if state.Dispatch.Comment != "" {
+			if err := ensureFreshCollision(); err != nil {
+				return a.failState(gate, state, err)
+			}
+			current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
+			if err != nil {
+				return a.failState(gate, state, err)
+			}
+			cfg, enabled := a.repoConfig(state.Org, state.Repo, current.Base.Ref)
+			if current.Head.SHA != state.HeadSHA || current.Base.Ref != state.BaseBranch || current.State != github.PullRequestStateOpen || current.Draft || !enabled || !agenticAuthorized(cfg, state, current) || (current.Mergable != nil && !*current.Mergable) {
+				return nil
+			}
+			if err := a.ensureComment(state, comments, state.Dispatch.Comment); err != nil {
+				return a.failState(gate, state, err)
+			}
+		}
+		state.Dispatch.Posted = true
+	}
 	// Only superseded reports need history. Share one lookup across executions;
 	// first-stage readiness continues to use current statuses exclusively.
 	var history *github.CombinedStatus
@@ -702,10 +743,22 @@ func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun,
 		if execution.Reported {
 			continue // Retain durable evidence after ProwJob garbage collection.
 		}
-		var pj v1.ProwJob
-		key := types.NamespacedName{Namespace: a.config().ProwJobNamespace, Name: execution.Name}
-		err := a.reader.Get(ctx, key, &pj)
-		if apierrors.IsNotFound(err) && execution.URL != "" {
+		var pj *v1.ProwJob
+		for j := range pjs {
+			candidate := &pjs[j]
+			if !matchesAgenticPull(candidate, state.Org, state.Repo, pr) || candidate.Spec.Job != execution.Job || candidate.Spec.Context != execution.Context || !candidate.Spec.Report {
+				continue
+			}
+			if execution.Name != "" {
+				if candidate.Name == execution.Name {
+					pj = candidate
+					break
+				}
+			} else if !slices.Contains(execution.Previous, candidate.Name) && (pj == nil || candidate.CreationTimestamp.After(pj.CreationTimestamp.Time) || (candidate.CreationTimestamp.Equal(&pj.CreationTimestamp) && candidate.Name > pj.Name)) {
+				pj = candidate
+			}
+		}
+		if pj == nil && execution.Acknowledged && execution.URL != "" {
 			reported, reportErr := reportMatches(execution.Context, execution.URL)
 			if reportErr != nil {
 				return a.failState(gate, state, reportErr)
@@ -715,56 +768,18 @@ func (a *agenticController) dispatch(ctx context.Context, gate *github.CheckRun,
 				continue
 			}
 		}
-		if apierrors.IsNotFound(err) && !execution.Adopted {
-			if err := ensureFreshCollision(); err != nil {
-				return a.failState(gate, state, err)
-			}
-			// Refresh immediately before creating jobs. A stale ProwJob event or
-			// plan must never dispatch work on an old revision.
-			current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
-			if err != nil {
-				return a.failState(gate, state, err)
-			}
-			if current.Head.SHA != state.HeadSHA || current.Base.Ref != state.BaseBranch || current.State != github.PullRequestStateOpen || current.Draft {
-				return nil
-			}
-			currentConfig, enabled := a.repoConfig(state.Org, state.Repo, current.Base.Ref)
-			if !enabled || !agenticAuthorized(currentConfig, state, current) || (current.Mergable != nil && !*current.Mergable) {
-				return nil
-			}
-			var definition *config.Presubmit
-			for j := range static {
-				candidate := &static[j]
-				if candidate.Name == execution.Job && candidate.Context == execution.Context && candidate.CouldRun(state.BaseBranch) && agenticAllowedJob(*candidate) && !candidate.SkipReport {
-					definition = candidate
-					break
-				}
-			}
-			if definition == nil {
-				return a.failState(gate, state, fmt.Errorf("selected job %q is no longer available", execution.Job))
-			}
-			pj = pjutil.NewPresubmit(*pr, state.Dispatch.BaseSHA, *definition, state.Dispatch.ID, map[string]string{"pipeline.openshift.io/dispatch": state.Dispatch.ID}, pjutil.RequireScheduling(a.config().Scheduler.Enabled))
-			pj.Name, pj.Namespace = execution.Name, key.Namespace
-			if err := a.jobs.Create(ctx, &pj); err != nil {
-				if !apierrors.IsAlreadyExists(err) {
-					return a.failState(gate, state, fmt.Errorf("creating %s: %w", execution.Job, err))
-				}
-				if err := a.reader.Get(ctx, key, &pj); err != nil {
-					return a.failState(gate, state, err)
-				}
-			}
-		} else if err != nil {
-			return a.failState(gate, state, fmt.Errorf("recovering %s: %w", execution.Job, err))
+		if pj == nil {
+			allReported = false
+			continue
 		}
-		if !matchesAgenticPull(&pj, state.Org, state.Repo, pr) || pj.Spec.Job != execution.Job || pj.Spec.Context != execution.Context || !pj.Spec.Report ||
-			(!execution.Adopted && (pj.Spec.Refs.BaseSHA != state.Dispatch.BaseSHA || pj.Labels["pipeline.openshift.io/dispatch"] != state.Dispatch.ID)) {
-			return a.failState(gate, state, fmt.Errorf("ProwJob %s does not match the recorded execution", pj.Name))
-		}
+		execution.Name, execution.Previous = pj.Name, nil
 		if pj.Status.URL != "" {
 			execution.URL = pj.Status.URL
 		}
-		reported := agenticExecutionReported(&pj, statuses)
-		if !reported && pj.Status.PrevReportStates["github-reporter"] != "" {
+		execution.Acknowledged = pj.Status.PrevReportStates["github-reporter"] != ""
+		reported := agenticExecutionReported(pj, statuses)
+		if !reported && execution.Acknowledged {
+			var err error
 			reported, err = reportMatches(execution.Context, pj.Status.URL)
 			if err != nil {
 				return a.failState(gate, state, err)

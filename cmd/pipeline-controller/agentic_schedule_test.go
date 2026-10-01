@@ -393,32 +393,29 @@ func TestAgenticOverlappingFailuresPreserveCooldown(t *testing.T) {
 	})
 }
 
-func TestAgenticRetryFinishesPartialDispatch(t *testing.T) {
+func TestAgenticRetryRecoversLostDispatchCommentResponse(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
 		f.plan(t, "job-a", "job-b")
 		f.passFirstStage(t)
-		f.jobs.failAt = 2
+		f.gh.failCommentAfterWrite = true
 		stop := startAgenticRunner(f)
-		defer stop()
-		require.Error(t, f.tryReconcile(nil), "expected partial-dispatch failure")
+		require.Error(t, f.tryReconcile(nil), "expected lost comment response")
 		gate, before := f.gate(t)
 		require.Equal(t, "failure", gate.Conclusion)
-		require.Len(t, f.allJobs(t), 1)
-		first := f.allJobs(t)[0].Name
+		require.Len(t, f.allJobs(t), 2)
+		comments := len(f.gh.comments)
+		stop()
+		f.a.statusContexts = nil
+		stop = startAgenticRunner(f)
+		defer stop()
 		advanceAgenticTime(f, 5*time.Second)
-		if len(f.allJobs(t)) != 2 || f.jobs.creates != 3 || len(f.a.scheduler.pending) != 0 {
-			t.Fatal("targeted retry did not finish exactly the missing execution")
+		if len(f.allJobs(t)) != 2 || len(f.gh.comments) != comments || len(f.a.scheduler.pending) != 0 {
+			t.Fatal("targeted retry reposted an already-created comment")
 		}
 		_, after := f.gate(t)
-		require.Equal(t, before.Dispatch, after.Dispatch, "recovery changed persisted execution identities")
-		found := false
-		for _, job := range f.allJobs(t) {
-			found = found || job.Name == first
-		}
-		if !found {
-			t.Fatal("retry replaced an already-created execution")
-		}
+		require.Equal(t, before.Dispatch.ID, after.Dispatch.ID)
+		require.True(t, after.Dispatch.Posted)
 	})
 }
 

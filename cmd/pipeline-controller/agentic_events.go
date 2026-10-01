@@ -89,6 +89,7 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 			state.Dispatch = nil
 		case "remaining":
 			state.ManualRequestID = state.LastCommandID
+			state.ForceRequestID = 0
 		case "auto":
 			if cfg.Trigger != "lgtm" {
 				body := fmt.Sprintf("`/pipeline auto` is available only in LGTM mode.\n\n<!-- pipeline-controller:command:%d -->", state.LastCommandID)

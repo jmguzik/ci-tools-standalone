@@ -64,7 +64,7 @@ func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
 				// A new process has no scheduler or SHA/context interest cache.
 				previous := f.a
 				require.NoError(t, previous.closeStore())
-				f.a = &agenticController{gh: previous.gh, jobs: previous.jobs, reader: previous.reader,
+				f.a = &agenticController{gh: previous.gh, reader: previous.reader,
 					config: previous.config, watcher: previous.watcher, lgtmWatcher: previous.lgtmWatcher,
 					appID: previous.appID, logger: previous.logger, options: previous.options, now: previous.now}
 				reads, lists := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls

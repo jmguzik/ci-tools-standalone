@@ -70,7 +70,7 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 
-	var protectedCommands string
+	var protectedJobs []config.Presubmit
 	for _, presubmit := range presubmits.protected {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
@@ -82,8 +82,9 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 				continue
 			}
 		}
-		protectedCommands += "\n" + presubmit.RerunCommand
+		protectedJobs = append(protectedJobs, presubmit)
 	}
+	protectedCommands := testCommands(protectedJobs)
 	if protectedCommands != "" {
 		comment += "Scheduling required tests:" + protectedCommands
 	}
@@ -116,6 +117,15 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		return err
 	}
 	return nil
+}
+
+// testCommands keeps Hook commands outside code fences in both modes.
+func testCommands(jobs []config.Presubmit) string {
+	var commands strings.Builder
+	for _, job := range jobs {
+		commands.WriteString("\n" + job.RerunCommand)
+	}
+	return commands.String()
 }
 
 // secondStageTriggeredAtSHA reports whether any second-stage (protected or
@@ -188,7 +198,7 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 	}
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
-	var testCommands string
+	var selected []config.Presubmit
 	if len(pipelineConditionallyRequired) != 0 {
 		cfp := config.NewGitHubDeferredChangedFilesProvider(ghc, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
 
@@ -249,12 +259,12 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				continue
 			}
 			if mode == modeForce || !existing[presubmit.Name] {
-				testCommands += "\n" + presubmit.RerunCommand
+				selected = append(selected, presubmit)
 			}
 			// else: already present at HEAD (manual trigger or a prior delta) → skip it
 		}
 	}
-	return testCommands, nil
+	return testCommands(selected), nil
 }
 
 // existsAtSHA checks whether a ProwJob with the given job name already exists

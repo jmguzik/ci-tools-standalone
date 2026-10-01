@@ -285,10 +285,11 @@ func TestAgenticAdoptedExecutionReportSurvivesGarbageCollection(t *testing.T) {
 	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[1], "manual", nil)
 	pj.Name, pj.Namespace, pj.CreationTimestamp = "manually-started", "ci", metav1.NewTime(f.now)
 	pj.Status.URL = "https://prow/view/manual/123"
+	pj.Status.PrevReportStates = map[string]v1.ProwJobState{"github-reporter": v1.PendingState}
 	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
 	f.reconcile(t, f.command(500, "remaining"))
 	_, state := f.gate(t)
-	if !state.Dispatch.Executions[0].Adopted || state.Dispatch.Executions[0].URL != pj.Status.URL || f.jobs.creates != 0 {
+	if state.Dispatch.Executions[0].Name != pj.Name || state.Dispatch.Executions[0].URL != pj.Status.URL || f.jobs.creates != 0 {
 		t.Fatal("remaining did not persist the adopted execution identity")
 	}
 	f.deleteJobs(t, pj)
@@ -380,8 +381,8 @@ func TestAgenticSupersededReportRecovery(t *testing.T) {
 				require.NoError(t, err)
 			}
 			gate, state := f.gate(t)
-			if (gate.Conclusion == "success") != wantReported || state.Dispatch.ID != original.Dispatch.ID {
-				t.Fatalf("gate=%s/%s, want reported=%v; dispatch changed=%v", gate.Status, gate.Conclusion, wantReported, state.Dispatch.ID != original.Dispatch.ID)
+			if (gate.Conclusion == "success") != wantReported || !reflect.DeepEqual(state.Plan, original.Plan) {
+				t.Fatalf("gate=%s/%s, want reported=%v; selection changed", gate.Status, gate.Conclusion, wantReported)
 			}
 			for _, execution := range state.Dispatch.Executions {
 				if execution.Reported != wantReported {
