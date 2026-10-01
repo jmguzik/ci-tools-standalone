@@ -9,7 +9,7 @@ import (
 )
 
 func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
-	for _, action := range []string{"ownership", "dispatch", "missing-job", "first-success", "lookup-error"} {
+	for _, action := range []string{"ownership", "dispatch", "first-success", "lookup-error"} {
 		t.Run(action, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
 			if action == "dispatch" || action == "lookup-error" {
@@ -17,13 +17,9 @@ func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
 			}
 			f.plan(t, "job-a")
 			f.passFirstStage(t)
-			if action == "missing-job" || action == "first-success" {
+			if action == "first-success" {
 				f.reconcile(t, nil)
-				if action == "missing-job" {
-					f.deleteJobs(t, f.allJobs(t)...)
-				} else {
-					f.report(t, v1.PendingState)
-				}
+				f.report(t, v1.PendingState)
 			}
 			created := f.jobs.creates
 			f.gh.getPullRequestsCalls = 0

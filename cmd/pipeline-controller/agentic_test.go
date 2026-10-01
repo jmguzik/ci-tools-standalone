@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,8 @@ type fakeAgenticGitHub struct {
 	getPullRequestsError   error
 	getPullRequestsCalls   int
 	beforePullRequest      func(int)
+	hook                   *agenticFixture
+	beforeComment          func(string)
 	listCheckRunsCalls     int
 	listCommentsCalls      int
 	getCombinedStatusCalls int
@@ -72,7 +75,13 @@ func (f *fakeAgenticGitHub) GetPullRequests(_, _ string) ([]github.PullRequest, 
 	return append([]github.PullRequest{f.pr}, f.otherPRs...), f.getPullRequestsError
 }
 func (f *fakeAgenticGitHub) CreateComment(_, _ string, _ int, body string) error {
+	if f.beforeComment != nil {
+		f.beforeComment(body)
+	}
 	f.comments = append(f.comments, github.IssueComment{ID: f.nextCommentID(), Body: body, User: github.User{Login: "controller[bot]"}})
+	if f.hook != nil && f.hook.autoHook {
+		f.hook.processHook(body)
+	}
 	if f.failCommentAfterWrite {
 		f.failCommentAfterWrite = false
 		return fmt.Errorf("response lost after creating comment: %w", io.ErrUnexpectedEOF)
@@ -196,39 +205,35 @@ func (f *fakeAgenticGitHub) BotUserChecker() (func(string) bool, error) {
 
 type agenticTestJobs struct {
 	ctrlruntimeclient.Client
-	creates      int
-	failAt       int
-	beforeCreate func(*v1.ProwJob)
+	creates int
 }
 
 func (j *agenticTestJobs) Create(ctx context.Context, object ctrlruntimeclient.Object, options ...ctrlruntimeclient.CreateOption) error {
 	j.creates++
-	if j.failAt > 0 && j.creates == j.failAt {
-		return apierrors.NewServiceUnavailable("injected create failure")
-	}
-	if j.beforeCreate != nil {
-		j.beforeCreate(object.(*v1.ProwJob))
-	}
 	return j.Client.Create(ctx, object, options...)
 }
 
 type agenticFixture struct {
-	t    *testing.T
-	a    *agenticController
-	gh   *fakeAgenticGitHub
-	jobs *agenticTestJobs
-	cfg  *config.Config
-	now  time.Time
+	t        *testing.T
+	a        *agenticController
+	gh       *fakeAgenticGitHub
+	jobs     *agenticTestJobs
+	cfg      *config.Config
+	now      time.Time
+	autoHook bool
 }
 
 func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	t.Helper()
-	f := &agenticFixture{t: t, now: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)}
+	f := &agenticFixture{t: t, now: time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC), autoHook: true}
 	static := []config.Presubmit{
 		{JobBase: config.JobBase{Name: "first-stage", Agent: "kubernetes"}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/first"}},
 		{JobBase: config.JobBase{Name: "job-a", Agent: "kubernetes", Annotations: map[string]string{"pipeline_run_if_changed": "^src/"}, Labels: map[string]string{"configured-label": "kept"}}, Reporter: config.Reporter{Context: "ci/job-a"}, Brancher: config.Brancher{Branches: []string{"^main$"}}},
 		{JobBase: config.JobBase{Name: "job-b", Agent: "kubernetes"}, Reporter: config.Reporter{Context: "ci/job-b"}},
 		{JobBase: config.JobBase{Name: "optional-job", Agent: "kubernetes", Annotations: map[string]string{"pipeline_run_if_changed": "^docs/"}}, Optional: true, Reporter: config.Reporter{Context: "ci/optional"}},
+	}
+	for i := range static {
+		static[i].RerunCommand = config.DefaultRerunCommandFor(static[i].Name)
 	}
 	f.cfg = &config.Config{ProwConfig: config.ProwConfig{ProwJobNamespace: "ci"}}
 	require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
@@ -240,11 +245,26 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1.AddToScheme(scheme))
 	f.jobs = &agenticTestJobs{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
-	f.a = &agenticController{gh: f.gh, jobs: f.jobs, reader: f.jobs, config: func() *config.Config { return f.cfg },
+	f.a = &agenticController{gh: f.gh, reader: f.jobs, config: func() *config.Config { return f.cfg },
 		watcher: &watcher{config: enrollment}, lgtmWatcher: &watcher{}, appID: 101, now: func() time.Time { return f.now }, logger: logrus.NewEntry(logrus.New()),
 		options: agenticOptions{timeout: defaultAgenticTimeout, trustedAuthors: flagutil.NewStrings("chai[bot]"), stateDir: t.TempDir()}}
+	// Most tests use an immediate fake Hook; handoff tests disable it to
+	// exercise asynchronous delivery explicitly. Only Hook creates ProwJobs.
+	f.gh.hook = f
 	t.Cleanup(func() { require.NoError(t, f.a.closeStore()) })
 	return f
+}
+
+func (f *agenticFixture) processHook(body string) {
+	for _, definition := range f.cfg.GetPresubmitsStatic("org/repo") {
+		if definition.RerunCommand == "" || !slices.Contains(strings.Split(body, "\n"), definition.RerunCommand) {
+			continue
+		}
+		pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, definition, "hook", nil)
+		pj.Name, pj.Namespace = fmt.Sprintf("hook-%d-%s", f.gh.comments[len(f.gh.comments)-1].ID, definition.Name), "ci"
+		pj.CreationTimestamp = metav1.NewTime(f.now)
+		require.NoError(f.t, f.jobs.Create(context.Background(), &pj))
+	}
 }
 
 // Prepare a current plan and first-stage success without yet reconciling.
@@ -458,6 +478,9 @@ func TestAgenticEmptyPlanIsExplicitAndAuthorized(t *testing.T) {
 			if check.Conclusion != "success" || f.jobs.creates != 0 {
 				t.Fatal("explicit empty plan did not settle after prerequisites")
 			}
+			for _, comment := range f.gh.comments {
+				require.NotContains(t, comment.Body, "/test", "empty selections must not post a Hook command")
+			}
 		})
 	}
 }
@@ -469,11 +492,15 @@ func TestAgenticRerunClosesSameGateAndRejectsOldReports(t *testing.T) {
 	f.reconcile(t, nil)
 	check, old := f.gate(t)
 	gateID := check.ID
-	f.now = f.now.Add(time.Minute)
-	f.jobs.beforeCreate = func(pj *v1.ProwJob) {
+	// Hook can create old and new runs in the same clock second. Exclude
+	// existing names instead of relying on timestamp precision or name order.
+	f.gh.beforeComment = func(body string) {
+		if !strings.Contains(body, "pipeline-controller:dispatch:") {
+			return
+		}
 		check, _ := f.gate(t)
 		if check.ID != gateID || check.Status != "in_progress" || check.Conclusion == "success" {
-			t.Fatalf("rerun created with a stale green gate: %+v", check)
+			t.Fatalf("rerun requested with a stale green gate: %+v", check)
 		}
 	}
 	f.reconcile(t, f.command(500, "required"))
@@ -484,6 +511,60 @@ func TestAgenticRerunClosesSameGateAndRejectsOldReports(t *testing.T) {
 	f.reconcile(t, nil)
 	check, _ = f.gate(t)
 	require.NotEqual(t, "success", check.Conclusion, "older same-context report satisfied the new execution")
+	f.report(t, v1.PendingState)
+	f.reconcile(t, nil)
+	check, _ = f.gate(t)
+	require.Equal(t, "success", check.Conclusion)
+}
+
+func TestAgenticCommentHandoffWaitsForHookAndReports(t *testing.T) {
+	f := newReadyAgenticFixture(t, "auto", "job-a")
+	f.autoHook = false
+	f.reconcile(t, nil)
+	gate, state := f.gate(t)
+	require.True(t, state.Dispatch.Posted)
+	require.Empty(t, f.allJobs(t), "controller must not create ProwJobs")
+	require.NotEqual(t, "success", gate.Conclusion, "posting a comment is not a report")
+	body := f.gh.comments[len(f.gh.comments)-1].Body
+	require.Contains(t, body, "\n/test job-a\n")
+	require.NotContains(t, body, "```")
+	require.False(t, agenticCommandRE.MatchString(body))
+	require.False(t, isAgenticPlanComment(body))
+	comments := len(f.gh.comments)
+	f.reconcile(t, nil)
+	require.Len(t, f.gh.comments, comments, "waiting must not repost")
+	f.processHook(body)
+	f.reconcile(t, nil)
+	gate, _ = f.gate(t)
+	require.NotEqual(t, "success", gate.Conclusion, "job existence is not a report")
+	f.report(t, v1.FailureState)
+	f.reconcile(t, nil)
+	gate, _ = f.gate(t)
+	require.Equal(t, "success", gate.Conclusion, "failed tests still reported their contexts")
+}
+
+func TestAgenticRemainingRetriesOnlyMissingHookRuns(t *testing.T) {
+	f := newReadyAgenticFixture(t, "auto", "job-a", "job-b")
+	f.autoHook = false
+	f.reconcile(t, nil) // Hook misses the first comment.
+	f.reconcile(t, f.command(500, "required"))
+	f.processHook("/test job-a") // Hook handles only part of the forced request.
+	f.report(t, v1.FailureState)
+	f.reconcile(t, f.command(501, "remaining"))
+	_, state := f.gate(t)
+	require.Zero(t, state.ForceRequestID, "remaining must not inherit force")
+	body := f.gh.comments[len(f.gh.comments)-1].Body
+	require.Contains(t, body, "\n/test job-b\n")
+	require.NotContains(t, body, "/test job-a")
+	require.Equal(t, f.allJobs(t)[0].Name, state.Dispatch.Executions[0].Name)
+	f.processHook(body)
+	f.report(t, v1.FailureState)
+	f.reconcile(t, nil)
+	gate, _ := f.gate(t)
+	require.Equal(t, "success", gate.Conclusion)
+	comments := len(f.gh.comments)
+	f.reconcile(t, f.command(502, "remaining"))
+	require.Len(t, f.gh.comments, comments+1, "remaining reran existing failed tests")
 }
 
 func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
@@ -522,11 +603,39 @@ func TestAgenticNoDispatchWithoutDurableGate(t *testing.T) {
 
 func TestAgenticFirstStageNewerRunWinsOverOldSuccess(t *testing.T) {
 	f := newReadyAgenticFixture(t, "auto")
+	f.reconcile(t, nil) // Persist the earlier success before a rerun arrives.
 	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "first", nil)
 	pj.Name, pj.Namespace, pj.CreationTimestamp = "new-first-stage", "ci", metav1.NewTime(f.now)
 	pj.Status.State = v1.PendingState
 	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
 	f.reconcile(t, nil)
-	check, _ := f.gate(t)
-	require.NotEqual(t, "success", check.Conclusion, "old GitHub success bypassed a newer pending first-stage execution")
+	check, state := f.gate(t)
+	require.NotEqual(t, "success", check.Conclusion, "old success bypassed a newer pending first-stage execution")
+	require.Empty(t, state.FirstStage)
+}
+
+func TestAgenticFirstStageStartsTimeoutWithoutGitHubReports(t *testing.T) {
+	for _, scenario := range []string{"override URL differs", "no report"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			f.passFirstStage(t)
+			pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "override", nil)
+			pj.Name, pj.Namespace, pj.CreationTimestamp = "override-first-stage", "ci", metav1.NewTime(f.now)
+			pj.Status.State, pj.Status.URL = v1.SuccessState, "https://github.com/org/repo/pull/42#issuecomment-500"
+			require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
+			if scenario == "no report" {
+				f.gh.statuses = nil
+			}
+			f.reconcile(t, nil)
+			_, state := f.gate(t)
+			require.NotNil(t, state.WaitingSince)
+			require.Equal(t, f.now, *state.WaitingSince)
+			require.Zero(t, f.gh.getCombinedStatusCalls)
+			f.now = f.now.Add(defaultAgenticTimeout)
+			f.reconcile(t, nil)
+			_, state = f.gate(t)
+			require.Equal(t, "timeout", state.Plan.Source)
+			require.Equal(t, 2, f.jobs.creates)
+		})
+	}
 }

@@ -236,8 +236,9 @@ Chai test selection requested for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` →
 Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
 ```
 
-Dispatch, including manual commands, waits for first-stage success and the existing
-trigger. The timeout starts then and falls back to normal selection. Late plans
+Both paths use the latest matching ProwJobs for first-stage success, including `/override`.
+Dispatch waits for that success and the existing trigger. The timeout starts then
+and falls back to normal selection. Late plans
 cannot replace fallback or a dispatched selection; push a new commit to change it.
 
 - `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs.
@@ -245,6 +246,7 @@ cannot replace fallback or a dispatched selection; push a new commit to change i
 - `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
 
 `ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
+Both modes post `/test` comments; Hook creates the ProwJobs. Agentic mode saves the comment request before posting and deduplicates retries against controller-authored comments. Posting alone never opens the gate. `/pipeline required` excludes existing runs; fresh matching runs, including manual runs, can satisfy the request. Hook processes comments asynchronously: a push can race dispatch, and a missed Hook event needs another manual command. Restart does not repost a successfully handed-off request.
 Recovery state lives in one JSON file per PR on a PVC; GitHub shows only the gate. Normal branches in mixed-mode repos may also have inactive records. New revisions reset state; observed PR closure deletes the file. Malformed state is preserved and blocks startup; repair or restore it.
 Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
 Enabling TTL permanently requires a fresh post-tracking plan when local state is missing, even if TTL is later disabled. Tracked PRs still accept early plans for new commits.
@@ -254,7 +256,7 @@ Dispatch and gate completion still validate current refs and authorization; sele
 Before enrolling:
 
 - Configure Chai's authenticated PR/comment delivery and matching identities; forward `status`, `pull_request` and `issue_comment` to the controller.
-- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch/create` in the ProwJob namespace. Use distinct HEADs.
+- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch` in the ProwJob namespace. Use distinct HEADs.
 - Mount a durable, writable PVC supporting file locks, atomic rename and `fsync` at `--agentic-state-dir`; deploy one replica with `Recreate`. An exclusive file lock rejects a second writer. Back up the volume; do not prune open-PR state. Normal-only enrollment and dry run need no storage.
 - Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
 - Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.

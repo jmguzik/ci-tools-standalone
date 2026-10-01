@@ -46,7 +46,7 @@ func TestAgenticStaleChaiWakeupDoesNotDelayUnfinishedDispatch(t *testing.T) {
 					f.report(t, v1.PendingState)
 					f.reconcile(t, nil)
 				} else {
-					f.jobs.failAt = 1
+					f.gh.failCommentAfterWrite = true
 					require.Error(t, f.tryReconcile(nil))
 				}
 				_, state := f.gate(t)
@@ -105,7 +105,7 @@ func TestAgenticUncertainSuccessIsClearedBeforeForcedRerun(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, r.Reopen, "uncertain success must remain durable across a failed reopening")
 	f.gh.failCheck = false
-	f.jobs.beforeCreate = func(*v1.ProwJob) {
+	f.gh.beforeComment = func(string) {
 		require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
 	}
 	f.reconcile(t, nil)

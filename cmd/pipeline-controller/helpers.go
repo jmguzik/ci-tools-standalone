@@ -70,7 +70,7 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 
-	var protectedCommands string
+	var protectedJobs []config.Presubmit
 	for _, presubmit := range presubmits.protected {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
@@ -82,8 +82,9 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 				continue
 			}
 		}
-		protectedCommands += "\n" + presubmit.RerunCommand
+		protectedJobs = append(protectedJobs, presubmit)
 	}
+	protectedCommands := testCommands(protectedJobs)
 	if protectedCommands != "" {
 		comment += "Scheduling required tests:" + protectedCommands
 	}
@@ -116,6 +117,15 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		return err
 	}
 	return nil
+}
+
+// testCommands keeps Hook commands outside code fences in both modes.
+func testCommands(jobs []config.Presubmit) string {
+	var commands strings.Builder
+	for _, job := range jobs {
+		commands.WriteString("\n" + job.RerunCommand)
+	}
+	return commands.String()
 }
 
 // secondStageTriggeredAtSHA reports whether any second-stage (protected or
@@ -188,7 +198,7 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 	}
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
-	var testCommands string
+	var selected []config.Presubmit
 	if len(pipelineConditionallyRequired) != 0 {
 		cfp := config.NewGitHubDeferredChangedFilesProvider(ghc, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
 
@@ -249,12 +259,12 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				continue
 			}
 			if mode == modeForce || !existing[presubmit.Name] {
-				testCommands += "\n" + presubmit.RerunCommand
+				selected = append(selected, presubmit)
 			}
 			// else: already present at HEAD (manual trigger or a prior delta) → skip it
 		}
 	}
-	return testCommands, nil
+	return testCommands(selected), nil
 }
 
 // existsAtSHA checks whether a ProwJob with the given job name already exists
@@ -286,6 +296,27 @@ func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.
 	return false
 }
 
+type firstStageSuccessWitness struct {
+	Context string `json:"context"`
+}
+
+// Both paths trust the latest matching ProwJob, including successful overrides.
+// Agentic callers retain successes for this HEAD/base after ProwJob cleanup.
+func firstStageJobPassed(job config.Presubmit, pj *v1.ProwJob, required bool, witnesses map[string]firstStageSuccessWitness) bool {
+	if pj == nil {
+		witness, seen := witnesses[job.Name]
+		return !required || (seen && witness.Context == job.Context)
+	}
+	if pj.Status.State != v1.SuccessState {
+		delete(witnesses, job.Name)
+		return false
+	}
+	if witnesses != nil {
+		witnesses[job.Name] = firstStageSuccessWitness{Context: job.Context}
+	}
+	return true
+}
+
 // checkFirstStageComplete checks if all first-stage tests have completed
 // successfully for the given ProwJob's SHA. This is used by the /pipeline auto
 // handler to trigger second-stage tests immediately when first-stage is already
@@ -309,8 +340,9 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		return false, fmt.Errorf("cannot list prowjobs: %w", err)
 	}
 
-	latestBatch := make(map[string]v1.ProwJob)
-	for _, pjob := range pjs.Items {
+	latestBatch := make(map[string]*v1.ProwJob)
+	for i := range pjs.Items {
+		pjob := &pjs.Items[i]
 		if pjob.Spec.Refs == nil || len(pjob.Spec.Refs.Pulls) == 0 {
 			continue
 		}
@@ -340,7 +372,7 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if pjob, ok := latestBatch[presubmit.Name]; !ok || pjob.Status.State != v1.SuccessState {
+		if !firstStageJobPassed(presubmit, latestBatch[presubmit.Name], true, nil) {
 			return false, nil
 		}
 	}
@@ -350,7 +382,7 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if pjob, ok := latestBatch[presubmit.Name]; ok && pjob.Status.State != v1.SuccessState {
+		if !firstStageJobPassed(presubmit, latestBatch[presubmit.Name], false, nil) {
 			return false, nil
 		}
 	}

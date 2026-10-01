@@ -925,7 +925,7 @@ func main() {
 			logger.WithError(err).Fatal("invalid GitHub App ID")
 		}
 	}
-	agentic := &agenticController{gh: githubClient, jobs: mgr.GetClient(), reader: mgr.GetAPIReader(), config: cfg,
+	agentic := &agenticController{gh: githubClient, reader: mgr.GetAPIReader(), config: cfg,
 		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
 	if err := agentic.validateEnrollment(); err != nil {
 		logger.WithError(err).Fatal("invalid agentic configuration")

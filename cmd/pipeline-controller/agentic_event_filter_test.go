@@ -54,7 +54,7 @@ func TestAgenticProwJobUpdateFields(t *testing.T) {
 			}
 		})
 	}
-	for _, label := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.ProwJobTypeLabel, "pipeline.openshift.io/dispatch"} {
+	for _, label := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.ProwJobTypeLabel} {
 		t.Run(label, func(t *testing.T) {
 			current := old.DeepCopy()
 			current.ResourceVersion, current.Labels[label] = "11", "changed"
