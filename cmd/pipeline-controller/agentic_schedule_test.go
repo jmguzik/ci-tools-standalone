@@ -111,7 +111,6 @@ func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newScheduledAgenticFixture(t, "auto")
 				f.a.options.timeout = 5 * time.Minute
-				f.passFirstStage(t)
 				stop := startAgenticRunner(f)
 				f.reconcile(t, nil)
 				_, original := f.gate(t)
@@ -122,7 +121,7 @@ func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
 				stop()
 				advanceAgenticTime(f, downtime)
 				stop = startAgenticRunner(f)
-				defer stop()
+				defer func() { stop() }()
 				if remaining := f.a.options.timeout - (3*time.Minute + downtime); remaining > 0 {
 					_, recovered := f.gate(t)
 					require.Equal(t, original.WaitingSince, recovered.WaitingSince, "restart reset the persisted waiting timestamp")
@@ -133,6 +132,14 @@ func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
 				_, state := f.gate(t)
 				require.NotNil(t, state.Plan)
 				require.Equal(t, "timeout", state.Plan.Source)
+				require.Nil(t, state.WaitingSince)
+				require.Zero(t, f.jobs.creates, "fallback bypassed first-stage success")
+				stop()
+				reads = f.gh.getPullRequestCalls
+				stop = startAgenticRunner(f)
+				require.Equal(t, reads, f.gh.getPullRequestCalls, "restart reread a completed selection")
+				f.passFirstStage(t)
+				f.reconcile(t, nil)
 				require.Equal(t, 2, f.jobs.creates, "persisted deadline did not dispatch once")
 				assertAgenticIdle(t, f, 24*time.Hour)
 				f.report(t, v1.PendingState)
@@ -144,8 +151,8 @@ func TestAgenticDeadlineSurvivesRestartWithoutPolling(t *testing.T) {
 	}
 }
 
-func TestAgenticEventsCancelChaiDeadline(t *testing.T) {
-	for _, change := range []string{"plan", "push", "retarget", "draft", "closed"} {
+func TestAgenticEventsUpdateChaiDeadline(t *testing.T) {
+	for _, change := range []string{"plan", "push", "retarget", "draft", "conflict", "closed"} {
 		t.Run(change, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newScheduledAgenticFixture(t, "auto")
@@ -153,6 +160,9 @@ func TestAgenticEventsCancelChaiDeadline(t *testing.T) {
 				stop := startAgenticRunner(f)
 				defer stop()
 				f.reconcile(t, nil)
+				_, original := f.gate(t)
+				started := *original.WaitingSince
+				advanceAgenticTime(f, time.Minute)
 				switch change {
 				case "plan":
 					f.plan(t, "job-a")
@@ -162,17 +172,57 @@ func TestAgenticEventsCancelChaiDeadline(t *testing.T) {
 					f.gh.pr.Base.Ref = "release"
 				case "draft":
 					f.gh.pr.Draft = true
+				case "conflict":
+					mergeable := false
+					f.gh.pr.Mergable = &mergeable
 				case "closed":
 					f.gh.pr.State = github.PullRequestStateClosed
 				}
 				f.reconcile(t, nil)
-				if len(f.a.scheduler.pending) != 0 {
-					t.Fatal("obsolete deadline was not canceled")
+				if change == "plan" || change == "closed" {
+					assertAgenticIdle(t, f, time.Hour)
+					return
 				}
+				_, state := f.gate(t)
+				if change == "push" || change == "retarget" {
+					started = f.now.UTC()
+				}
+				require.Equal(t, started, *state.WaitingSince)
+				deadline := started.Add(defaultAgenticTimeout)
+				require.Equal(t, deadline, f.a.scheduler.pending[agenticWork{org: "org", repo: "repo", number: 42}].deadline)
+				advanceAgenticTime(f, time.Until(deadline)-time.Nanosecond)
+				_, state = f.gate(t)
+				require.Nil(t, state.Plan, "fallback used an obsolete revision deadline")
+				advanceAgenticTime(f, time.Nanosecond)
+				_, state = f.gate(t)
+				require.Equal(t, "timeout", state.Plan.Source)
+				require.Zero(t, f.jobs.creates, "selection bypassed current dispatch prerequisites")
 				assertAgenticIdle(t, f, time.Hour)
 			})
 		})
 	}
+}
+
+func TestAgenticReviewGetsFreshTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newScheduledAgenticFixture(t, "manual")
+		f.plan(t, "job-a")
+		stop := startAgenticRunner(f)
+		defer stop()
+		f.reconcile(t, nil)
+		advanceAgenticTime(f, 2*defaultAgenticTimeout)
+		f.reconcile(t, f.command(500, "agent-review"))
+		_, state := f.gate(t)
+		require.Equal(t, f.now.UTC(), *state.WaitingSince, "re-review reused the revision's expired deadline")
+		advanceAgenticTime(f, defaultAgenticTimeout-time.Nanosecond)
+		_, state = f.gate(t)
+		require.Nil(t, state.Plan)
+		advanceAgenticTime(f, time.Nanosecond)
+		_, state = f.gate(t)
+		require.Equal(t, "timeout", state.Plan.Source)
+		require.Zero(t, f.jobs.creates)
+		assertAgenticIdle(t, f, time.Hour)
+	})
 }
 
 func TestAgenticTransientRetriesContinueUntilRecovery(t *testing.T) {
@@ -326,8 +376,8 @@ func TestAgenticRateLimitKeepsDeadlineAndOriginalCommand(t *testing.T) {
 				}
 				advanceAgenticTime(f, time.Nanosecond)
 				_, state := f.gate(t)
-				if f.jobs.creates != 2 || state.Plan.Source != "timeout" || state.ForceRequestID != command.ID || len(f.a.scheduler.pending) != 0 {
-					t.Fatal("cooldown recovery lost the expired deadline or original request")
+				if f.jobs.creates != 2 || state.Plan.Source != "timeout" || state.ManualRequestID != 0 || !state.Command.Rejected || len(f.a.scheduler.pending) != 0 {
+					t.Fatal("cooldown recovery lost the deadline or queued a pre-selection request")
 				}
 			})
 		})
@@ -341,6 +391,8 @@ func TestAgenticCommentRoutingFailurePreservesCommand(t *testing.T) {
 				f := newScheduledAgenticFixture(t, mode)
 				if mode == "auto" {
 					f.passFirstStage(t)
+				} else {
+					f.plan(t, "job-a")
 				}
 				stop := startAgenticRunner(f)
 				defer stop()
@@ -357,8 +409,14 @@ func TestAgenticCommentRoutingFailurePreservesCommand(t *testing.T) {
 				f.gh.getPullRequestError = nil
 				advanceAgenticTime(f, delay)
 				_, state := f.gate(t)
-				if state.ManualRequestID != command.ID || (mode == "auto" && state.ForceRequestID != command.ID) || f.jobs.creates != wantCreates || len(f.a.scheduler.pending) != 0 {
-					t.Fatal("retry or nearer Chai deadline lost the delivered manual command")
+				if f.jobs.creates != wantCreates || len(f.a.scheduler.pending) != 0 {
+					t.Fatal("retry or nearer Chai deadline lost the delivered comment")
+				}
+				if mode == "manual" {
+					require.Equal(t, command.ID, state.ManualRequestID)
+				} else {
+					require.Zero(t, state.ManualRequestID)
+					require.True(t, state.Command.Rejected)
 				}
 			})
 		})
@@ -368,6 +426,7 @@ func TestAgenticCommentRoutingFailurePreservesCommand(t *testing.T) {
 func TestAgenticOverlappingFailuresPreserveCooldown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "manual")
+		f.plan(t, "job-a")
 		stop := startAgenticRunner(f)
 		defer stop()
 		f.reconcile(t, nil)

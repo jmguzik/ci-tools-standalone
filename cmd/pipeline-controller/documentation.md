@@ -8,6 +8,7 @@ The Pipeline Controller operates in three distinct modes, each offering differen
 
 All modes support [agentic selection](#agentic-selection-chai). Otherwise,
 the normal-selection behavior below applies.
+The same opening notification is used with either selection method.
 
 ## Three Operating Modes
 
@@ -237,12 +238,12 @@ Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
 ```
 
 Both paths use the latest matching ProwJobs for first-stage success, including `/override`.
-Dispatch waits for that success and the existing trigger. The timeout starts then
-and falls back to normal selection. Late plans
+Dispatch waits for that success and the existing trigger. The timeout starts when
+the controller first observes the PR revision, independently of CI or the trigger, and falls back to normal selection. Late plans
 cannot replace fallback or a dispatched selection; push a new commit to change it.
 
-- `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs.
-- `/pipeline agent-review` requests a fresh plan and clears opt-out before dispatch; use it after a same-SHA base retarget.
+- `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs. Before a valid selection exists, they are rejected with a comment, not queued; post the command again after Chai or timeout selects the jobs.
+- `/pipeline agent-review` requests a fresh plan with a new timeout and clears opt-out before dispatch; use it after a same-SHA base retarget.
 - `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
 
 `ci/tests-dispatched` means selected executions reported their contexts, not tests passed.

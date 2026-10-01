@@ -181,7 +181,7 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 			return nil
 		}
 		pull := pj.Spec.Refs.Pulls[0]
-		allowed, err := r.agentic.allowLegacySnapshot(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pull.Number, pull.SHA, pj.Spec.Refs.BaseRef)
+		allowed, err := r.agentic.allowSnapshot(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pull.Number, pull.SHA, pj.Spec.Refs.BaseRef, false)
 		if err != nil || !allowed {
 			return err
 		}

@@ -15,6 +15,7 @@ import (
 func TestAgenticPersistedCooldownAndCommandSurviveRestart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "manual")
+		f.plan(t, "job-a")
 		stop := startAgenticRunner(f)
 		f.reconcile(t, nil)
 		command := f.command(500, "remaining")
@@ -136,7 +137,7 @@ func TestAgenticAppliedRerunIntentResumesAfterRestart(t *testing.T) {
 		f.reconcile(t, nil)
 		gate, state := f.gate(t)
 		command := f.command(500, "required")
-		require.NoError(t, f.a.recordCommand(&gate, state, *command))
+		require.NoError(t, f.a.recordCommand(&gate, state, &f.gh.pr, *command, f.gh.comments))
 		cfg, _ := f.a.repoConfig("org", "repo", "main")
 		require.NoError(t, f.a.applyCommand(&gate, state, cfg, &f.gh.pr, f.gh.comments))
 		// Crash after command acknowledgment, before dispatch preparation.
