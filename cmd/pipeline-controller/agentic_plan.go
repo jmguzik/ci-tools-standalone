@@ -211,45 +211,15 @@ func latestAgenticJobs(pjs []v1.ProwJob, org, repo string, pr *github.PullReques
 
 // agenticFirstStageReady is deliberately independent of second-stage existence.
 // Unlike the ordinary duplicate guard, it also works after a partial dispatch.
-func agenticFirstStageReady(static []config.Presubmit, latest map[string]*v1.ProwJob, statuses *github.CombinedStatus, witnesses map[string]agenticFirstStageWitness, pr *github.PullRequest, ghc minimalGhClient, org, repo string) (bool, error) {
-	changes := config.NewGitHubDeferredChangedFilesProvider(ghc, org, repo, pr.Number)
+func agenticFirstStageReady(static []config.Presubmit, latest map[string]*v1.ProwJob, witnesses map[string]firstStageSuccessWitness, branch string) bool {
 	ready := true
 	for _, p := range static {
-		if !p.ContextRequired() || agenticSecondStage(p) || !p.CouldRun(pr.Base.Ref) {
+		if !p.ContextRequired() || agenticSecondStage(p) || !p.CouldRun(branch) {
 			continue
 		}
-		required, err := p.ShouldRun(pr.Base.Ref, changes, false, false)
-		if err != nil {
-			return false, err
-		}
-		pj := latest[p.Name]
-		var status github.Status
-		if statuses != nil {
-			for _, observed := range statuses.Statuses {
-				if observed.Context == p.Context {
-					status = observed
-					break
-				}
-			}
-		}
-		// A manually run conditional first-stage job still has to succeed.
-		if required || pj != nil || status.State != "" {
-			if pj != nil {
-				if pj.Status.State != v1.SuccessState || status.State != github.StatusSuccess || pj.Status.URL == "" || status.TargetURL != pj.Status.URL {
-					delete(witnesses, p.Name)
-					ready = false
-				} else {
-					witnesses[p.Name] = agenticFirstStageWitness{Context: p.Context, URL: pj.Status.URL}
-				}
-			} else {
-				// Commit statuses alone are not base-branch-scoped. Only reuse a
-				// report previously witnessed for this exact HEAD/base journal.
-				witness, ok := witnesses[p.Name]
-				if !ok || witness.Context != p.Context || witness.URL == "" || status.State != github.StatusSuccess || status.TargetURL != witness.URL {
-					ready = false
-				}
-			}
+		if !firstStageJobPassed(p, latest[p.Name], p.AlwaysRun, witnesses) {
+			ready = false
 		}
 	}
-	return ready, nil
+	return ready
 }

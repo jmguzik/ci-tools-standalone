@@ -65,11 +65,6 @@ type agenticDispatch struct {
 	Executions []agenticExecution `json:"executions"`
 }
 
-type agenticFirstStageWitness struct {
-	Context string `json:"context"`
-	URL     string `json:"url"`
-}
-
 // The per-PR filesystem record is authoritative. No dispatch is allowed
 // before its selection and comment request have been saved there. Hook owns
 // ProwJob creation; the controller observes the resulting executions.
@@ -95,7 +90,7 @@ type agenticState struct {
 	Frozen           bool                                `json:"frozen,omitempty"`
 	WaitingSince     *time.Time                          `json:"waiting_since,omitempty"`
 	Dispatch         *agenticDispatch                    `json:"dispatch,omitempty"`
-	FirstStage       map[string]agenticFirstStageWitness `json:"first_stage,omitempty"`
+	FirstStage       map[string]firstStageSuccessWitness `json:"first_stage,omitempty"`
 	StatusInterests  []string                            `json:"status_interests,omitempty"`
 	PendingDispatch  bool                                `json:"pending_dispatch,omitempty"`
 	RevisionPending  bool                                `json:"revision_pending,omitempty"`
@@ -250,7 +245,7 @@ func validateAgenticState(state *agenticState) error {
 		return fmt.Errorf("invalid persisted request identity")
 	}
 	for name, witness := range state.FirstStage {
-		if name == "" || witness.Context == "" || witness.Context == agenticGate || witness.URL == "" {
+		if name == "" || witness.Context == "" || witness.Context == agenticGate {
 			return fmt.Errorf("invalid first-stage witness")
 		}
 	}
@@ -529,17 +524,10 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		return a.failState(gate, state, err)
 	}
 	latest := latestAgenticJobs(pjs.Items, org, repo, pr)
-	statuses, err := a.gh.GetCombinedStatus(org, repo, pr.Head.SHA)
-	if err != nil {
-		return a.failState(gate, state, err)
-	}
 	if state.FirstStage == nil {
-		state.FirstStage = map[string]agenticFirstStageWitness{}
+		state.FirstStage = map[string]firstStageSuccessWitness{}
 	}
-	ready, err := agenticFirstStageReady(static, latest, statuses, state.FirstStage, pr, a.gh, org, repo)
-	if err != nil {
-		return a.failState(gate, state, err)
-	}
+	ready := agenticFirstStageReady(static, latest, state.FirstStage, pr.Base.Ref)
 	authorized := agenticAuthorized(cfg, state, pr)
 	if pr.Draft || (pr.Mergable != nil && !*pr.Mergable) || !ready || !authorized {
 		state.WaitingSince = nil
@@ -572,6 +560,14 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 				return agenticPlanPendingError{invalidPlan}
 			}
 			return a.saveState(gate, state, "", "Waiting for Chai's selected jobs (bounded by the configured timeout).")
+		}
+	}
+	// GitHub reports are needed only for the selected second-stage executions.
+	var statuses *github.CombinedStatus
+	if len(state.Plan.Jobs) > 0 {
+		statuses, err = a.gh.GetCombinedStatus(org, repo, pr.Head.SHA)
+		if err != nil {
+			return a.failState(gate, state, err)
 		}
 	}
 	prepare := state.Dispatch == nil || state.Dispatch.ID != agenticDispatchID(state)
@@ -712,8 +708,7 @@ func (a *agenticController) dispatch(gate *github.CheckRun, state *agenticState,
 		}
 		state.Dispatch.Posted = true
 	}
-	// Only superseded reports need history. Share one lookup across executions;
-	// first-stage readiness continues to use current statuses exclusively.
+	// Only superseded reports need history. Share one lookup across executions.
 	var history *github.CombinedStatus
 	reportMatches := func(jobContext, url string) (bool, error) {
 		if agenticStatusMatches(jobContext, url, statuses) {

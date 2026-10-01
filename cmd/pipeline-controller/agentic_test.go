@@ -603,11 +603,39 @@ func TestAgenticNoDispatchWithoutDurableGate(t *testing.T) {
 
 func TestAgenticFirstStageNewerRunWinsOverOldSuccess(t *testing.T) {
 	f := newReadyAgenticFixture(t, "auto")
+	f.reconcile(t, nil) // Persist the earlier success before a rerun arrives.
 	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "first", nil)
 	pj.Name, pj.Namespace, pj.CreationTimestamp = "new-first-stage", "ci", metav1.NewTime(f.now)
 	pj.Status.State = v1.PendingState
 	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
 	f.reconcile(t, nil)
-	check, _ := f.gate(t)
-	require.NotEqual(t, "success", check.Conclusion, "old GitHub success bypassed a newer pending first-stage execution")
+	check, state := f.gate(t)
+	require.NotEqual(t, "success", check.Conclusion, "old success bypassed a newer pending first-stage execution")
+	require.Empty(t, state.FirstStage)
+}
+
+func TestAgenticFirstStageStartsTimeoutWithoutGitHubReports(t *testing.T) {
+	for _, scenario := range []string{"override URL differs", "no report"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			f.passFirstStage(t)
+			pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "override", nil)
+			pj.Name, pj.Namespace, pj.CreationTimestamp = "override-first-stage", "ci", metav1.NewTime(f.now)
+			pj.Status.State, pj.Status.URL = v1.SuccessState, "https://github.com/org/repo/pull/42#issuecomment-500"
+			require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
+			if scenario == "no report" {
+				f.gh.statuses = nil
+			}
+			f.reconcile(t, nil)
+			_, state := f.gate(t)
+			require.NotNil(t, state.WaitingSince)
+			require.Equal(t, f.now, *state.WaitingSince)
+			require.Zero(t, f.gh.getCombinedStatusCalls)
+			f.now = f.now.Add(defaultAgenticTimeout)
+			f.reconcile(t, nil)
+			_, state = f.gate(t)
+			require.Equal(t, "timeout", state.Plan.Source)
+			require.Equal(t, 2, f.jobs.creates)
+		})
+	}
 }

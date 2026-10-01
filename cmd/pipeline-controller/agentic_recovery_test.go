@@ -170,13 +170,15 @@ func TestAgenticFirstStageWitnessSurvivesGarbageCollection(t *testing.T) {
 	var all v1.ProwJobList
 	require.NoError(t, f.jobs.List(context.Background(), &all))
 	f.deleteJobs(t, all.Items...)
+	firstStageStatuses := append([]github.Status(nil), f.gh.statuses[f.gh.pr.Head.SHA]...)
+	f.gh.statuses = nil
 	f.reconcile(t, nil)
 	check, _ := f.gate(t)
 	require.Equal(t, "success", check.Conclusion, "persisted first-stage evidence was lost after ProwJob cleanup")
 	// A raw success without a witnessed ProwJob does not establish a new gate.
 	unobserved := newAgenticFixture(t, "auto")
 	unobserved.plan(t)
-	unobserved.gh.statuses[unobserved.gh.pr.Head.SHA] = f.gh.statuses[f.gh.pr.Head.SHA]
+	unobserved.gh.statuses[unobserved.gh.pr.Head.SHA] = firstStageStatuses
 	unobserved.reconcile(t, nil)
 	check, _ = unobserved.gate(t)
 	require.NotEqual(t, "success", check.Conclusion, "unscoped GitHub status created first-stage proof")
@@ -364,6 +366,14 @@ func TestAgenticSupersededReportRecovery(t *testing.T) {
 				f.gh.listStatusesError = io.ErrUnexpectedEOF
 			case "first-stage-failure":
 				current[0].State, wantReads = github.StatusFailure, 0
+				var jobs v1.ProwJobList
+				require.NoError(t, f.jobs.List(context.Background(), &jobs))
+				for _, pj := range jobs.Items {
+					if pj.Spec.Job == "first-stage" {
+						pj.Status.State = v1.FailureState
+						require.NoError(t, f.jobs.Update(context.Background(), &pj))
+					}
+				}
 			}
 			err := f.tryReconcile(f.command(500, "remaining"))
 			if scenario == "history-error" {

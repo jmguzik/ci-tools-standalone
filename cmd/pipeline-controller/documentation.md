@@ -236,8 +236,9 @@ Chai test selection requested for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` →
 Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
 ```
 
-Dispatch, including manual commands, waits for first-stage success and the existing
-trigger. The timeout starts then and falls back to normal selection. Late plans
+Both paths use the latest matching ProwJobs for first-stage success, including `/override`.
+Dispatch waits for that success and the existing trigger. The timeout starts then
+and falls back to normal selection. Late plans
 cannot replace fallback or a dispatched selection; push a new commit to change it.
 
 - `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs.
