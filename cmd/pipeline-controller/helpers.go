@@ -163,6 +163,25 @@ func secondStageTriggeredAtSHA(ctx context.Context, pjLister ctrlruntimeclient.R
 	return false
 }
 
+// pipelineAnnotationMatches gives run-if-changed precedence over skip-if-only-changed.
+func pipelineAnnotationMatches(p config.Presubmit, changes config.ChangedFilesProvider) (bool, error) {
+	run, skip := p.Annotations["pipeline_run_if_changed"], p.Annotations["pipeline_skip_if_only_changed"]
+	if run == "" && skip == "" {
+		return true, nil
+	}
+	job := []config.Presubmit{p}
+	if run != "" {
+		job[0].RegexpChangeMatcher = config.RegexpChangeMatcher{RunIfChanged: run}
+	} else {
+		job[0].RegexpChangeMatcher = config.RegexpChangeMatcher{SkipIfOnlyChanged: skip}
+	}
+	if err := config.SetPresubmitRegexes(job); err != nil {
+		return false, err
+	}
+	_, shouldRun, err := job[0].RegexpChangeMatcher.ShouldRun(changes)
+	return shouldRun, err
+}
+
 func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineConditionallyRequired []config.Presubmit, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode) (string, error) {
 	if pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) == 0 {
 		return "", fmt.Errorf("ProwJob %s does not have valid Refs.Pulls", pj.Name)
@@ -180,37 +199,10 @@ func acquireConditionalContexts(ctx context.Context, pj *v1.ProwJob, pipelineCon
 				continue
 			}
 
-			shouldRun := false
-			// Check pipeline_run_if_changed first (takes precedence)
-			if run, ok := presubmit.Annotations["pipeline_run_if_changed"]; ok && run != "" {
-				psList := []config.Presubmit{presubmit}
-				psList[0].RegexpChangeMatcher = config.RegexpChangeMatcher{RunIfChanged: run}
-				if err := config.SetPresubmitRegexes(psList); err != nil {
-					deleteIds()
-					return "", err
-				}
-				_, shouldRunResult, err := psList[0].RegexpChangeMatcher.ShouldRun(cfp)
-				if err != nil {
-					deleteIds()
-					return "", err
-				}
-				shouldRun = shouldRunResult
-			} else if skip, ok := presubmit.Annotations["pipeline_skip_if_only_changed"]; ok && skip != "" {
-				// Check pipeline_skip_if_only_changed if pipeline_run_if_changed is not present
-				psList := []config.Presubmit{presubmit}
-				psList[0].RegexpChangeMatcher = config.RegexpChangeMatcher{SkipIfOnlyChanged: skip}
-				if err := config.SetPresubmitRegexes(psList); err != nil {
-					deleteIds()
-					return "", err
-				}
-				_, shouldRunResult, err := psList[0].RegexpChangeMatcher.ShouldRun(cfp)
-				if err != nil {
-					deleteIds()
-					return "", err
-				}
-				shouldRun = shouldRunResult
-			} else {
-				shouldRun = true
+			shouldRun, err := pipelineAnnotationMatches(presubmit, cfp)
+			if err != nil {
+				deleteIds()
+				return "", err
 			}
 
 			if shouldRun {

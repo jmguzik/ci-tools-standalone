@@ -6,6 +6,9 @@ The Pipeline Controller is a tool that manages the execution of second-stage tes
 
 The Pipeline Controller operates in three distinct modes, each offering different levels of automation for triggering second-stage tests. Second-stage tests are tests that run after the initial required tests pass, typically integration tests, optional tests, or tests that depend on specific file changes.
 
+All modes support [agentic selection](#agentic-selection-chai). Otherwise,
+the normal-selection behavior below applies.
+
 ## Three Operating Modes
 
 ### 1. Manual Mode
@@ -201,6 +204,61 @@ If you manually trigger some second-stage tests (using `/test <job-name>`) in Au
 
 This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
 
+## Agentic Selection (Chai)
+
+Enable Chai in the main or LGTM enrollment configuration:
+
+```yaml
+- name: example
+  branches: [main]
+  mode: {trigger: auto, agentic: {mode: chai}}
+```
+
+Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable),
+`--agentic-state-dir=/var/lib/pipeline-controller` (required outside dry run),
+and `--agentic-timeout=20m` (default); no repository-level trust/timeout.
+
+On PR creation/new commits, Chai posts its selected second-stage jobs without waiting for CI/LGTM:
+
+```markdown
+Chai test plan for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`
+
+- `pull-ci-example-main-e2e`
+```
+
+Use the full 40-character SHA, `None.` for no jobs and an optional final `Reason: ...`.
+The controller validates trusted author, revision and eligible job names, not relevance.
+For re-review, Chai verifies controller identity/current refs and echoes the 32-character `Request:` ID:
+
+```markdown
+Chai test selection requested for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`.
+
+Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
+```
+
+Dispatch, including manual commands, waits for first-stage success and the existing
+trigger. The timeout starts then and falls back to normal selection. Late plans
+cannot replace fallback or a dispatched selection; push a new commit to change it.
+
+- `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs.
+- `/pipeline agent-review` requests a fresh plan and clears opt-out before dispatch; use it after a same-SHA base retarget.
+- `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
+
+`ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
+Recovery state lives in one JSON file per PR on a PVC; GitHub shows only the gate. Normal branches in mixed-mode repos may also have inactive records. New revisions reset state; observed PR closure deletes the file. Malformed state is preserved and blocks startup; repair or restore it.
+Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
+Enabling TTL permanently requires a fresh post-tracking plan when local state is missing, even if TTL is later disabled. Tracked PRs still accept early plans for new commits.
+Restart restores known deadlines and unfinished actions from disk, without scanning GitHub or replaying existing jobs. There is no polling or missed-event catch-up; a missed event may require another event or manual command.
+Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
+
+Before enrolling:
+
+- Configure Chai's authenticated PR/comment delivery and matching identities; forward `status`, `pull_request` and `issue_comment` to the controller.
+- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch/create` in the ProwJob namespace. Use distinct HEADs.
+- Mount a durable, writable PVC supporting file locks, atomic rename and `fsync` at `--agentic-state-dir`; deploy one replica with `Recreate`. An exclusive file lock rejects a second writer. Back up the volume; do not prune open-PR state. Normal-only enrollment and dry run need no storage.
+- Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
+- Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.
+
 ## Enrolling Repository
 
 To enroll repository with the pipeline controller, you need to add it to the appropriate configuration:
@@ -208,4 +266,3 @@ To enroll repository with the pipeline controller, you need to add it to the app
 ### For Manual or Automatic Mode
 
 Repository needs to be added to the main pipeline controller configuration file. Contact your platform team or CI/CD administrators to have your repository added with the desired mode (`manual` or `auto`).
-

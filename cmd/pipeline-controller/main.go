@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,9 +48,13 @@ type options struct {
 	lgtmConfigFile           string
 	dryrun                   bool
 	webhookSecretFile        string
+	agentic                  agenticOptions
 }
 
 func (o *options) validate() error {
+	if err := o.agentic.validate(); err != nil {
+		return err
+	}
 	for _, opt := range []interface{ Validate(bool) error }{&o.client, &o.config} {
 		if err := opt.Validate(o.dryrun); err != nil {
 			return err
@@ -64,6 +69,7 @@ func (o *options) parseArgs(fs *flag.FlagSet, args []string) error {
 	fs.StringVar(&o.configFile, "config-file", "", "Config file with list of enabled orgs and repos.")
 	fs.StringVar(&o.lgtmConfigFile, "lgtm-config-file", "", "Config file with list of enabled orgs and repos with second stage triggered by lgtm label.")
 	fs.StringVar(&o.webhookSecretFile, "hmac-secret-file", "/etc/webhook/hmac", "Path to the file containing the GitHub HMAC secret.")
+	o.agentic.addFlags(fs)
 
 	o.config.AddFlags(fs)
 	o.github.AddFlags(fs)
@@ -104,6 +110,7 @@ type clientWrapper struct {
 	lgtmWatcher        *watcher
 	pjLister           ctrlruntimeclient.Reader
 	pipelineAutoCache  *PipelineAutoCache
+	agentic            *agenticController
 	// ids provides a per-SHA idempotency guard for the LGTM and /pipeline
 	// remaining scheduling paths, which do not run under the reconciler's own
 	// ids cache. Keyed by composeKey (org/repo/pr/baseRef/SHA).
@@ -145,6 +152,9 @@ func isBranchEnabled(branches []string, branch string) bool {
 func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github.PullRequestEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+	if !cw.allowLegacyPullRequest(l, event) {
+		return
+	}
 
 	logger := l.WithFields(logrus.Fields{
 		"handler": "handlePullRequestCreation",
@@ -271,6 +281,9 @@ func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github
 func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullRequestEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+	if !cw.allowLegacyPullRequest(l, event) {
+		return
+	}
 
 	logger := l.WithFields(logrus.Fields{
 		"handler": "handleLabelAddition",
@@ -391,6 +404,9 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueCommentEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+	if cw.agentic != nil && cw.agentic.handleIssueComment(l, event) {
+		return
+	}
 
 	logger := l.WithFields(logrus.Fields{
 		"handler":    "handleIssueComment",
@@ -470,6 +486,11 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	pr, err := cw.ghc.GetPullRequest(org, repo, number)
 	if err != nil {
 		logger.WithError(err).Error("failed to get PR details")
+		return
+	}
+	// The PR may have moved to an agentic branch since the routing lookup at
+	// the beginning of this handler. Never fall through to legacy side effects.
+	if _, enabled := cw.agentic.repoConfig(org, repo, pr.Base.Ref); enabled {
 		return
 	}
 
@@ -603,6 +624,9 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event github.PullRequestEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+	if !cw.allowLegacyPullRequest(l, event) {
+		return
+	}
 
 	logger := l.WithFields(logrus.Fields{
 		"handler": "handlePipelineContextCreation",
@@ -832,9 +856,15 @@ func main() {
 	}
 
 	watcher := newWatcher(o.configFile, logger)
+	if err := watcher.reloadConfig(); err != nil {
+		logger.WithError(err).Fatal("failed to load pipeline configuration")
+	}
 	go watcher.watch()
 
 	lgtmWatcher := newWatcher(o.lgtmConfigFile, logger)
+	if err := lgtmWatcher.reloadConfig(); err != nil {
+		logger.WithError(err).Fatal("failed to load LGTM pipeline configuration")
+	}
 	go lgtmWatcher.watch()
 
 	// Create a function that returns repos from both config and lgtm config
@@ -868,47 +898,11 @@ func main() {
 			}
 		}
 
-		// If no repos found, retry once after a short delay
-		if len(repos) == 0 {
-			time.Sleep(100 * time.Millisecond)
-
-			// Retry getting configs
-			mainConfig = watcher.getConfig()
-			lgtmConfig = lgtmWatcher.getConfig()
-
-			for org, repoConfigs := range mainConfig {
-				for repo := range repoConfigs {
-					repos = append(repos, org+"/"+repo)
-				}
-			}
-
-			for org, repoConfigs := range lgtmConfig {
-				for repo := range repoConfigs {
-					orgRepo := org + "/" + repo
-					found := false
-					for _, existing := range repos {
-						if existing == orgRepo {
-							found = true
-							break
-						}
-					}
-					if !found {
-						repos = append(repos, orgRepo)
-					}
-				}
-			}
-		}
-
 		return repos
 	}
 
 	configDataProvider := NewConfigDataProvider(cfg, repoLister, logger.WithField("component", "config-data-provider"))
 	go configDataProvider.Run()
-
-	// Wait for config data provider to be ready
-	logger.Info("Waiting for config data provider to be ready...")
-	time.Sleep(2 * time.Second) // Give it time to load initial data
-	logger.Info("Config data provider should be ready")
 
 	pipelineAutoCache := NewPipelineAutoCache()
 	go func() {
@@ -924,6 +918,24 @@ func main() {
 		logger.WithError(err).Fatal("failed to construct github reporter controller")
 	}
 	go reconciler.cleanOldIds(24 * time.Hour)
+	var appID int64
+	if o.github.AppID != "" {
+		appID, err = strconv.ParseInt(o.github.AppID, 10, 64)
+		if err != nil {
+			logger.WithError(err).Fatal("invalid GitHub App ID")
+		}
+	}
+	agentic := &agenticController{gh: githubClient, jobs: mgr.GetClient(), reader: mgr.GetAPIReader(), config: cfg,
+		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
+	if err := agentic.validateEnrollment(); err != nil {
+		logger.WithError(err).Fatal("invalid agentic configuration")
+	}
+	if err := agentic.prepareStore(); err != nil {
+		logger.WithError(err).Fatal("cannot open agentic recovery state")
+	}
+	watcher.setOnChange(agentic.configurationChanged)
+	lgtmWatcher.setOnChange(agentic.configurationChanged)
+	reconciler.agentic = agentic
 
 	if err = secret.Add(o.webhookSecretFile); err != nil {
 		logger.WithError(err).Fatal("error starting secrets agent")
@@ -937,6 +949,7 @@ func main() {
 		lgtmWatcher:        lgtmWatcher,
 		pjLister:           mgr.GetCache(),
 		pipelineAutoCache:  pipelineAutoCache,
+		agentic:            agentic,
 	}
 
 	// Evict stale per-SHA idempotency keys from the LGTM / /pipeline remaining
@@ -951,6 +964,8 @@ func main() {
 	eventServer.RegisterHandlePullRequestEvent(cw.handleLabelAddition)
 	eventServer.RegisterHandlePullRequestEvent(cw.handlePipelineContextCreation)
 	eventServer.RegisterHandleIssueCommentEvent(cw.handleIssueComment)
+	eventServer.RegisterHandlePullRequestEvent(agentic.handlePullRequest)
+	eventServer.RegisterStatusEventHandler(agentic.handleStatus)
 
 	logger.Info("All event handlers registered successfully")
 
@@ -959,6 +974,12 @@ func main() {
 	})
 
 	interrupts.ListenAndServe(eventServer, time.Second*30)
+	interrupts.Run(func(ctx context.Context) {
+		if err := agentic.Run(ctx); err != nil {
+			logger.WithError(err).Error("Cannot start agentic recovery")
+			interrupts.Terminate()
+		}
+	})
 	interrupts.Run(func(ctx context.Context) {
 		if err := mgr.Start(ctx); err != nil {
 			logger.WithError(err).Fatal("controller manager exited with error")

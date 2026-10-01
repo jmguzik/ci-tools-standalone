@@ -12,7 +12,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
@@ -84,6 +86,7 @@ type reconciler struct {
 	watcher            *watcher
 	lgtmWatcher        *watcher
 	pipelineAutoCache  *PipelineAutoCache
+	agentic            *agenticController
 }
 
 func NewReconciler(
@@ -115,7 +118,10 @@ func NewReconciler(
 	if err := builder.
 		ControllerManagedBy(mgr).
 		Named("pipeline-controller").
-		For(&v1.ProwJob{}).
+		Watches(&v1.ProwJob{}, &handler.EnqueueRequestForObject{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc: reconciler.shouldReconcileProwJobCreate,
+			UpdateFunc: reconciler.shouldReconcileProwJobUpdate,
+		})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(reconciler); err != nil {
 		return nil, fmt.Errorf("failed to construct controller: %w", err)
@@ -158,6 +164,27 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 
 	if pj.Spec.Refs == nil || pj.Spec.Type != v1.PresubmitJob {
 		return nil
+	}
+	if _, enabled := r.agentic.repoConfig(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.BaseRef); enabled {
+		if len(pj.Spec.Refs.Pulls) != 1 {
+			return nil
+		}
+		if err := r.agentic.reconcile(ctx, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, nil); err != nil {
+			r.agentic.logger.WithError(err).Error("Agentic ProwJob reconciliation failed")
+		}
+		// Agentic work owns its retry timer and error classification. Returning
+		// an error here would also start controller-runtime's retry loop.
+		return nil
+	}
+	if r.agentic.hasRepo(pj.Spec.Refs.Org, pj.Spec.Refs.Repo) {
+		if len(pj.Spec.Refs.Pulls) != 1 {
+			return nil
+		}
+		pull := pj.Spec.Refs.Pulls[0]
+		allowed, err := r.agentic.allowLegacySnapshot(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pull.Number, pull.SHA, pj.Spec.Refs.BaseRef)
+		if err != nil || !allowed {
+			return err
+		}
 	}
 
 	presubmits := r.configDataProvider.GetPresubmits(pj.Spec.Refs.Org + "/" + pj.Spec.Refs.Repo)
