@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/prow/pkg/logrusutil"
 )
 
-const pullRequestInfoComment = "**Pipeline controller notification**\nThis repo is configured to use the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/). Second-stage tests will be triggered either automatically or after lgtm label is added, depending on the repository configuration. The pipeline controller will automatically detect which contexts are required and will utilize `/test` Prow commands to trigger the second stage.\n\nFor optional jobs, comment `/test ?` to see a list of all defined jobs. To trigger manually all jobs from second stage use `/pipeline required` command. \n\nThis repository is configured in: "
+const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs, `/pipeline remaining` to request missing second-stage tests, or `/pipeline required` to rerun the selected second-stage set."
 
 const RepoNotConfiguredMessage = "This repository is not currently configured for [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) support."
 
@@ -150,9 +150,12 @@ func isBranchEnabled(branches []string, branch string) bool {
 }
 
 func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github.PullRequestEvent) {
+	if event.Action != github.PullRequestActionOpened {
+		return
+	}
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	if !cw.allowLegacyPullRequest(l, event) {
+	if !cw.allowPullRequestSnapshot(l, event, true) {
 		return
 	}
 
@@ -164,124 +167,45 @@ func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github
 		"pr":      event.PullRequest.Number,
 	})
 
-	logger.Info("Processing pull request event")
+	org, repo, number := event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number
+	baseBranch := event.PullRequest.Base.Ref
+	repoConfig, inMain := cw.watcher.getConfig()[org][repo]
+	lgtmConfig, inLGTM := cw.lgtmWatcher.getConfig()[org][repo]
+	inMain = inMain && isBranchEnabled(repoConfig.Branches, baseBranch)
+	inLGTM = inLGTM && isBranchEnabled(lgtmConfig.Branches, baseBranch)
+	if !inMain && !inLGTM {
+		return
+	}
+	if !inMain {
+		repoConfig = lgtmConfig
+	}
 
-	if github.PullRequestActionOpened == event.Action {
-		org := event.Repo.Owner.Login
-		repo := event.Repo.Name
-		number := event.PullRequest.Number
-
-		logger = logger.WithFields(logrus.Fields{
-			"org":  org,
-			"repo": repo,
-			"pr":   number,
-		})
-
-		logger.Info("Processing PR opened event")
-
-		// Check if repo is in configuration (either manual/auto mode or LGTM mode)
-		currentCfg := cw.watcher.getConfig()
-		repos, orgExists := currentCfg[org]
-		repoConfig, repoExists := repos[repo]
-
-		lgtmCfg := cw.lgtmWatcher.getConfig()
-		lgtmRepos, lgtmOrgExists := lgtmCfg[org]
-		_, lgtmRepoExists := lgtmRepos[repo]
-
-		isInConfig := (orgExists && repoExists) || (lgtmOrgExists && lgtmRepoExists)
-
-		logger.WithFields(logrus.Fields{
-			"org_exists":       orgExists,
-			"repo_exists":      repoExists,
-			"lgtm_org_exists":  lgtmOrgExists,
-			"lgtm_repo_exists": lgtmRepoExists,
-			"is_in_config":     isInConfig,
-		}).Debug("Configuration check results")
-
-		if !isInConfig {
-			logger.Debug("Repository not in configuration (neither regular nor LGTM), skipping")
-			return
-		}
-
-		// Check if branch is enabled for this repo
-		baseBranch := event.PullRequest.Base.Ref
-		var branchEnabled bool
-		if orgExists && repoExists {
-			branchEnabled = isBranchEnabled(repoConfig.Branches, baseBranch)
-		} else if lgtmOrgExists && lgtmRepoExists {
-			lgtmRepoConfig := lgtmRepos[repo]
-			branchEnabled = isBranchEnabled(lgtmRepoConfig.Branches, baseBranch)
-		}
-
-		if !branchEnabled {
-			logger.WithField("base_branch", baseBranch).Debug("Branch not enabled for pipeline controller, skipping")
-			return
-		}
-
-		// Check if repo is in regular config to determine trigger mode
-		var isAutomaticPipeline bool
-		isInLGTMConfig := lgtmOrgExists && lgtmRepoExists
-		if orgExists && repoExists {
-			isAutomaticPipeline = repoConfig.Trigger == "auto"
-			logger.WithField("trigger_mode", repoConfig.Trigger).Debug("Repository trigger mode")
-		}
-
-		logger.Debug("Getting presubmits from config data provider")
-		presubmits := cw.configDataProvider.GetPresubmits(org + "/" + repo)
-
-		// Show pipeline info comment for automatic mode or LGTM mode
-		if isAutomaticPipeline || isInLGTMConfig {
-			hasPipelineJobs := len(presubmits.protected) > 0 || len(presubmits.alwaysRequired) > 0 ||
-				len(presubmits.conditionallyRequired) > 0 || len(presubmits.pipelineConditionallyRequired) > 0 ||
-				len(presubmits.pipelineSkipOnlyRequired) > 0
-
-			logger.WithField("has_pipeline_jobs", hasPipelineJobs).Debug("Checking for pipeline jobs")
-
-			if hasPipelineJobs {
-				// Repo has pipeline-controlled jobs and is in automatic mode or LGTM mode, use pipeline info comment
-				modeStr := "automatic mode"
-				if isInLGTMConfig && !isAutomaticPipeline {
-					modeStr = "LGTM mode"
-				}
-				logger.WithField("mode", modeStr).Info("Creating pipeline info comment")
-				if err := cw.ghc.CreateComment(org, repo, number, pullRequestInfoComment+modeStr); err != nil {
-					logger.WithError(err).Error("failed to create comment")
-				} else {
-					logger.Info("Successfully created pipeline info comment")
-				}
-			} else {
-				logger.Debug("No pipeline jobs found, skipping comment creation")
-			}
-		} else {
-			// Manual mode: Check for non-always-run jobs
-			cfg := cw.configDataProvider.configGetter()
-			presubmits := cfg.GetPresubmitsStatic(org + "/" + repo)
-
-			hasNonAlwaysRunJobs := false
-			for _, p := range presubmits {
-				if !p.AlwaysRun {
-					hasNonAlwaysRunJobs = true
-					break
-				}
-			}
-
-			if hasNonAlwaysRunJobs {
-				comment := "There are test jobs defined for this repository which are not configured to run automatically. " +
-					"Comment `/test ?` to see a list of all defined jobs. Review these jobs and use `/test <job>` to manually trigger jobs most likely to be impacted by the proposed changes." +
-					"Comment `/pipeline required` to trigger all required & necessary jobs."
-
-				if err := cw.ghc.CreateComment(org, repo, number, comment); err != nil {
-					logger.WithError(err).Error("failed to create comment")
-				}
+	presubmits := cw.configDataProvider.GetPresubmits(org + "/" + repo)
+	hasPipelineJobs := len(presubmits.protected) > 0 || len(presubmits.alwaysRequired) > 0 ||
+		len(presubmits.conditionallyRequired) > 0 || len(presubmits.pipelineConditionallyRequired) > 0 ||
+		len(presubmits.pipelineSkipOnlyRequired) > 0
+	if repoConfig.Trigger != "auto" && !inLGTM {
+		// Preserve manual mode's eligibility check; the message is shared.
+		hasPipelineJobs = false
+		for _, p := range cw.configDataProvider.configGetter().GetPresubmitsStatic(org + "/" + repo) {
+			if !p.AlwaysRun {
+				hasPipelineJobs = true
+				break
 			}
 		}
+	}
+	if !hasPipelineJobs {
+		return
+	}
+	if err := cw.ghc.CreateComment(org, repo, number, pullRequestInfoComment); err != nil {
+		logger.WithError(err).Error("failed to create pipeline info comment")
 	}
 }
 
 func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullRequestEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	if !cw.allowLegacyPullRequest(l, event) {
+	if !cw.allowPullRequestSnapshot(l, event, false) {
 		return
 	}
 
@@ -624,7 +548,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event github.PullRequestEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
-	if !cw.allowLegacyPullRequest(l, event) {
+	if !cw.allowPullRequestSnapshot(l, event, false) {
 		return
 	}
 

@@ -62,6 +62,33 @@ func TestAgenticMixedModeRejectsStaleLegacyEvents(t *testing.T) {
 	}
 }
 
+func TestAgenticMixedModeOpeningNotification(t *testing.T) {
+	f, cw := mixedAgenticFixture(t)
+	event := github.PullRequestEvent{Action: github.PullRequestActionOpened, Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr}
+	cw.handlePullRequestCreation(f.a.logger, event)
+	require.Len(t, f.gh.comments, 1)
+	require.Equal(t, pullRequestInfoComment, f.gh.comments[0].Body)
+
+	for _, scenario := range []string{"dry-run", "lookup-failure", "disabled-branch", "not-opened"} {
+		t.Run(scenario, func(t *testing.T) {
+			f, cw := mixedAgenticFixture(t)
+			event := github.PullRequestEvent{Action: github.PullRequestActionOpened, Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr}
+			switch scenario {
+			case "dry-run":
+				f.a.dryRun = true
+			case "lookup-failure":
+				f.gh.getPullRequestError = errors.New("GitHub unavailable")
+			case "disabled-branch":
+				f.gh.pr.Base.Ref, event.PullRequest.Base.Ref = "disabled", "disabled"
+			case "not-opened":
+				event.Action = github.PullRequestActionSynchronize
+			}
+			cw.handlePullRequestCreation(f.a.logger, event)
+			require.Empty(t, f.gh.comments)
+		})
+	}
+}
+
 func TestAgenticMixedModeRejectsStaleProwJob(t *testing.T) {
 	for _, lookupFails := range []bool{false, true} {
 		f, cw := mixedAgenticFixture(t)

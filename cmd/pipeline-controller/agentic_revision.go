@@ -55,7 +55,7 @@ func (a *agenticController) recoverCommands(gate *github.CheckRun, state *agenti
 		if comment.ID <= state.LastCommandID || comment.CreatedAt.Before(state.ObservedAt) || comment.CreatedAt.IsZero() || comment.UpdatedAt.After(comment.CreatedAt) {
 			continue
 		}
-		if err := a.recordCommand(gate, state, comment); err != nil {
+		if err := a.recordCommand(gate, state, pr, comment, comments); err != nil {
 			return err
 		}
 		if err := a.applyCommand(gate, state, cfg, pr, comments); err != nil {

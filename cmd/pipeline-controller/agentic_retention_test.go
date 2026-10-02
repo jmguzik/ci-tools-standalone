@@ -103,6 +103,7 @@ func TestAgenticRetentionDisabledModesLeaveStorageUntouched(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newScheduledAgenticFixture(t, "manual")
+				f.plan(t, "job-a")
 				f.reconcile(t, nil)
 				modified := f.now.Add(-365 * 24 * time.Hour)
 				path := ageAgenticRecord(t, f, 42, modified)

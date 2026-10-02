@@ -34,22 +34,22 @@ func TestAgenticProwJobInitialCreates(t *testing.T) {
 }
 
 func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
-	for _, phase := range []string{"untracked", "first-stage", "manual-trigger", "manual-plan", "empty-plan", "inflight", "completed"} {
+	for _, phase := range []string{"untracked", "first-stage", "manual-plan", "empty-plan", "inflight", "completed"} {
 		t.Run(phase, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				mode := "auto"
-				if phase == "manual-trigger" || phase == "manual-plan" {
+				if phase == "manual-plan" {
 					mode = "manual"
 				}
 				f := newScheduledAgenticFixture(t, mode)
 				if phase != "untracked" {
 					if phase != "first-stage" {
 						f.passFirstStage(t)
-						if phase == "empty-plan" {
-							f.plan(t)
-						} else if phase != "manual-trigger" {
-							f.plan(t, "job-a")
-						}
+					}
+					if phase == "empty-plan" {
+						f.plan(t)
+					} else {
+						f.plan(t, "job-a")
 					}
 					f.reconcile(t, nil)
 					if phase == "completed" {

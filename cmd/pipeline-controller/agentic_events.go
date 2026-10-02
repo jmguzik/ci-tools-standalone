@@ -22,13 +22,13 @@ func validAgenticCommand(command string) bool {
 	}
 }
 
-func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticState, comment github.IssueComment) error {
+func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticState, pr *github.PullRequest, comment github.IssueComment, comments []github.IssueComment) error {
 	matches := agenticCommandRE.FindAllStringSubmatch(comment.Body, -1)
 	if len(matches) != 1 || comment.ID <= state.LastCommandID || comment.ID <= 0 {
 		return nil
 	}
 	// Once a gate observes a new revision, delayed deliveries of older commands
-	// cannot authorize it. Early commands already recorded on disk survive
+	// cannot authorize it. Recorded command decisions survive
 	// restarts without reinterpreting comment text against another HEAD.
 	if comment.CreatedAt.IsZero() || comment.CreatedAt.Before(state.ObservedAt) {
 		return nil
@@ -40,8 +40,18 @@ func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticS
 	if !trusted {
 		return nil
 	}
+	command := &agenticCommand{Command: strings.ToLower(matches[0][1])}
+	if command.Command == "required" || command.Command == "remaining" {
+		if err := a.refreshPlan(state, pr, comments); err != nil {
+			if _, pending := err.(agenticPlanPendingError); !pending {
+				return err
+			}
+		}
+		// A missed early command must not be revived by a later Chai comment.
+		command.Rejected = state.Plan == nil || (state.Plan.Source == "chai" && state.Plan.CommentID > comment.ID)
+	}
 	state.LastCommandID = comment.ID
-	state.Command = &agenticCommand{Command: strings.ToLower(matches[0][1])}
+	state.Command = command
 	return a.saveState(gate, state, "", "Pipeline request recorded for this HEAD/base.")
 }
 
@@ -83,6 +93,14 @@ func (a *agenticController) ensureComment(state *agenticState, comments []github
 
 func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticState, cfg RepoConfig, pr *github.PullRequest, comments []github.IssueComment) error {
 	if command := state.Command; command != nil && !command.Applied {
+		if command.Rejected {
+			body := fmt.Sprintf("Cannot run `/pipeline %s`: test selection is not ready. Retry after Chai or the controller selects jobs. This request is not queued.\n\n<!-- pipeline-controller:command:%d -->", command.Command, state.LastCommandID)
+			if err := a.ensureComment(state, comments, body); err != nil {
+				return err
+			}
+			command.Applied = true
+			return a.saveState(gate, state, "", "Pipeline request rejected: waiting for test selection.")
+		}
 		switch command.Command {
 		case "required":
 			state.ManualRequestID, state.ForceRequestID = state.LastCommandID, state.LastCommandID
@@ -136,7 +154,9 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 					}
 					pr.Labels = labels
 				}
-				state.Plan, state.WaitingSince = nil, nil
+				state.Plan = nil
+				now := a.currentTime()
+				state.WaitingSince = &now
 				state.Review = &agenticReviewRequest{HeadSHA: state.HeadSHA, BaseBranch: state.BaseBranch,
 					RequestID: agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, strconv.Itoa(state.LastCommandID))}
 				state.ReviewPosted = false
@@ -227,21 +247,20 @@ func (a *agenticController) hasAgenticEnrollment() bool {
 	return false
 }
 
-// Legacy events carry snapshots. In a mixed-mode repository a delayed event
-// from a normal branch must not publish placeholders or /test commands after
-// the PR moves to an agentic branch. Normal-only repositories need no extra API
-// call and retain their existing behavior.
-func (a *agenticController) allowLegacySnapshot(org, repo string, number int, head, base string) (bool, error) {
+// Mixed-mode events must match the live PR. Universal notifications may reach
+// agentic branches; legacy placeholders and dispatch must not. Normal-only
+// repositories retain their existing behavior without an extra GitHub read.
+func (a *agenticController) allowSnapshot(org, repo string, number int, head, base string, allowAgentic bool) (bool, error) {
 	if !a.hasRepo(org, repo) {
 		return true, nil
 	}
 	a.mu.Lock()
 	stopped := a.stopped
 	a.mu.Unlock()
-	if stopped {
+	if stopped || (allowAgentic && a.dryRun) {
 		return false, nil
 	}
-	if _, enabled := a.repoConfig(org, repo, base); enabled {
+	if _, enabled := a.repoConfig(org, repo, base); enabled && !allowAgentic {
 		return false, nil
 	}
 	pr, err := a.gh.GetPullRequest(org, repo, number)
@@ -249,13 +268,13 @@ func (a *agenticController) allowLegacySnapshot(org, repo string, number int, he
 		return false, err
 	}
 	_, enabled := a.repoConfig(org, repo, pr.Base.Ref)
-	return !enabled && pr.State == github.PullRequestStateOpen && !pr.Draft && pr.Head.SHA == head && pr.Base.Ref == base, nil
+	return (allowAgentic || !enabled) && pr.State == github.PullRequestStateOpen && !pr.Draft && pr.Head.SHA == head && pr.Base.Ref == base, nil
 }
 
-func (cw *clientWrapper) allowLegacyPullRequest(logger *logrus.Entry, event github.PullRequestEvent) bool {
-	allowed, err := cw.agentic.allowLegacySnapshot(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, event.PullRequest.Head.SHA, event.PullRequest.Base.Ref)
+func (cw *clientWrapper) allowPullRequestSnapshot(logger *logrus.Entry, event github.PullRequestEvent, allowAgentic bool) bool {
+	allowed, err := cw.agentic.allowSnapshot(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, event.PullRequest.Head.SHA, event.PullRequest.Base.Ref, allowAgentic)
 	if err != nil {
-		logger.WithError(err).Error("Cannot safely route legacy pull request event")
+		logger.WithError(err).Error("Cannot safely route pull request event")
 	}
 	return allowed && err == nil
 }

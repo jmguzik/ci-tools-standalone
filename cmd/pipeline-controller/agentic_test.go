@@ -390,7 +390,7 @@ func TestAgenticDispatchAndReporting(t *testing.T) {
 	require.Equal(t, 1, f.jobs.creates, "recreated an execution already durably acknowledged")
 }
 
-func TestAgenticManualEarlyRequestAndRevisionBinding(t *testing.T) {
+func TestAgenticSelectedRequestWaitsForFirstStageAndBindsRevision(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.plan(t, "job-a")
 	f.reconcile(t, nil)
@@ -422,33 +422,121 @@ func TestAgenticManualEarlyRequestAndRevisionBinding(t *testing.T) {
 	require.Zero(t, state.ManualRequestID, "delayed old command authorized a new HEAD")
 }
 
-func TestAgenticTimeoutWaitsForPrerequisitesAndIgnoresLatePlans(t *testing.T) {
-	f := newAgenticFixture(t, "lgtm")
-	f.passFirstStage(t)
+func TestAgenticCommandsRejectMissingSelection(t *testing.T) {
+	for _, selection := range []string{"missing", "stale", "newer-invalid", "late-plan"} {
+		for _, command := range []string{"required", "remaining"} {
+			t.Run(selection+"/"+command, func(t *testing.T) {
+				f := newAgenticFixture(t, "manual")
+				switch selection {
+				case "newer-invalid":
+					f.plan(t, "job-a")
+				case "stale":
+					f.plan(t, "job-a")
+					f.gh.comments[0].Body = formatAgenticPlan(agenticPlan{HeadSHA: strings.Repeat("c", 40), BaseBranch: "main", Jobs: []string{"job-a"}})
+				}
+				f.reconcile(t, nil)
+				if selection == "newer-invalid" {
+					f.plan(t, "unknown-job")
+				}
+				f.command(500, command)
+				request := f.command(600, command)
+				if selection == "late-plan" {
+					f.plan(t, "job-a")
+				}
+				comments := len(f.gh.comments) + 2
+				reconcile := func() {
+					err := f.tryReconcile(request)
+					if selection == "newer-invalid" {
+						require.ErrorContains(t, err, "unknown-job")
+					} else {
+						require.NoError(t, err)
+					}
+				}
+				reconcile() // Recover both comments, not just the delivered one.
+				_, state := f.gate(t)
+				require.Zero(t, state.ManualRequestID)
+				require.Zero(t, state.ForceRequestID)
+				require.Nil(t, state.Dispatch)
+				require.True(t, state.Command.Rejected)
+				require.True(t, state.Command.Applied)
+				require.Equal(t, 600, state.LastCommandID)
+				require.Len(t, f.gh.comments, comments, "each command should get one rejection")
+				for _, reply := range f.gh.comments[comments-2:] {
+					require.Contains(t, reply.Body, "test selection is not ready")
+					require.Contains(t, reply.Body, "This request is not queued.")
+				}
+				reconcile()
+				require.Len(t, f.gh.comments, comments, "duplicate delivery repeated the rejection")
+				require.NoError(t, f.a.closeStore())
+				f.plan(t, "job-a")
+				f.passFirstStage(t)
+				f.reconcile(t, request)
+				require.Zero(t, f.jobs.creates, "rejected command dispatched after selection/restart")
+				f.reconcile(t, f.command(700, command))
+				require.Equal(t, 1, f.jobs.creates, "fresh command after selection was rejected")
+			})
+		}
+	}
+}
+
+func TestAgenticRejectionSurvivesLostCommentResponse(t *testing.T) {
+	f := newAgenticFixture(t, "manual")
 	f.reconcile(t, nil)
-	f.now = f.now.Add(2 * time.Hour)
-	f.reconcile(t, nil)
+	request := f.command(500, "required")
+	f.gh.failCommentAfterWrite = true
+	require.Error(t, f.tryReconcile(request))
 	_, state := f.gate(t)
-	if state.WaitingSince != nil || state.Plan != nil || f.jobs.creates != 0 {
-		t.Fatal("timeout ran while waiting for LGTM")
-	}
-	f.gh.pr.Labels = []github.Label{{Name: "lgtm"}}
-	f.reconcile(t, nil)
-	_, state = f.gate(t)
-	if state.WaitingSince == nil || !state.WaitingSince.Equal(f.now) {
-		t.Fatal("timeout did not start when all other prerequisites held")
-	}
-	f.now = f.now.Add(defaultAgenticTimeout)
-	f.reconcile(t, nil)
-	_, state = f.gate(t)
-	if state.Plan.Source != "timeout" || len(state.Plan.Jobs) != 2 || f.jobs.creates != 2 || hasAgenticLabel(&f.gh.pr, agenticSkipLabel) {
-		t.Fatalf("timeout did not select normal jobs without permanent opt-out: %+v", state)
-	}
-	f.plan(t)
-	f.reconcile(t, nil)
-	_, state = f.gate(t)
-	if state.Plan.Source != "timeout" || len(state.Plan.Jobs) != 2 {
-		t.Fatal("late Chai plan replaced a timeout decision")
+	require.True(t, state.Command.Rejected, "rejection must be saved before replying")
+	require.Zero(t, state.ManualRequestID)
+	comments := len(f.gh.comments)
+	require.NoError(t, f.a.closeStore())
+	f.plan(t, "job-a")
+	f.passFirstStage(t)
+	f.reconcile(t, request)
+	require.Len(t, f.gh.comments, comments+1, "retry duplicated the rejection reply")
+	require.Zero(t, f.jobs.creates, "reply recovery turned a rejection into a dispatch")
+	f.reconcile(t, f.command(600, "required"))
+	require.Equal(t, 1, f.jobs.creates)
+}
+
+func TestAgenticTimeoutSelectsBeforeCIAndTriggerAndIgnoresLatePlans(t *testing.T) {
+	for _, mode := range []string{"auto", "manual", "lgtm"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newAgenticFixture(t, mode)
+			f.reconcile(t, nil)
+			_, state := f.gate(t)
+			require.Equal(t, state.ObservedAt, *state.WaitingSince)
+			started := *state.WaitingSince
+			f.now = f.now.Add(defaultAgenticTimeout - time.Second)
+			f.reconcile(t, nil)
+			_, state = f.gate(t)
+			require.Nil(t, state.Plan, "selected fallback before the revision deadline")
+			require.Equal(t, started, *state.WaitingSince)
+			f.now = f.now.Add(time.Second)
+			f.reconcile(t, nil)
+			_, state = f.gate(t)
+			require.Equal(t, "timeout", state.Plan.Source)
+			require.Len(t, state.Plan.Jobs, 2)
+			require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+			require.Zero(t, f.jobs.creates, "selection bypassed first-stage success")
+			f.plan(t)
+			f.reconcile(t, nil)
+			_, state = f.gate(t)
+			require.Equal(t, "timeout", state.Plan.Source, "late Chai plan replaced fallback")
+			f.passFirstStage(t)
+			f.reconcile(t, nil)
+			if mode != "auto" {
+				require.Zero(t, f.jobs.creates, "selection bypassed the dispatch trigger")
+			}
+			switch mode {
+			case "manual":
+				f.reconcile(t, f.command(500, "remaining"))
+			case "lgtm":
+				f.gh.pr.Labels = []github.Label{{Name: "lgtm"}}
+				f.reconcile(t, nil)
+			}
+			require.Equal(t, 2, f.jobs.creates)
+		})
 	}
 }
 
@@ -589,6 +677,8 @@ func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
 	body := formatAgenticPlan(agenticPlan{HeadSHA: f.gh.pr.Head.SHA, BaseBranch: "main", Jobs: []string{"job-b"}, Rationale: "Refreshed selection.", RequestID: state.Review.RequestID})
 	f.gh.comments = append(f.gh.comments, github.IssueComment{ID: 2000, Body: body, User: github.User{Login: "chai[bot]"}, CreatedAt: f.now})
 	f.reconcile(t, nil)
+	require.Zero(t, f.jobs.creates, "rejected pre-selection command authorized dispatch")
+	f.reconcile(t, f.command(2001, "remaining"))
 	if f.jobs.creates != 1 || f.allJobs(t)[0].Spec.Job != "job-b" {
 		t.Fatal("correlated reply was not dispatched")
 	}
@@ -614,7 +704,7 @@ func TestAgenticFirstStageNewerRunWinsOverOldSuccess(t *testing.T) {
 	require.Empty(t, state.FirstStage)
 }
 
-func TestAgenticFirstStageStartsTimeoutWithoutGitHubReports(t *testing.T) {
+func TestAgenticFirstStageReadinessNeedsNoGitHubReports(t *testing.T) {
 	for _, scenario := range []string{"override URL differs", "no report"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")

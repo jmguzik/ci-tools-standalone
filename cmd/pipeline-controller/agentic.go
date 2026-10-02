@@ -44,8 +44,9 @@ type agenticSelection struct {
 }
 
 type agenticCommand struct {
-	Command string `json:"command"`
-	Applied bool   `json:"applied,omitempty"`
+	Command  string `json:"command"`
+	Applied  bool   `json:"applied,omitempty"`
+	Rejected bool   `json:"rejected,omitempty"`
 }
 
 type agenticExecution struct {
@@ -495,7 +496,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		if err := a.explainUnboundCommand(state, *comment, comments); err != nil {
 			return err
 		}
-		if err := a.recordCommand(gate, state, *comment); err != nil {
+		if err := a.recordCommand(gate, state, pr, *comment, comments); err != nil {
 			return err
 		}
 	}
@@ -503,18 +504,10 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		return a.failState(gate, state, err)
 	}
 	static := a.config().GetPresubmitsStatic(org + "/" + repo)
-	var invalidPlan error
-	if !state.Frozen {
-		if hasAgenticLabel(pr, agenticSkipLabel) {
-			if state.Plan == nil || state.Plan.Source != "opt-out" {
-				jobs, err := normalAgenticSelection(static, pr, a.gh, org, repo)
-				if err != nil {
-					return a.failState(gate, state, err)
-				}
-				state.Plan = &agenticSelection{Source: "opt-out", Jobs: jobs, Rationale: "Normal selection requested by pipeline-skip-agent-review."}
-			}
-		} else if state.Plan == nil || state.Plan.Source == "chai" {
-			invalidPlan = a.readPlan(state, static, comments)
+	invalidPlan := a.refreshPlan(state, pr, comments)
+	if invalidPlan != nil {
+		if _, pending := invalidPlan.(agenticPlanPendingError); !pending {
+			return a.failState(gate, state, invalidPlan)
 		}
 	}
 	var pjs v1.ProwJobList
@@ -528,16 +521,10 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		state.FirstStage = map[string]firstStageSuccessWitness{}
 	}
 	ready := agenticFirstStageReady(static, latest, state.FirstStage, pr.Base.Ref)
-	authorized := agenticAuthorized(cfg, state, pr)
-	if pr.Draft || (pr.Mergable != nil && !*pr.Mergable) || !ready || !authorized {
-		state.WaitingSince = nil
-		state.PendingDispatch = false
-		return a.saveState(gate, state, "", "Waiting for first-stage success and the configured trigger.")
-	}
 	if state.Plan == nil || invalidPlan != nil {
 		if state.WaitingSince == nil {
-			now := a.currentTime()
-			state.WaitingSince = &now
+			started := state.ObservedAt
+			state.WaitingSince = &started
 		}
 		if a.currentTime().Sub(*state.WaitingSince) >= a.options.timeout {
 			jobs, err := normalAgenticSelection(static, pr, a.gh, org, repo)
@@ -545,6 +532,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 				return a.failState(gate, state, err)
 			}
 			state.Plan = &agenticSelection{Source: "timeout", Jobs: jobs, Rationale: "Chai timed out; normal selection is locked for this HEAD/base."}
+			state.WaitingSince = nil
 			// Persist the fallback decision before doing anything that can create
 			// executions. Late replies cannot change it, even after a restart.
 			if err := a.saveState(gate, state, "", "Chai timed out; preparing normal selection."); err != nil {
@@ -557,10 +545,20 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 				if err := a.saveState(gate, state, "failure", invalidPlan.Error()); err != nil {
 					return err // Transient persistence failures still need recovery.
 				}
-				return agenticPlanPendingError{invalidPlan}
+				return invalidPlan
 			}
 			return a.saveState(gate, state, "", "Waiting for Chai's selected jobs (bounded by the configured timeout).")
 		}
+	} else {
+		state.WaitingSince = nil
+	}
+	if pr.Draft || (pr.Mergable != nil && !*pr.Mergable) || !ready {
+		state.PendingDispatch = false
+		return a.saveState(gate, state, "", "Waiting for first-stage success and the configured trigger.")
+	}
+	if !agenticAuthorized(cfg, state, pr) {
+		state.PendingDispatch = false
+		return a.saveState(gate, state, "", "Test selection is ready; waiting for the configured trigger.")
 	}
 	// GitHub reports are needed only for the selected second-stage executions.
 	var statuses *github.CombinedStatus
@@ -606,7 +604,30 @@ func agenticAuthorized(cfg RepoConfig, state *agenticState, pr *github.PullReque
 	return cfg.Trigger == "auto" || (cfg.Trigger == "lgtm" && (hasAgenticLabel(pr, "lgtm") || hasAgenticLabel(pr, PipelineAutoLabel))) || state.ManualRequestID > 0
 }
 
+func (a *agenticController) refreshPlan(state *agenticState, pr *github.PullRequest, comments []github.IssueComment) error {
+	if state.Frozen {
+		return nil
+	}
+	static := a.config().GetPresubmitsStatic(state.Org + "/" + state.Repo)
+	if hasAgenticLabel(pr, agenticSkipLabel) {
+		if state.Plan == nil || state.Plan.Source != "opt-out" {
+			jobs, err := normalAgenticSelection(static, pr, a.gh, state.Org, state.Repo)
+			if err != nil {
+				return err
+			}
+			state.Plan = &agenticSelection{Source: "opt-out", Jobs: jobs, Rationale: "Normal selection requested by pipeline-skip-agent-review."}
+		}
+	} else if state.Plan == nil || state.Plan.Source == "chai" {
+		if err := a.readPlan(state, static, comments); err != nil {
+			state.Plan = nil // A newer invalid plan must not authorize an older selection.
+			return agenticPlanPendingError{err}
+		}
+	}
+	return nil
+}
+
 func (a *agenticController) readPlan(state *agenticState, static []config.Presubmit, comments []github.IssueComment) error {
+	comments = slices.Clone(comments) // Command recovery iterates the original in ascending order.
 	sort.Slice(comments, func(i, j int) bool { return comments[i].ID > comments[j].ID })
 	for _, comment := range comments {
 		if !trustedAgenticAuthor(a.options.trustedAuthors.Strings(), comment.User) || !isAgenticPlanComment(comment.Body) {
