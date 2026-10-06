@@ -98,11 +98,14 @@ func TestAgenticCommentEventReadsVisibleList(t *testing.T) {
 	f.gh.comments[len(f.gh.comments)-1] = comment
 	event := github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: f.gh.pr.Base.Repo,
 		Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: comment}
+	f.a.startQueue(t.Context())
+	t.Cleanup(f.a.queue.ShutDown)
 	for range 2 {
 		if !f.a.handleIssueComment(f.a.logger, event) {
 			t.Fatal("visible plan fell through to legacy comment handling")
 		}
 	}
+	f.a.processNext(t.Context())
 	if f.jobs.creates != 1 || f.allJobs(t)[0].Spec.Job != "job-a" {
 		t.Fatal("plain list without JSON/reason was not dispatched idempotently")
 	}
@@ -131,7 +134,7 @@ func TestAgenticDelayedCommentCannotUseCurrentPRMetadata(t *testing.T) {
 			event := github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: f.gh.pr.Base.Repo,
 				Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: comment}
 			f.a.handleIssueComment(f.a.logger, event)
-			f.reconcile(t, nil) // Rescanning on restart must reach the same decision.
+			f.reconcile(t, nil) // A later reconciliation must reach the same decision.
 			_, state := f.gate(t)
 			if state.Plan != nil || f.jobs.creates != 0 {
 				t.Fatal("delayed plan was incorrectly bound to the current PR")

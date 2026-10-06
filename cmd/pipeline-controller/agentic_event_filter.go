@@ -37,8 +37,7 @@ func (r *reconciler) shouldReconcileProwJobUpdate(update event.UpdateEvent) bool
 	}
 	if !reflect.DeepEqual(old.Spec, current.Spec) || old.Name != current.Name || old.Namespace != current.Namespace ||
 		old.UID != current.UID || !old.CreationTimestamp.Equal(&current.CreationTimestamp) ||
-		old.Status.State != current.Status.State || old.Status.URL != current.Status.URL ||
-		old.Status.PrevReportStates["github-reporter"] != current.Status.PrevReportStates["github-reporter"] {
+		old.Status.State != current.Status.State {
 		return true
 	}
 	for _, label := range []string{kube.OrgLabel, kube.RepoLabel, kube.PullLabel, kube.ProwJobTypeLabel} {

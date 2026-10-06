@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	"sigs.k8s.io/prow/pkg/github"
@@ -41,26 +40,10 @@ func (a *agenticController) invalidateDeparture(org, repo string, pr *github.Pul
 		state.Inactive, state.RevisionPending = true, false
 		return a.writeRecord(context.Background(), &agenticRecord{State: state})
 	}
-	if r.State.Inactive && r.Desired == nil {
+	if r.State.Inactive && !r.Dirty {
 		return nil
 	}
-	r.State.Inactive, r.State.PendingDispatch, r.Wakeup = true, false, nil
-	gate := r.Gate
+	r.State.Inactive, r.State.PendingDispatch, r.State.WaitingSince = true, false, nil
+	gate := r.Gate.checkRun(a.appID)
 	return a.saveState(&gate, r.State, "failure", "PR left agentic enrollment; returning requires a fresh selection and authorization.")
-}
-
-func (a *agenticController) recoverCommands(gate *github.CheckRun, state *agenticState, cfg RepoConfig, pr *github.PullRequest, comments []github.IssueComment) error {
-	sort.Slice(comments, func(i, j int) bool { return comments[i].ID < comments[j].ID })
-	for _, comment := range comments {
-		if comment.ID <= state.LastCommandID || comment.CreatedAt.Before(state.ObservedAt) || comment.CreatedAt.IsZero() || comment.UpdatedAt.After(comment.CreatedAt) {
-			continue
-		}
-		if err := a.recordCommand(gate, state, pr, comment, comments); err != nil {
-			return err
-		}
-		if err := a.applyCommand(gate, state, cfg, pr, comments); err != nil {
-			return err
-		}
-	}
-	return nil
 }

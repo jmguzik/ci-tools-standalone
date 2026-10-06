@@ -13,6 +13,10 @@ import (
 
 var agenticCommandRE = regexp.MustCompile(`(?im)^/pipeline[\t ]+(required|remaining|auto|agent-review|skip-agent-review)[\t ]*$`)
 
+// Preserve ordinary-mode command prefixes while filtering unrelated comments
+// before any GitHub read, including in mixed-mode repositories.
+var pipelineCommentRE = regexp.MustCompile(`(?im)^/pipeline\s+(required|remaining|auto|agent-review|skip-agent-review)`)
+
 func validAgenticCommand(command string) bool {
 	switch command {
 	case "required", "remaining", "auto", "agent-review", "skip-agent-review":
@@ -155,8 +159,11 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 					pr.Labels = labels
 				}
 				state.Plan = nil
-				now := a.currentTime()
-				state.WaitingSince = &now
+				state.WaitingSince = nil
+				if state.ActivatedAt != nil {
+					now := a.currentTime()
+					state.WaitingSince = &now
+				}
 				state.Review = &agenticReviewRequest{HeadSHA: state.HeadSHA, BaseBranch: state.BaseBranch,
 					RequestID: agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, strconv.Itoa(state.LastCommandID))}
 				state.ReviewPosted = false
@@ -168,7 +175,7 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 			return err
 		}
 	}
-	if state.Review != nil && !state.ReviewPosted {
+	if state.Review != nil && !state.ReviewPosted && state.ActivatedAt != nil {
 		if err := a.ensureComment(state, comments, formatAgenticReview(*state.Review)); err != nil {
 			return err
 		}
@@ -182,17 +189,33 @@ func (a *agenticController) handleIssueComment(logger *logrus.Entry, event githu
 	if !event.Issue.IsPullRequest() || a == nil || !a.hasRepo(event.Repo.Owner.Login, event.Repo.Name) {
 		return false
 	}
+	if !isAgenticPlanComment(event.Comment.Body) && !pipelineCommentRE.MatchString(event.Comment.Body) {
+		return true
+	}
+	a.queueMu.Lock()
+	shutdown := a.queue != nil && a.queue.ShuttingDown()
+	cooldown := a.retryAt[agenticWork{org: event.Repo.Owner.Login, repo: event.Repo.Name, number: event.Issue.Number}].After(a.currentTime())
+	a.queueMu.Unlock()
+	if shutdown {
+		return true
+	}
 	var command *github.IssueComment
 	if event.Action == github.IssueCommentActionCreated {
 		command = &event.Comment
 	}
-	if a.deferCommentRouting(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command) {
-		return true
+	if cooldown {
+		a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command)
+		return true // The worker honors the cooldown and rereads live PR metadata.
 	}
 	pr, err := a.gh.GetPullRequest(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number)
 	if err != nil {
 		logger.WithError(err).Error("Cannot determine agentic configuration")
-		a.retryReconciliation(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command, err)
+		if retry := agenticRetryFor(err); retry.after > 0 {
+			a.queueMu.Lock()
+			a.rememberCooldownLocked(agenticWork{org: event.Repo.Owner.Login, repo: event.Repo.Name, number: event.Issue.Number}, retry.after)
+			a.queueMu.Unlock()
+		}
+		a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command)
 		return true // fail closed instead of falling through to /test dispatch
 	}
 	if _, enabled := a.repoConfig(event.Repo.Owner.Login, event.Repo.Name, pr.Base.Ref); !enabled {
@@ -204,19 +227,15 @@ func (a *agenticController) handleIssueComment(logger *logrus.Entry, event githu
 	if !isAgenticPlanComment(event.Comment.Body) && !agenticCommandRE.MatchString(event.Comment.Body) {
 		return true
 	}
-	if err := a.reconcile(context.Background(), event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command); err != nil {
-		logger.WithError(err).Error("Agentic comment reconciliation failed")
-	}
+	a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, command)
 	return true
 }
 
-func (a *agenticController) handlePullRequest(logger *logrus.Entry, event github.PullRequestEvent) {
+func (a *agenticController) handlePullRequest(_ *logrus.Entry, event github.PullRequestEvent) {
 	if !a.hasRepo(event.Repo.Owner.Login, event.Repo.Name) {
 		return
 	}
-	if err := a.reconcile(context.Background(), event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, nil); err != nil {
-		logger.WithError(err).Error("Agentic pull request reconciliation failed")
-	}
+	a.enqueue(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, nil)
 }
 
 func (a *agenticController) hasRepo(org, repo string) bool {
@@ -279,21 +298,6 @@ func (cw *clientWrapper) allowPullRequestSnapshot(logger *logrus.Entry, event gi
 	return allowed && err == nil
 }
 
-func (a *agenticController) reconcileRepo(ctx context.Context, org, repo, sha string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.reconcileWork(ctx, agenticWork{org: org, repo: repo, sha: sha}, nil, 0); err != nil {
-		a.logger.WithError(err).WithField("repo", org+"/"+repo).Error("Cannot recover agentic pull requests")
-	}
-}
-
-func (a *agenticController) handleStatus(_ *logrus.Entry, event github.StatusEvent) {
-	if !a.shouldHandleAgenticStatus(event) {
-		return
-	}
-	a.reconcileRepo(context.Background(), event.Repo.Owner.Login, event.Repo.Name, event.SHA)
-}
-
 // Restart restores local deadlines and explicitly unfinished actions only.
 // Missed events are accepted; there is no startup or periodic GitHub sweep.
 func (a *agenticController) Run(ctx context.Context) error {
@@ -303,17 +307,21 @@ func (a *agenticController) Run(ctx context.Context) error {
 	if err := a.prepareStore(); err != nil {
 		return fmt.Errorf("opening agentic state: %w", err)
 	}
-	a.startScheduling(ctx)
+	a.startQueue(ctx)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			a.queue.ShutDown()
+		case <-done:
+		}
+	}()
 	defer func() {
+		close(done)
+		a.queue.ShutDown()
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		a.stopped = true
-		if a.scheduler != nil {
-			for _, pending := range a.scheduler.pending {
-				pending.timer.Stop()
-			}
-			a.scheduler = nil
-		}
 		if err := a.closeStoreLocked(); err != nil {
 			a.logger.WithError(err).Error("Cannot close agentic state directory")
 		}
@@ -321,24 +329,20 @@ func (a *agenticController) Run(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return nil
 	}
-	if !a.hasAgenticEnrollment() || a.dryRun {
-		<-ctx.Done()
-		return nil
-	}
 	if err := a.restoreRecords(ctx); err != nil {
 		return fmt.Errorf("restoring agentic records: %w", err)
 	}
-	<-ctx.Done()
+	for a.processNext(ctx) {
+	}
 	return nil
 }
 
 // Reevaluate already tracked PRs on explicit configuration changes, without
-// discovering new PRs or scanning GitHub repositories. Release mu between PRs
-// so the batch does not prevent webhook, timer, or shutdown work from running.
+// discovering new PRs or scanning GitHub repositories.
 func (a *agenticController) configurationChanged() {
 	a.mu.Lock()
-	s := a.scheduler
-	if a.stopped || a.dryRun || s == nil || s.ctx.Err() != nil || (!a.hasAgenticEnrollment() && len(a.statusContexts) == 0) {
+	ctx := a.queueCtx
+	if a.stopped || a.dryRun || ctx == nil || ctx.Err() != nil {
 		a.mu.Unlock()
 		return
 	}
@@ -355,22 +359,19 @@ func (a *agenticController) configurationChanged() {
 	a.mu.Unlock()
 	for _, name := range names {
 		a.mu.Lock()
-		if a.stopped || a.scheduler != s || s.ctx.Err() != nil {
+		if a.stopped || ctx.Err() != nil {
 			a.mu.Unlock()
 			return
 		}
-		r, err := a.readStoredRecord(s.ctx, name)
+		r, err := a.readStoredRecord(ctx, name)
 		if err != nil {
 			a.mu.Unlock()
 			a.logger.WithError(err).Error("Cannot reload tracked agentic PR")
 			return
 		}
 		if r != nil {
-			err = a.reconcileWork(s.ctx, agenticWork{org: r.State.Org, repo: r.State.Repo, number: r.State.Number}, nil, 0)
+			a.enqueue(r.State.Org, r.State.Repo, r.State.Number, nil)
 		}
 		a.mu.Unlock()
-		if err != nil {
-			a.logger.WithError(err).Error("Cannot reevaluate tracked agentic PR")
-		}
 	}
 }

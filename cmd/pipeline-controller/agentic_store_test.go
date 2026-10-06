@@ -70,7 +70,7 @@ func TestAgenticLostCheckCreationResponseDoesNotDuplicateGate(t *testing.T) {
 	require.Equal(t, 1, f.jobs.creates)
 }
 
-func TestAgenticMalformedRecordPreservedAndRoutingIsIndexed(t *testing.T) {
+func TestAgenticMalformedRecordPreservedAndRoutingIsScoped(t *testing.T) {
 	f := newAgenticFixture(t, "auto")
 	f.reconcile(t, nil)
 	healthySHA := f.gh.pr.Head.SHA
@@ -131,23 +131,20 @@ func TestAgenticStoreUpdatesHeadAndDeletionRouting(t *testing.T) {
 					// The shared SHA stays routed until its remaining PR is deleted.
 					require.Len(t, records, 1)
 					require.Equal(t, 43, records[0].State.Number)
-					require.True(t, f.a.statusContexts[old]["ci/first"], "changing one PR hid another PR's reports")
 					require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 43))
 					records, err = f.a.listRecords(context.Background(), old)
 					require.NoError(t, err)
 				}
-				// On the second push, the head change itself must prune orphaned interests.
+				// After the head changes, the old SHA must no longer match.
 				require.Empty(t, records)
-				require.NotContains(t, f.a.statusContexts, old)
 				records, err = f.a.listRecords(context.Background(), agenticWork{org: "org", repo: "repo", sha: sha})
 				require.NoError(t, err)
 				require.Len(t, records, 1)
-				require.Len(t, f.a.store.routes, 1, "only the current SHA should remain indexed")
-				require.Len(t, f.a.statusContexts, 1)
+				require.Len(t, f.a.store.entries, 1)
 			}
 			if cleanup == "ttl" {
 				f.a.options.stateTTL = time.Hour
-				ageAgenticRecord(t, f, 42, f.now.Add(-time.Hour))
+				ageAgenticRecord(t, f, f.now.Add(-time.Hour))
 				require.NoError(t, f.a.expireRecordsLocked(context.Background()))
 			} else {
 				other := f.gh.pr
@@ -164,8 +161,6 @@ func TestAgenticStoreUpdatesHeadAndDeletionRouting(t *testing.T) {
 				require.NoError(t, f.a.deleteRecord(context.Background(), "org", "repo", 43))
 			}
 			require.Empty(t, f.a.store.entries)
-			require.Empty(t, f.a.store.routes)
-			require.Empty(t, f.a.statusContexts)
 		})
 	}
 }

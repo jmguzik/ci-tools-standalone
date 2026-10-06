@@ -19,7 +19,7 @@ func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
 			f.passFirstStage(t)
 			if action == "first-success" {
 				f.reconcile(t, nil)
-				f.report(t, v1.PendingState)
+				f.report(t, v1.SuccessState)
 			}
 			created := f.jobs.creates
 			f.gh.getPullRequestsCalls = 0
@@ -50,7 +50,7 @@ func TestAgenticStableEventDoesNotListRepositoryPulls(t *testing.T) {
 			f := newReadyAgenticFixture(t, "auto", "job-a")
 			f.reconcile(t, nil)
 			if reported {
-				f.report(t, v1.PendingState)
+				f.report(t, v1.SuccessState)
 				f.reconcile(t, nil)
 			}
 			f.gh.getPullRequestsCalls = 0

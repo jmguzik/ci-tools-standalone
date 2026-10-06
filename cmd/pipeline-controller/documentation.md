@@ -219,7 +219,9 @@ Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable),
 `--agentic-state-dir=/var/lib/pipeline-controller` (required outside dry run),
 and `--agentic-timeout=20m` (default); no repository-level trust/timeout.
 
-On PR creation/new commits, Chai posts its selected second-stage jobs without waiting for CI/LGTM:
+No check is created before readiness. Once at least half of applicable required
+first-stage jobs pass (rounded up), with no failures, the controller creates
+`ci/tests-dispatched` as `in_progress`. Chai reacts to `check_run.created` and posts:
 
 ```markdown
 Chai test plan for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`
@@ -238,26 +240,40 @@ Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
 ```
 
 Both paths use the latest matching ProwJobs for first-stage success, including `/override`.
-Dispatch waits for that success and the existing trigger. The timeout starts when
-the controller first observes the PR revision, independently of CI or the trigger, and falls back to normal selection. Late plans
+Dispatch waits for all first-stage jobs and the existing trigger. The timeout
+starts at the readiness threshold and falls back to normal selection. Late plans
 cannot replace fallback or a dispatched selection; push a new commit to change it.
 
 - `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs. Before a valid selection exists, they are rejected with a comment, not queued; post the command again after Chai or timeout selects the jobs.
 - `/pipeline agent-review` requests a fresh plan with a new timeout and clears opt-out before dispatch; use it after a same-SHA base retarget.
 - `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
 
-`ci/tests-dispatched` means selected executions reported their contexts, not tests passed.
-Both modes post `/test` comments; Hook creates the ProwJobs. Agentic mode saves the comment request before posting and deduplicates retries against controller-authored comments. Posting alone never opens the gate. `/pipeline required` excludes existing runs; fresh matching runs, including manual runs, can satisfy the request. Hook processes comments asynchronously: a push can race dispatch, and a missed Hook event needs another manual command. Restart does not repost a successfully handed-off request.
-Recovery state lives in one JSON file per PR on a PVC; GitHub shows only the gate. Normal branches in mixed-mode repos may also have inactive records. New revisions reset state; observed PR closure deletes the file. Malformed state is preserved and blocks startup; repair or restore it.
+`ci/tests-dispatched` succeeds only when all first-stage and selected second-stage
+jobs pass. Results come from the shared ProwJob cache, not GitHub statuses or
+reporter acknowledgments. Same-second runs are treated conservatively: a tied
+pending or failing run blocks success. Both modes post `/test` comments; Hook creates jobs.
+Requests are saved before posting and retries deduplicate controller-authored
+comments. Posting alone never opens the gate. Forced reruns exclude existing
+runs and reopen the same check before dispatch; a missing Hook event needs a
+new manual command. A new SHA starts a new decision/check; old results do not count.
+
+One compact JSON record per PR on the existing PVC stores intent, gate identity
+and success witnesses for jobs Sinker removes—not GitHub status history or retry
+timers. New revisions reset it; observed closure deletes it. Malformed state
+blocks startup and is preserved for repair.
+The record schema is now version 2. If upgrading an older agentic deployment,
+use a fresh state directory (retain the old one) and fresh PR heads.
 Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
 Enabling TTL permanently requires a fresh post-tracking plan when local state is missing, even if TTL is later disabled. Tracked PRs still accept early plans for new commits.
-Restart restores known deadlines and unfinished actions from disk, without scanning GitHub or replaying existing jobs. There is no polling or missed-event catch-up; a missed event may require another event or manual command.
+The standard PR-keyed workqueue restores only selection deadlines and unfinished
+actions. No GitHub scan, initial-job replay or polling; missed events may require
+another event or manual command. Operational retries honor server cooldowns.
 Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
 
 Before enrolling:
 
-- Configure Chai's authenticated PR/comment delivery and matching identities; forward `status`, `pull_request` and `issue_comment` to the controller.
-- Grant App Checks read/write, PR/comment/label access, status/member reads; Kubernetes ProwJob `get/list/watch` in the ProwJob namespace. Use distinct HEADs.
+- Configure Chai's authenticated **Check runs** and **Issue comments** webhook delivery and matching identities; forward `pull_request` and `issue_comment` to the controller. GitHub emits no queued-to-in-progress webhook, so creation is the wake-up.
+- Grant App Checks read/write, PR/comment/label/member access; Kubernetes ProwJob `get/list/watch`. Keep permissions needed by ordinary mode. Use distinct HEADs.
 - Mount a durable, writable PVC supporting file locks, atomic rename and `fsync` at `--agentic-state-dir`; deploy one replica with `Recreate`. An exclusive file lock rejects a second writer. Back up the volume; do not prune open-PR state. Normal-only enrollment and dry run need no storage.
 - Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
 - Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.

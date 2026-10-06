@@ -150,7 +150,10 @@ func TestAgenticCommentRetargetBetweenRoutingReads(t *testing.T) {
 		}
 	}
 	event := github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}},
-		Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: github.IssueComment{Body: "/pipeline required"}}
+		Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: github.IssueComment{Body: "Unrelated discussion."}}
+	cw.handleIssueComment(f.a.logger, event)
+	require.Zero(t, f.gh.getPullRequestCalls)
+	event.Comment.Body = "/pipeline required extra text" // Ordinary mode accepts command prefixes.
 	cw.handleIssueComment(f.a.logger, event)
 	if f.gh.getPullRequestCalls != 2 || len(f.gh.comments) != 0 || f.gh.statusWrites != 0 {
 		t.Fatal("retarget between routing lookups fell through to legacy dispatch")
@@ -160,8 +163,11 @@ func TestAgenticCommentRetargetBetweenRoutingReads(t *testing.T) {
 func TestAgenticStaleNormalEventReconcilesCurrentAgenticRevision(t *testing.T) {
 	f, _ := mixedAgenticFixture(t)
 	f.a.handlePullRequest(f.a.logger, staleNormalEvent(f))
+	f.a.startQueue(t.Context())
+	t.Cleanup(f.a.queue.ShutDown)
+	f.a.processNext(t.Context())
 	gate, state := f.gate(t)
-	if gate.ID == 0 || state.BaseBranch != "main" || f.gh.statusWrites != 0 {
+	if gate.ID != 0 || state.BaseBranch != "main" || state.RevisionPending || f.gh.statusWrites != 0 {
 		t.Fatal("stale event did not reconcile the live agentic revision safely")
 	}
 }
@@ -199,32 +205,6 @@ func TestAgenticCommandAuthorization(t *testing.T) {
 				}
 			} else if state.ManualRequestID != 500 || f.jobs.creates != 1 {
 				t.Fatal("trusted command did not authorize dispatch")
-			}
-		})
-	}
-}
-
-func TestAgenticExecutionRequiresActualMatchingReport(t *testing.T) {
-	for _, tc := range []struct {
-		name, reportURL, context, targetURL, state string
-		ack, want                                  bool
-	}{
-		{name: "ack-without-status", reportURL: "https://prow/run/2", ack: true},
-		{name: "status-without-ack", reportURL: "https://prow/run/2", context: "ci/test", targetURL: "https://prow/run/2", state: "success"},
-		{name: "wrong-context", reportURL: "https://prow/run/2", ack: true, context: "ci/other", targetURL: "https://prow/run/2", state: "success"},
-		{name: "older-run", reportURL: "https://prow/run/2", ack: true, context: "ci/test", targetURL: "https://prow/run/1", state: "success"},
-		{name: "missing-url", ack: true, context: "ci/test", state: "success"},
-		{name: "own-pending", reportURL: "https://prow/run/2", ack: true, context: "ci/test", targetURL: "https://prow/run/2", state: "pending", want: true},
-		{name: "own-failure", reportURL: "https://prow/run/2", ack: true, context: "ci/test", targetURL: "https://prow/run/2", state: "failure", want: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Context: "ci/test"}, Status: v1.ProwJobStatus{URL: tc.reportURL}}
-			if tc.ack {
-				pj.Status.PrevReportStates = map[string]v1.ProwJobState{"github-reporter": v1.PendingState}
-			}
-			statuses := &github.CombinedStatus{Statuses: []github.Status{{Context: tc.context, TargetURL: tc.targetURL, State: tc.state}}}
-			if got := agenticExecutionReported(pj, statuses); got != tc.want {
-				t.Fatalf("reported=%v, want %v", got, tc.want)
 			}
 		})
 	}

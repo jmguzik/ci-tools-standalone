@@ -21,15 +21,6 @@ import (
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-func TestAgenticBackoffSaturates(t *testing.T) {
-	if got := nextAgenticBackoff(time.Duration(1<<63 - 1)); got != agenticMaxBackoff {
-		t.Fatalf("oversized backoff overflowed: %v", got)
-	}
-	if got := nextAgenticBackoff(-time.Second); got != agenticInitialBackoff {
-		t.Fatalf("negative starting backoff produced %v", got)
-	}
-}
-
 func TestAgenticRetryClassification(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -158,6 +149,7 @@ func TestAgenticFailureReporting(t *testing.T) {
 		} {
 			t.Run(fmt.Sprintf("existing=%v/%s", existing, tc.name), func(t *testing.T) {
 				f := newAgenticFixture(t, "manual")
+				f.passFirstStage(t)
 				f.reconcile(t, nil)
 				gate, state := f.gate(t)
 				attempts := f.gh.checkAttempts

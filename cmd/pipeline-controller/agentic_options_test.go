@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"io"
 	"os"
@@ -119,13 +118,13 @@ func TestAgenticMissingGlobalTrustFailsClosed(t *testing.T) {
 		f.plan(t, "job-a")
 		f.passFirstStage(t)
 		for range 2 {
-			if err := f.a.reconcile(context.Background(), "org", "repo", 42, nil); err == nil {
+			if err := f.tryReconcile(nil); err == nil {
 				t.Fatal("enrolled repository accepted missing global trust")
 			}
 			f.now = f.now.Add(defaultAgenticTimeout)
 		}
 		gate, _ := f.gate(t)
-		if gate.Conclusion != "failure" || f.jobs.creates != 0 {
+		if gate.ID != 0 || f.jobs.creates != 0 {
 			t.Fatal("missing trust allowed dispatch or fallback")
 		}
 	}

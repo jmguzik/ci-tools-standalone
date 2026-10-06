@@ -849,7 +849,7 @@ func main() {
 			logger.WithError(err).Fatal("invalid GitHub App ID")
 		}
 	}
-	agentic := &agenticController{gh: githubClient, reader: mgr.GetAPIReader(), config: cfg,
+	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), apiReader: mgr.GetAPIReader(), config: cfg,
 		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
 	if err := agentic.validateEnrollment(); err != nil {
 		logger.WithError(err).Fatal("invalid agentic configuration")
@@ -889,7 +889,6 @@ func main() {
 	eventServer.RegisterHandlePullRequestEvent(cw.handlePipelineContextCreation)
 	eventServer.RegisterHandleIssueCommentEvent(cw.handleIssueComment)
 	eventServer.RegisterHandlePullRequestEvent(agentic.handlePullRequest)
-	eventServer.RegisterStatusEventHandler(agentic.handleStatus)
 
 	logger.Info("All event handlers registered successfully")
 
@@ -899,6 +898,9 @@ func main() {
 
 	interrupts.ListenAndServe(eventServer, time.Second*30)
 	interrupts.Run(func(ctx context.Context) {
+		if !mgr.GetCache().WaitForCacheSync(ctx) {
+			return
+		}
 		if err := agentic.Run(ctx); err != nil {
 			logger.WithError(err).Error("Cannot start agentic recovery")
 			interrupts.Terminate()

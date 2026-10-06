@@ -89,13 +89,6 @@ func (a *agenticController) expireRecordLocked(ctx context.Context, name string,
 	return true, nil
 }
 
-func (a *agenticController) expireWorkLocked(ctx context.Context, work agenticWork) (bool, error) {
-	if work.number == 0 {
-		return false, nil
-	}
-	return a.expireRecordLocked(ctx, agenticRecordName(work.org, work.repo, work.number)+".json", a.currentTime())
-}
-
 // Iterate the routing index without retaining record payloads or a directory
 // snapshot. Even large stores require at most one decoded candidate at a time.
 func (a *agenticController) expireRecordsLocked(ctx context.Context) error {
@@ -130,19 +123,19 @@ func (a *agenticController) readStoredRecord(ctx context.Context, name string) (
 // One maintenance timer serves the entire controller, using only local file
 // metadata. Normal-only and dry-run controllers never open or clean the store.
 func (a *agenticController) startStateMaintenanceLocked() {
-	s := a.scheduler
-	if a.maintenance != nil || a.store == nil || a.options.stateTTL <= 0 || a.dryRun || !a.hasAgenticEnrollment() || s == nil || s.ctx.Err() != nil {
+	ctx := a.queueCtx
+	if a.maintenance != nil || a.store == nil || a.options.stateTTL <= 0 || a.dryRun || !a.hasAgenticEnrollment() || ctx == nil || ctx.Err() != nil {
 		return
 	}
 	var timer *time.Timer
 	timer = time.AfterFunc(max(min(a.options.stateTTL, time.Hour), time.Minute), func() {
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if a.maintenance != timer || a.scheduler != s || a.stopped || s.ctx.Err() != nil {
+		if a.maintenance != timer || a.stopped || ctx.Err() != nil {
 			return
 		}
 		a.maintenance = nil
-		if err := a.expireRecordsLocked(s.ctx); err != nil {
+		if err := a.expireRecordsLocked(ctx); err != nil {
 			a.logger.WithError(err).Error("Cannot expire local agentic records")
 		}
 		a.startStateMaintenanceLocked()

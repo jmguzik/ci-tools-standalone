@@ -12,32 +12,46 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"sigs.k8s.io/prow/pkg/github"
 )
 
 const agenticRecordLimit = 192 * 1024
+const agenticStateVersion = 2
 
 var agenticRecordFilename = regexp.MustCompile(`^pipeline-agentic-[0-9a-f]{32}\.json$`)
 
-// One authoritative record holds each PR's recovery state.
-// Desired is persisted before publishing the gate; Wakeup uses the existing
-// scheduler rather than introducing a second recovery queue.
+// Keep intent and the last published gate identity, not GitHub projections or
+// retry timers. Job results come from ProwJobs, with compact success witnesses
+// retained for jobs Sinker has already removed.
 type agenticRecord struct {
-	State   *agenticState       `json:"state"`
-	Gate    github.CheckRun     `json:"gate"`
-	Desired *github.CheckRun    `json:"desired,omitempty"`
-	Reopen  bool                `json:"reopen,omitempty"`
-	Wakeup  *agenticSavedWakeup `json:"wakeup,omitempty"`
+	State  *agenticState       `json:"state"`
+	Gate   agenticGateSnapshot `json:"gate"`
+	Dirty  bool                `json:"dirty,omitempty"`
+	Reopen bool                `json:"reopen,omitempty"`
 }
 
-type agenticSavedWakeup struct {
-	At        time.Time            `json:"at"`
-	Deadline  time.Time            `json:"deadline,omitempty"`
-	Backoff   time.Duration        `json:"backoff,omitempty"`
-	NotBefore time.Time            `json:"not_before,omitempty"`
-	Comment   *github.IssueComment `json:"comment,omitempty"`
+type agenticGateSnapshot struct {
+	ID         int64  `json:"id,omitempty"`
+	HeadSHA    string `json:"head_sha,omitempty"`
+	ExternalID string `json:"external_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Conclusion string `json:"conclusion,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+func snapshotAgenticGate(gate github.CheckRun) agenticGateSnapshot {
+	return agenticGateSnapshot{ID: gate.ID, HeadSHA: gate.HeadSHA, ExternalID: gate.ExternalID,
+		Status: gate.Status, Conclusion: gate.Conclusion, Summary: gate.Output.Summary}
+}
+
+func (g agenticGateSnapshot) checkRun(appID int64) github.CheckRun {
+	gate := github.CheckRun{ID: g.ID, HeadSHA: g.HeadSHA, ExternalID: g.ExternalID, Status: g.Status, Conclusion: g.Conclusion,
+		Output: github.CheckRunOutput{Title: "Pipeline", Summary: g.Summary}}
+	if g.ID != 0 {
+		gate.Name, gate.App.ID = agenticGate, appID
+	}
+	return gate
 }
 
 func agenticRecordName(org, repo string, number int) string {
@@ -51,7 +65,6 @@ type agenticStore struct {
 	lock             *os.File
 	directory        *os.File
 	entries          map[string]agenticWork
-	routes           map[agenticWork]map[string]bool
 	fault            error // A failed directory sync leaves durability uncertain until restart.
 	requireFreshPlan bool
 }
@@ -63,7 +76,7 @@ func openAgenticStore(dir string) (_ *agenticStore, err error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	s := &agenticStore{dir: dir, entries: map[string]agenticWork{}, routes: map[agenticWork]map[string]bool{}}
+	s := &agenticStore{dir: dir, entries: map[string]agenticWork{}}
 	defer func() {
 		if err != nil {
 			_ = s.close()
@@ -117,36 +130,13 @@ func (s *agenticStore) close() error {
 }
 
 func (s *agenticStore) index(name string, state *agenticState) {
-	s.unindex(name)
-	work := agenticWork{org: state.Org, repo: state.Repo, number: state.Number, sha: state.HeadSHA}
-	s.entries[name] = work
-	key := agenticWork{org: work.org, repo: work.repo, sha: work.sha}
-	if s.routes[key] == nil {
-		s.routes[key] = map[string]bool{}
-	}
-	s.routes[key][name] = true
-}
-
-func (s *agenticStore) unindex(name string) {
-	if old, ok := s.entries[name]; ok {
-		key := agenticWork{org: old.org, repo: old.repo, sha: old.sha}
-		delete(s.routes[key], name)
-		if len(s.routes[key]) == 0 {
-			delete(s.routes, key)
-		}
-		delete(s.entries, name)
-	}
+	s.entries[name] = agenticWork{org: state.Org, repo: state.Repo, number: state.Number, sha: state.HeadSHA}
 }
 
 func (s *agenticStore) recordNames(work ...agenticWork) []string {
 	var names []string
-	if len(work) == 0 {
-		for name := range s.entries {
-			names = append(names, name)
-		}
-	} else {
-		key := agenticWork{org: work[0].org, repo: work[0].repo, sha: work[0].sha}
-		for name := range s.routes[key] {
+	for name, entry := range s.entries {
+		if len(work) == 0 || (entry.org == work[0].org && entry.repo == work[0].repo && entry.sha == work[0].sha) {
 			names = append(names, name)
 		}
 	}
@@ -196,19 +186,14 @@ func decodeAgenticRecord(name string, data []byte) (*agenticRecord, error) {
 		return nil, fmt.Errorf("invalid agentic record %s: %w", name, err)
 	}
 	s := r.State
-	if s == nil || s.Version != 1 || s.Org == "" || s.Repo == "" || s.Number <= 0 || s.HeadSHA == "" || s.BaseBranch == "" || s.RevisionID == "" || s.ObservedAt.IsZero() || name != agenticRecordName(s.Org, s.Repo, s.Number)+".json" {
+	if s == nil || s.Version != agenticStateVersion || s.Org == "" || s.Repo == "" || s.Number <= 0 || s.HeadSHA == "" || s.BaseBranch == "" || s.RevisionID == "" || s.ObservedAt.IsZero() || name != agenticRecordName(s.Org, s.Repo, s.Number)+".json" {
 		return nil, fmt.Errorf("invalid agentic record identity: %s", name)
 	}
 	if err := validateAgenticState(s); err != nil {
 		return nil, fmt.Errorf("invalid agentic record %s: %w", name, err)
 	}
-	for _, gate := range []*github.CheckRun{&r.Gate, r.Desired} {
-		if gate != nil && (gate.ID < 0 || ((gate.Name != "" || gate.ID != 0) && (gate.Name != agenticGate || gate.HeadSHA != s.HeadSHA || gate.ExternalID != agenticExternalID(s.Org, s.Repo, s.Number)))) {
-			return nil, fmt.Errorf("invalid gate identity in %s", name)
-		}
-	}
-	if r.Wakeup != nil && (r.Wakeup.At.IsZero() || r.Wakeup.Backoff < 0 || r.Wakeup.NotBefore.After(r.Wakeup.At)) {
-		return nil, fmt.Errorf("invalid wakeup in %s", name)
+	if r.Gate.ID < 0 || (r.Gate.ID != 0 && (r.Gate.HeadSHA != s.HeadSHA || r.Gate.ExternalID != agenticExternalID(s.Org, s.Repo, s.Number))) {
+		return nil, fmt.Errorf("invalid gate identity in %s", name)
 	}
 	s.record = &r
 	return &r, nil
@@ -336,14 +321,7 @@ func (a *agenticController) writeRecord(ctx context.Context, r *agenticRecord) e
 		s.fault = fmt.Errorf("syncing agentic state directory: %w", err)
 		return s.fault
 	}
-	previous, known := s.entries[name]
 	s.index(name, r.State)
-	if known {
-		key := agenticWork{org: previous.org, repo: previous.repo, sha: previous.sha}
-		if len(s.routes[key]) == 0 {
-			delete(a.statusContexts, key)
-		}
-	}
 	return nil
 }
 
@@ -394,18 +372,12 @@ func (a *agenticController) deleteStoredRecord(ctx context.Context, name string,
 		a.store.fault = fmt.Errorf("syncing agentic state deletion: %w", err)
 		return a.store.fault
 	}
-	a.store.unindex(name)
+	delete(a.store.entries, name)
 	work := agenticWork{org: r.State.Org, repo: r.State.Repo, number: r.State.Number}
-	if a.scheduler != nil {
-		if pending := a.scheduler.pending[work]; pending != nil {
-			pending.timer.Stop()
-			delete(a.scheduler.pending, work)
-		}
-	}
-	key := agenticWork{org: work.org, repo: work.repo, sha: r.State.HeadSHA}
-	if len(a.store.routes[key]) == 0 {
-		delete(a.statusContexts, key)
-	}
+	a.queueMu.Lock()
+	delete(a.inputs, work)
+	delete(a.retryAt, work)
+	a.queueMu.Unlock()
 	return nil
 }
 
@@ -421,15 +393,15 @@ func (a *agenticController) retirePreviousOwners(ctx context.Context, state *age
 			continue
 		}
 		old.State.Inactive, old.State.PendingDispatch = true, false
-		old.Gate, old.Desired, old.Wakeup, old.Reopen = github.CheckRun{}, nil, nil, false
+		old.Gate, old.Dirty, old.Reopen = agenticGateSnapshot{}, false, false
 		if err := a.writeRecord(ctx, old); err != nil {
 			return err
 		}
 		work := agenticWork{org: state.Org, repo: state.Repo, number: old.State.Number}
-		if a.scheduler != nil && a.scheduler.pending[work] != nil {
-			a.scheduler.pending[work].timer.Stop()
-			delete(a.scheduler.pending, work)
-		}
+		a.queueMu.Lock()
+		delete(a.inputs, work)
+		delete(a.retryAt, work)
+		a.queueMu.Unlock()
 	}
 	return nil
 }
