@@ -53,7 +53,7 @@ func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
 					}
 					f.reconcile(t, nil)
 					if phase == "completed" {
-						f.report(t, v1.PendingState)
+						f.report(t, v1.SuccessState)
 						f.reconcile(t, nil)
 					}
 					if phase == "empty-plan" || phase == "completed" {
@@ -61,15 +61,12 @@ func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
 						require.Equal(t, "success", gate.Conclusion)
 					}
 				}
-				// A new process has no scheduler or SHA/context interest cache.
-				previous := f.a
-				require.NoError(t, previous.closeStore())
-				f.a = &agenticController{gh: previous.gh, reader: previous.reader,
-					config: previous.config, watcher: previous.watcher, lgtmWatcher: previous.lgtmWatcher,
-					appID: previous.appID, logger: previous.logger, options: previous.options, now: previous.now}
+				// A new process starts with an empty workqueue.
+				require.NoError(t, f.a.closeStore())
+				restartAgenticFixture(f)
 				reads, lists := f.gh.getPullRequestCalls, f.gh.getPullRequestsCalls
-				checks, comments, statuses := f.gh.listCheckRunsCalls, f.gh.listCommentsCalls, f.gh.getCombinedStatusCalls
-				writes, history := len(f.gh.checkWrites), f.gh.listStatusesCalls
+				checks, comments := f.gh.listCheckRunsCalls, f.gh.listCommentsCalls
+				writes := len(f.gh.checkWrites)
 				stop := startAgenticRunner(f)
 				defer stop()
 				assertAgenticIdle(t, f, 24*time.Hour)
@@ -77,8 +74,6 @@ func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
 				require.Equal(t, lists, f.gh.getPullRequestsCalls)
 				require.Equal(t, checks, f.gh.listCheckRunsCalls)
 				require.Equal(t, comments, f.gh.listCommentsCalls)
-				require.Equal(t, statuses, f.gh.getCombinedStatusCalls)
-				require.Equal(t, history, f.gh.listStatusesCalls)
 				require.Len(t, f.gh.checkWrites, writes)
 				if phase == "untracked" {
 					require.Empty(t, f.gh.checks, "startup discovered a PR that had no persisted work")

@@ -169,11 +169,7 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 		if len(pj.Spec.Refs.Pulls) != 1 {
 			return nil
 		}
-		if err := r.agentic.reconcile(ctx, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, nil); err != nil {
-			r.agentic.logger.WithError(err).Error("Agentic ProwJob reconciliation failed")
-		}
-		// Agentic work owns its retry timer and error classification. Returning
-		// an error here would also start controller-runtime's retry loop.
+		r.agentic.enqueue(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, nil)
 		return nil
 	}
 	if r.agentic.hasRepo(pj.Spec.Refs.Org, pj.Spec.Refs.Repo) {

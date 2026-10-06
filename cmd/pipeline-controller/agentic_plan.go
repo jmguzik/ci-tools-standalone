@@ -193,6 +193,28 @@ func matchesAgenticPull(pj *v1.ProwJob, org, repo string, pr *github.PullRequest
 		refs.BaseRef == pr.Base.Ref && len(refs.Pulls) == 1 && refs.Pulls[0].Number == pr.Number && refs.Pulls[0].SHA == pr.Head.SHA
 }
 
+// Creation timestamps have second precision; names cannot establish run order.
+// Within a tie, failure wins over pending, and either wins over success.
+func preferAgenticJob(candidate, current *v1.ProwJob) bool {
+	if current == nil || candidate.CreationTimestamp.After(current.CreationTimestamp.Time) {
+		return true
+	}
+	if !candidate.CreationTimestamp.Equal(&current.CreationTimestamp) {
+		return false
+	}
+	priority := func(state v1.ProwJobState) int {
+		switch state {
+		case v1.SuccessState:
+			return 0
+		case v1.FailureState, v1.ErrorState, v1.AbortedState:
+			return 2
+		default:
+			return 1
+		}
+	}
+	return priority(candidate.Status.State) > priority(current.Status.State)
+}
+
 func latestAgenticJobs(pjs []v1.ProwJob, org, repo string, pr *github.PullRequest) map[string]*v1.ProwJob {
 	latest := map[string]*v1.ProwJob{}
 	for i := range pjs {
@@ -201,25 +223,35 @@ func latestAgenticJobs(pjs []v1.ProwJob, org, repo string, pr *github.PullReques
 			continue
 		}
 		old := latest[pj.Spec.Job]
-		if old == nil || pj.CreationTimestamp.After(old.CreationTimestamp.Time) ||
-			(pj.CreationTimestamp.Equal(&old.CreationTimestamp) && pj.Name > old.Name) {
+		if preferAgenticJob(pj, old) {
 			latest[pj.Spec.Job] = pj
 		}
 	}
 	return latest
 }
 
-// agenticFirstStageReady is deliberately independent of second-stage existence.
-// Unlike the ordinary duplicate guard, it also works after a partial dispatch.
-func agenticFirstStageReady(static []config.Presubmit, latest map[string]*v1.ProwJob, witnesses map[string]firstStageSuccessWitness, branch string) bool {
-	ready := true
+// All applicable required first-stage jobs must pass; second-stage runs do not count.
+func agenticFirstStageComplete(static []config.Presubmit, latest map[string]*v1.ProwJob, witnesses map[string]firstStageSuccessWitness, branch string) (ready, failed bool) {
+	ready = true
 	for _, p := range static {
 		if !p.ContextRequired() || agenticSecondStage(p) || !p.CouldRun(branch) {
 			continue
 		}
-		if !firstStageJobPassed(p, latest[p.Name], p.AlwaysRun, witnesses) {
+		pj := latest[p.Name]
+		// Conditional first-stage jobs absent at this revision do not block completion.
+		_, witnessed := witnesses[p.Name]
+		if !p.AlwaysRun && pj == nil && !witnessed {
+			continue
+		}
+		if pj != nil && (pj.Status.State == v1.FailureState || pj.Status.State == v1.ErrorState || pj.Status.State == v1.AbortedState) {
+			failed = true
+		}
+		if pj != nil && pj.Spec.Context != p.Context {
+			delete(witnesses, p.Name)
+			ready = false
+		} else if !firstStageJobPassed(p, pj, true, witnesses) {
 			ready = false
 		}
 	}
-	return ready
+	return ready, failed
 }

@@ -13,19 +13,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-const (
-	agenticInitialBackoff = 5 * time.Second
-	agenticMaxBackoff     = 5 * time.Minute
-)
-
-func nextAgenticBackoff(previous time.Duration) time.Duration {
-	if previous <= 0 {
-		return agenticInitialBackoff
-	}
-	// Clamp before multiplying, including huge inputs.
-	return min(previous, agenticMaxBackoff/2) * 2
-}
-
 type agenticRetryInfo struct {
 	transient       bool
 	after           time.Duration

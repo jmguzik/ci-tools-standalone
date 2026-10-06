@@ -26,36 +26,29 @@ import (
 )
 
 type fakeAgenticGitHub struct {
-	pr                     github.PullRequest
-	comments               []github.IssueComment
-	checks                 []github.CheckRun
-	statuses               map[string][]github.Status
-	statusHistory          map[string][]github.Status
-	listStatusesCalls      int
-	listStatusesError      error
-	changes                []github.PullRequestChange
-	member                 bool
-	collaborator           bool
-	statusWrites           int
-	checkWrites            []github.CheckRun
-	failCheck              bool
-	failCheckAfterCreate   bool
-	failCommentAfterWrite  bool
-	listCommentsError      error
-	otherPRs               []github.PullRequest
-	checkAttempts          int
-	failCheckAt            int
-	failAddLabel           bool
-	getPullRequestError    error
-	getPullRequestCalls    int
-	getPullRequestsError   error
-	getPullRequestsCalls   int
-	beforePullRequest      func(int)
-	hook                   *agenticFixture
-	beforeComment          func(string)
-	listCheckRunsCalls     int
-	listCommentsCalls      int
-	getCombinedStatusCalls int
+	pr                    github.PullRequest
+	comments              []github.IssueComment
+	checks                []github.CheckRun
+	changes               []github.PullRequestChange
+	member                bool
+	collaborator          bool
+	statusWrites          int
+	checkWrites           []github.CheckRun
+	failCheck             bool
+	failCheckAfterCreate  bool
+	failCommentAfterWrite bool
+	otherPRs              []github.PullRequest
+	checkAttempts         int
+	getPullRequestError   error
+	getPullRequestCalls   int
+	getPullRequestsError  error
+	getPullRequestsCalls  int
+	beforePullRequest     func(int)
+	hook                  *agenticFixture
+	beforeComment         func(string)
+	afterCheckWrite       func(github.CheckRun)
+	listCheckRunsCalls    int
+	listCommentsCalls     int
 }
 
 func (f *fakeAgenticGitHub) GetPullRequest(_, _ string, _ int) (*github.PullRequest, error) {
@@ -99,7 +92,7 @@ func (f *fakeAgenticGitHub) nextCommentID() int {
 
 func (f *fakeAgenticGitHub) ListIssueComments(_, _ string, _ int) ([]github.IssueComment, error) {
 	f.listCommentsCalls++
-	return append([]github.IssueComment{}, f.comments...), f.listCommentsError
+	return append([]github.IssueComment{}, f.comments...), nil
 }
 func (f *fakeAgenticGitHub) GetPullRequestChanges(_, _ string, _ int) ([]github.PullRequestChange, error) {
 	return f.changes, nil
@@ -109,9 +102,6 @@ func (f *fakeAgenticGitHub) CreateStatus(_, _, _ string, _ github.Status) error 
 	return nil
 }
 func (f *fakeAgenticGitHub) AddLabel(_, _ string, _ int, label string) error {
-	if f.failAddLabel {
-		return errors.New("label write failed")
-	}
 	f.pr.Labels = append(f.pr.Labels, github.Label{Name: label})
 	return nil
 }
@@ -140,12 +130,15 @@ func (f *fakeAgenticGitHub) ListCheckRuns(_, _, sha string) (*github.CheckRunLis
 }
 func (f *fakeAgenticGitHub) CreateCheckRun(_, _ string, check github.CheckRun) (int64, error) {
 	f.checkAttempts++
-	if f.failCheck || f.checkAttempts == f.failCheckAt {
+	if f.failCheck {
 		return 0, fmt.Errorf("check write failed: %w", io.ErrUnexpectedEOF)
 	}
 	check.ID, check.App.ID = int64(len(f.checks)+1), 101
 	f.checks = append(f.checks, check)
 	f.checkWrites = append(f.checkWrites, check)
+	if f.afterCheckWrite != nil {
+		f.afterCheckWrite(check)
+	}
 	if f.failCheckAfterCreate {
 		f.failCheckAfterCreate = false
 		return 0, fmt.Errorf("response lost after creating check: %w", io.ErrUnexpectedEOF)
@@ -154,7 +147,7 @@ func (f *fakeAgenticGitHub) CreateCheckRun(_, _ string, check github.CheckRun) (
 }
 func (f *fakeAgenticGitHub) UpdateCheckRun(_, _ string, id int64, check github.CheckRun) error {
 	f.checkAttempts++
-	if f.failCheck || f.checkAttempts == f.failCheckAt {
+	if f.failCheck {
 		return fmt.Errorf("check write failed: %w", io.ErrUnexpectedEOF)
 	}
 	for i := range f.checks {
@@ -183,17 +176,12 @@ func (f *fakeAgenticGitHub) UpdateCheckRun(_, _ string, id int64, check github.C
 		} // SDK omits an empty text field in PATCH.
 		f.checks[i] = old
 		f.checkWrites = append(f.checkWrites, old)
+		if f.afterCheckWrite != nil {
+			f.afterCheckWrite(old)
+		}
 		return nil
 	}
 	return errors.New("unknown check")
-}
-func (f *fakeAgenticGitHub) GetCombinedStatus(_, _, sha string) (*github.CombinedStatus, error) {
-	f.getCombinedStatusCalls++
-	return &github.CombinedStatus{SHA: sha, Statuses: append([]github.Status{}, f.statuses[sha]...)}, nil
-}
-func (f *fakeAgenticGitHub) ListStatuses(_, _, sha string) ([]github.Status, error) {
-	f.listStatusesCalls++
-	return append([]github.Status{}, f.statusHistory[sha]...), f.listStatusesError
 }
 func (f *fakeAgenticGitHub) IsMember(_, _ string) (bool, error) { return f.member, nil }
 func (f *fakeAgenticGitHub) IsCollaborator(_, _, _ string) (bool, error) {
@@ -237,7 +225,7 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	}
 	f.cfg = &config.Config{ProwConfig: config.ProwConfig{ProwJobNamespace: "ci"}}
 	require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
-	f.gh = &fakeAgenticGitHub{member: true, statuses: map[string][]github.Status{}, changes: []github.PullRequestChange{{Filename: "src/main.go"}},
+	f.gh = &fakeAgenticGitHub{member: true, changes: []github.PullRequestChange{{Filename: "src/main.go"}},
 		pr: github.PullRequest{Number: 42, State: github.PullRequestStateOpen, CreatedAt: f.now.Add(-time.Hour),
 			Head: github.PullRequestBranch{SHA: strings.Repeat("a", 40)}, Base: github.PullRequestBranch{Ref: "main", SHA: strings.Repeat("b", 40), Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}, HTMLURL: "https://github.com/org/repo"}}}}
 	var enrollment enabledConfig
@@ -245,7 +233,7 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1.AddToScheme(scheme))
 	f.jobs = &agenticTestJobs{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
-	f.a = &agenticController{gh: f.gh, reader: f.jobs, config: func() *config.Config { return f.cfg },
+	f.a = &agenticController{gh: f.gh, reader: f.jobs, apiReader: f.jobs, config: func() *config.Config { return f.cfg },
 		watcher: &watcher{config: enrollment}, lgtmWatcher: &watcher{}, appID: 101, now: func() time.Time { return f.now }, logger: logrus.NewEntry(logrus.New()),
 		options: agenticOptions{timeout: defaultAgenticTimeout, trustedAuthors: flagutil.NewStrings("chai[bot]"), stateDir: t.TempDir()}}
 	// Most tests use an immediate fake Hook; handoff tests disable it to
@@ -277,7 +265,10 @@ func newReadyAgenticFixture(t *testing.T, mode string, jobs ...string) *agenticF
 }
 
 func (f *agenticFixture) tryReconcile(command *github.IssueComment) error {
-	return f.a.reconcile(context.Background(), "org", "repo", f.gh.pr.Number, command)
+	f.a.mu.Lock()
+	defer f.a.mu.Unlock()
+	var deadline time.Time
+	return f.a.reconcilePull(context.Background(), "org", "repo", f.gh.pr.Number, command, &deadline)
 }
 
 func (f *agenticFixture) reconcile(t *testing.T, command *github.IssueComment) {
@@ -338,179 +329,168 @@ func (f *agenticFixture) passFirstStage(t *testing.T) {
 	if err := f.jobs.Client.Create(context.Background(), &pj); !apierrors.IsAlreadyExists(err) {
 		require.NoError(t, err)
 	}
-	f.gh.statuses[f.gh.pr.Head.SHA] = []github.Status{{Context: "ci/first", State: github.StatusSuccess, TargetURL: "https://prow/first-stage/1"}}
 }
 
 func (f *agenticFixture) report(t *testing.T, state v1.ProwJobState) {
 	t.Helper()
 	for _, pj := range f.allJobs(t) {
 		pj.Status.State = state
-		pj.Status.URL = "https://prow/view/" + pj.Name
-		pj.Status.PrevReportStates = map[string]v1.ProwJobState{"github-reporter": state}
+		pj.Status.URL = ""
+		pj.Status.PrevReportStates = nil
 		require.NoError(t, f.jobs.Update(context.Background(), &pj))
-		status := github.StatusPending
-		if state == v1.FailureState {
-			status = github.StatusFailure
-		}
-		current := f.gh.statuses[f.gh.pr.Head.SHA]
-		var next []github.Status
-		for _, prior := range current {
-			if prior.Context != pj.Spec.Context {
-				next = append(next, prior)
-			}
-		}
-		f.gh.statuses[f.gh.pr.Head.SHA] = append(next, github.Status{Context: pj.Spec.Context, State: status, TargetURL: pj.Status.URL})
 	}
 }
 
-func TestAgenticDispatchAndReporting(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a")
-	f.reconcile(t, nil)
-	check, state := f.gate(t)
-	if check.Status != "in_progress" || state.Dispatch == nil || !state.Frozen || len(f.allJobs(t)) != 1 {
-		t.Fatalf("expected a closed gate and one execution, got %+v / %+v", check, state)
-	}
-	require.Contains(t, check.Output.Summary, "Test selection is locked for this commit. Later Chai plans are ignored; push a new commit to change the selection.", "dispatch check must explain the selection lock")
-	pj := f.allJobs(t)[0]
-	if pj.Spec.Job != "job-a" || !pj.Spec.Report || pj.Labels["configured-label"] != "kept" || pj.Annotations["pipeline_run_if_changed"] != "^src/" {
-		t.Fatalf("lost selected job definition/metadata: %+v", pj)
-	}
-	require.Zero(t, f.gh.statusWrites, "controller created per-job placeholders")
-	f.report(t, v1.FailureState)
-	f.reconcile(t, nil)
-	check, state = f.gate(t)
-	if check.Conclusion != "success" || !state.Dispatch.Executions[0].Reported {
-		t.Fatal("gate did not open after the requested execution reported")
-	}
-	require.Contains(t, check.Output.Summary, "Test selection is locked for this commit.", "completed dispatch check lost the selection-lock explanation")
-	require.Equal(t, github.StatusFailure, f.gh.statuses[f.gh.pr.Head.SHA][1].State, "real job failure was overwritten")
-	// Durable evidence survives controller restart and ProwJob garbage collection.
-	f.deleteJobs(t, f.allJobs(t)...)
-	f.reconcile(t, nil)
-	require.Equal(t, 1, f.jobs.creates, "recreated an execution already durably acknowledged")
-}
-
-func TestAgenticSelectedRequestWaitsForFirstStageAndBindsRevision(t *testing.T) {
-	f := newAgenticFixture(t, "manual")
-	f.plan(t, "job-a")
-	f.reconcile(t, nil)
-	request := f.command(500, "required")
-	f.reconcile(t, request)
-	check, state := f.gate(t)
-	if state.ManualRequestID != 500 || state.Dispatch != nil || state.WaitingSince != nil || len(f.allJobs(t)) != 0 {
-		t.Fatalf("early command was not durably deferred: %+v", state)
-	}
-	require.NotContains(t, check.Output.Summary, "Test selection is locked for this commit.", "check described a pending selection as locked")
-	f.now = f.now.Add(time.Minute)
-	f.passFirstStage(t)
-	f.reconcile(t, nil)
-	require.Len(t, f.allJobs(t), 1, "recorded manual request was lost on restart")
-	// A repeated delivery does not force a second run.
-	f.reconcile(t, request)
-	require.Len(t, f.allJobs(t), 1, "redelivered command duplicated a dispatch")
-	f.gh.pr.Head.SHA = strings.Repeat("c", 40)
-	f.now = f.now.Add(time.Minute)
-	f.passFirstStage(t)
-	f.plan(t, "job-a")
-	f.reconcile(t, nil)
-	_, state = f.gate(t)
-	if state.ManualRequestID != 0 || state.Dispatch != nil {
-		t.Fatal("old manual request authorized a new HEAD")
-	}
-	f.reconcile(t, request)
-	_, state = f.gate(t)
-	require.Zero(t, state.ManualRequestID, "delayed old command authorized a new HEAD")
-}
-
-func TestAgenticCommandsRejectMissingSelection(t *testing.T) {
-	for _, selection := range []string{"missing", "stale", "newer-invalid", "late-plan"} {
-		for _, command := range []string{"required", "remaining"} {
-			t.Run(selection+"/"+command, func(t *testing.T) {
-				f := newAgenticFixture(t, "manual")
-				switch selection {
-				case "newer-invalid":
-					f.plan(t, "job-a")
-				case "stale":
-					f.plan(t, "job-a")
-					f.gh.comments[0].Body = formatAgenticPlan(agenticPlan{HeadSHA: strings.Repeat("c", 40), BaseBranch: "main", Jobs: []string{"job-a"}})
-				}
-				f.reconcile(t, nil)
-				if selection == "newer-invalid" {
-					f.plan(t, "unknown-job")
-				}
-				f.command(500, command)
-				request := f.command(600, command)
-				if selection == "late-plan" {
-					f.plan(t, "job-a")
-				}
-				comments := len(f.gh.comments) + 2
-				reconcile := func() {
-					err := f.tryReconcile(request)
-					if selection == "newer-invalid" {
-						require.ErrorContains(t, err, "unknown-job")
-					} else {
-						require.NoError(t, err)
-					}
-				}
-				reconcile() // Recover both comments, not just the delivered one.
-				_, state := f.gate(t)
-				require.Zero(t, state.ManualRequestID)
-				require.Zero(t, state.ForceRequestID)
-				require.Nil(t, state.Dispatch)
-				require.True(t, state.Command.Rejected)
-				require.True(t, state.Command.Applied)
-				require.Equal(t, 600, state.LastCommandID)
-				require.Len(t, f.gh.comments, comments, "each command should get one rejection")
-				for _, reply := range f.gh.comments[comments-2:] {
-					require.Contains(t, reply.Body, "test selection is not ready")
-					require.Contains(t, reply.Body, "This request is not queued.")
-				}
-				reconcile()
-				require.Len(t, f.gh.comments, comments, "duplicate delivery repeated the rejection")
-				require.NoError(t, f.a.closeStore())
+func TestAgenticWaitsForFirstStageSuccess(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		states   []v1.ProwJobState
+		active   bool
+		selected bool
+	}{
+		{"missing", nil, false, false},
+		{"pending", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.PendingState}, false, false},
+		{"all-green", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.SuccessState}, true, false},
+		{"failure-veto", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.FailureState}, false, false},
+		{"abort-veto", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.AbortedState}, false, false},
+		{"selected-awaits-all-green", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.PendingState}, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			if test.selected {
 				f.plan(t, "job-a")
-				f.passFirstStage(t)
-				f.reconcile(t, request)
-				require.Zero(t, f.jobs.creates, "rejected command dispatched after selection/restart")
-				f.reconcile(t, f.command(700, command))
-				require.Equal(t, 1, f.jobs.creates, "fresh command after selection was rejected")
-			})
-		}
+			}
+			static := f.cfg.GetPresubmitsStatic("org/repo")
+			for _, name := range []string{"first-b", "first-c"} {
+				p := static[0]
+				p.Name, p.Context = name, "ci/"+name
+				static = append(static, p)
+			}
+			require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
+			first := []config.Presubmit{static[0], static[4], static[5]}
+			for i, state := range test.states {
+				pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, first[i], "first", nil)
+				pj.Name, pj.Namespace = first[i].Name, "ci"
+				pj.CreationTimestamp = metav1.NewTime(f.now)
+				pj.Status.State = state
+				require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
+				if state != v1.SuccessState {
+					stale := pj.DeepCopy()
+					stale.Name, stale.ResourceVersion, stale.Status.State = "z-old-"+pj.Name, "", v1.SuccessState
+					require.NoError(t, f.jobs.Client.Create(context.Background(), stale))
+				}
+			}
+			f.reconcile(t, nil)
+			_, state := f.gate(t)
+			require.Equal(t, test.active, state.ActivatedAt != nil)
+			require.Equal(t, test.active && !test.selected, state.WaitingSince != nil)
+			require.Nil(t, state.Dispatch, "first-stage success and a selection are both required")
+			if test.active {
+				require.Len(t, f.gh.checks, 1)
+				check := f.gh.checks[0]
+				require.Equal(t, "in_progress", check.Status)
+				if !test.selected {
+					require.Equal(t, "Waiting for Chai", check.Output.Title)
+					require.Equal(t, &f.now, state.WaitingSince, "timeout starts only after first-stage success")
+				}
+				require.Contains(t, check.Output.Summary, "Pipeline for `"+f.gh.pr.Head.SHA+"` → `main`.")
+				require.Equal(t, agenticExternalID("org", "repo", 42), check.ExternalID)
+			} else {
+				require.Empty(t, f.gh.checks, "do not consume the creation event before readiness")
+			}
+			if test.selected {
+				var pj v1.ProwJob
+				require.NoError(t, f.jobs.Get(context.Background(), ctrlruntimeclient.ObjectKey{Namespace: "ci", Name: "first-c"}, &pj))
+				pj.Status.State = v1.SuccessState
+				require.NoError(t, f.jobs.Update(context.Background(), &pj))
+				f.reconcile(t, nil)
+				require.Equal(t, 1, f.jobs.creates)
+				require.Len(t, f.gh.checks, 1, "create the gate only after the final first-stage success")
+			}
+		})
 	}
 }
 
-func TestAgenticRejectionSurvivesLostCommentResponse(t *testing.T) {
-	f := newAgenticFixture(t, "manual")
-	f.reconcile(t, nil)
-	request := f.command(500, "required")
-	f.gh.failCommentAfterWrite = true
-	require.Error(t, f.tryReconcile(request))
-	_, state := f.gate(t)
-	require.True(t, state.Command.Rejected, "rejection must be saved before replying")
-	require.Zero(t, state.ManualRequestID)
-	comments := len(f.gh.comments)
-	require.NoError(t, f.a.closeStore())
-	f.plan(t, "job-a")
-	f.passFirstStage(t)
-	f.reconcile(t, request)
-	require.Len(t, f.gh.comments, comments+1, "retry duplicated the rejection reply")
-	require.Zero(t, f.jobs.creates, "reply recovery turned a rejection into a dispatch")
-	f.reconcile(t, f.command(600, "required"))
-	require.Equal(t, 1, f.jobs.creates)
+func TestAgenticGateUsesSelectedProwJobResults(t *testing.T) {
+	for _, state := range []v1.ProwJobState{v1.PendingState, v1.FailureState, v1.ErrorState, v1.AbortedState, v1.SuccessState} {
+		t.Run(string(state), func(t *testing.T) {
+			f := newReadyAgenticFixture(t, "auto", "job-a")
+			f.reconcile(t, nil)
+			require.Equal(t, 1, f.jobs.creates, "only Hook should create the selected job")
+			require.Zero(t, f.gh.statusWrites, "controller must not publish job placeholders")
+			f.report(t, state)
+			// A tied old success must not hide this run's pending/failing state.
+			stale := f.allJobs(t)[0].DeepCopy()
+			stale.Name, stale.ResourceVersion, stale.Status.State = "z-old-success", "", v1.SuccessState
+			require.NoError(t, f.jobs.Client.Create(context.Background(), stale))
+			f.reconcile(t, nil)
+			gate, saved := f.gate(t)
+			require.Equal(t, state == v1.SuccessState, saved.Dispatch.Executions[0].Passed)
+			switch state {
+			case v1.PendingState:
+				require.Equal(t, "in_progress", gate.Status)
+			case v1.SuccessState:
+				require.Equal(t, "success", gate.Conclusion)
+			default:
+				require.Equal(t, "failure", gate.Conclusion)
+			}
+			if state != v1.SuccessState {
+				stale.Name, stale.ResourceVersion = "a-new-success", ""
+				stale.CreationTimestamp = metav1.NewTime(f.now.Add(time.Second))
+				require.NoError(t, f.jobs.Client.Create(context.Background(), stale))
+				f.reconcile(t, nil)
+				gate, _ = f.gate(t)
+				require.Equal(t, "success", gate.Conclusion, "an unambiguously newer success must release the gate")
+			}
+		})
+	}
 }
 
-func TestAgenticTimeoutSelectsBeforeCIAndTriggerAndIgnoresLatePlans(t *testing.T) {
+func TestAgenticSelectedResultsRequireCurrentIdentity(t *testing.T) {
+	for _, wrong := range []string{"sha", "base", "context", "job"} {
+		t.Run(wrong, func(t *testing.T) {
+			f := newReadyAgenticFixture(t, "auto", "job-a")
+			f.reconcile(t, nil)
+			pj := f.allJobs(t)[0]
+			pj.Status.State = v1.SuccessState
+			switch wrong {
+			case "sha":
+				pj.Spec.Refs.Pulls[0].SHA = strings.Repeat("c", 40)
+			case "base":
+				pj.Spec.Refs.BaseRef = "release"
+			case "context":
+				pj.Spec.Context = "other-context"
+			case "job":
+				pj.Spec.Job = "other-job"
+			}
+			require.NoError(t, f.jobs.Update(context.Background(), &pj))
+			f.reconcile(t, nil)
+			gate, _ := f.gate(t)
+			require.NotEqual(t, "success", gate.Conclusion)
+		})
+	}
+}
+
+func TestAgenticTimeoutStartsAtReadinessAndLocksFallback(t *testing.T) {
 	for _, mode := range []string{"auto", "manual", "lgtm"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newAgenticFixture(t, mode)
 			f.reconcile(t, nil)
+			f.now = f.now.Add(time.Hour)
+			f.reconcile(t, nil)
 			_, state := f.gate(t)
-			require.Equal(t, state.ObservedAt, *state.WaitingSince)
+			require.Nil(t, state.WaitingSince)
+			require.Nil(t, state.Plan)
+			require.Empty(t, f.gh.checks)
+			f.passFirstStage(t)
+			f.reconcile(t, nil)
+			_, state = f.gate(t)
 			started := *state.WaitingSince
+			require.Equal(t, f.now, started)
 			f.now = f.now.Add(defaultAgenticTimeout - time.Second)
 			f.reconcile(t, nil)
 			_, state = f.gate(t)
-			require.Nil(t, state.Plan, "selected fallback before the revision deadline")
+			require.Nil(t, state.Plan)
 			require.Equal(t, started, *state.WaitingSince)
 			f.now = f.now.Add(time.Second)
 			f.reconcile(t, nil)
@@ -518,15 +498,39 @@ func TestAgenticTimeoutSelectsBeforeCIAndTriggerAndIgnoresLatePlans(t *testing.T
 			require.Equal(t, "timeout", state.Plan.Source)
 			require.Len(t, state.Plan.Jobs, 2)
 			require.False(t, hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
-			require.Zero(t, f.jobs.creates, "selection bypassed first-stage success")
+			if mode != "auto" {
+				require.Zero(t, f.jobs.creates)
+			}
+			require.NoError(t, f.a.closeStore())
+			f.plan(t) // Late empty Chai replies must not replace fallback.
+			switch mode {
+			case "manual":
+				f.reconcile(t, f.command(500, "remaining"))
+			case "lgtm":
+				f.gh.pr.Labels = []github.Label{{Name: "lgtm"}}
+				f.reconcile(t, nil)
+			default:
+				f.reconcile(t, nil)
+			}
+			_, state = f.gate(t)
+			require.Equal(t, "timeout", state.Plan.Source)
+			require.Equal(t, 2, f.jobs.creates)
+		})
+	}
+}
+
+func TestAgenticEmptyPlanStillRequiresCIAndAuthorization(t *testing.T) {
+	for _, mode := range []string{"manual", "auto", "lgtm"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newAgenticFixture(t, mode)
 			f.plan(t)
 			f.reconcile(t, nil)
-			_, state = f.gate(t)
-			require.Equal(t, "timeout", state.Plan.Source, "late Chai plan replaced fallback")
+			require.Empty(t, f.gh.checks)
 			f.passFirstStage(t)
 			f.reconcile(t, nil)
+			gate, _ := f.gate(t)
 			if mode != "auto" {
-				require.Zero(t, f.jobs.creates, "selection bypassed the dispatch trigger")
+				require.NotEqual(t, "success", gate.Conclusion)
 			}
 			switch mode {
 			case "manual":
@@ -535,197 +539,154 @@ func TestAgenticTimeoutSelectsBeforeCIAndTriggerAndIgnoresLatePlans(t *testing.T
 				f.gh.pr.Labels = []github.Label{{Name: "lgtm"}}
 				f.reconcile(t, nil)
 			}
-			require.Equal(t, 2, f.jobs.creates)
+			gate, _ = f.gate(t)
+			require.Equal(t, "success", gate.Conclusion)
+			require.Zero(t, f.jobs.creates)
 		})
 	}
 }
 
-func TestAgenticEmptyPlanIsExplicitAndAuthorized(t *testing.T) {
-	for _, mode := range []string{"manual", "auto", "lgtm"} {
-		t.Run(mode, func(t *testing.T) {
-			f := newAgenticFixture(t, mode)
-			f.plan(t)
+func TestAgenticEarlyCommandsAreRejectedNotReplayed(t *testing.T) {
+	for _, command := range []string{"required", "remaining"} {
+		t.Run(command, func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
 			f.reconcile(t, nil)
-			check, _ := f.gate(t)
-			require.NotEqual(t, "success", check.Conclusion, "empty plan bypassed first-stage success")
+			missed := f.command(500, command)
+			request := f.command(600, command)
+			f.reconcile(t, request)
+			_, state := f.gate(t)
+			require.True(t, state.Command.Rejected)
+			require.Zero(t, state.ManualRequestID)
+			require.Contains(t, f.gh.comments[len(f.gh.comments)-1].Body, "This request is not queued.")
+			replies := len(f.gh.comments)
+			f.plan(t, "job-a")
 			f.passFirstStage(t)
-			f.reconcile(t, nil)
-			check, _ = f.gate(t)
-			if mode != "auto" && check.Conclusion == "success" {
-				t.Fatal("empty plan bypassed trigger authorization")
-			}
-			if mode == "lgtm" {
-				f.gh.pr.Labels = []github.Label{{Name: "lgtm"}}
-			}
-			var command *github.IssueComment
-			if mode == "manual" {
-				command = f.command(500, "remaining")
-			}
-			f.reconcile(t, command)
-			check, _ = f.gate(t)
-			if check.Conclusion != "success" || f.jobs.creates != 0 {
-				t.Fatal("explicit empty plan did not settle after prerequisites")
-			}
-			for _, comment := range f.gh.comments {
-				require.NotContains(t, comment.Body, "/test", "empty selections must not post a Hook command")
-			}
+			require.NoError(t, f.a.closeStore())
+			f.reconcile(t, missed)
+			f.reconcile(t, request)
+			require.Zero(t, f.jobs.creates)
+			require.Len(t, f.gh.comments, replies+1, "redelivery duplicated the rejection")
+			f.reconcile(t, f.command(700, command))
+			require.Equal(t, 1, f.jobs.creates)
 		})
 	}
 }
 
-func TestAgenticRerunClosesSameGateAndRejectsOldReports(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a")
-	f.reconcile(t, nil)
-	f.report(t, v1.PendingState)
-	f.reconcile(t, nil)
-	check, old := f.gate(t)
-	gateID := check.ID
-	// Hook can create old and new runs in the same clock second. Exclude
-	// existing names instead of relying on timestamp precision or name order.
-	f.gh.beforeComment = func(body string) {
-		if !strings.Contains(body, "pipeline-controller:dispatch:") {
-			return
-		}
-		check, _ := f.gate(t)
-		if check.ID != gateID || check.Status != "in_progress" || check.Conclusion == "success" {
-			t.Fatalf("rerun requested with a stale green gate: %+v", check)
-		}
-	}
-	f.reconcile(t, f.command(500, "required"))
-	check, next := f.gate(t)
-	if len(f.gh.checks) != 1 || check.ID != gateID || check.Status != "in_progress" || next.Dispatch.ID == old.Dispatch.ID || next.Dispatch.Executions[0].Reported {
-		t.Fatal("rerun accepted an older execution or left duplicate green gates")
-	}
-	f.reconcile(t, nil)
-	check, _ = f.gate(t)
-	require.NotEqual(t, "success", check.Conclusion, "older same-context report satisfied the new execution")
-	f.report(t, v1.PendingState)
-	f.reconcile(t, nil)
-	check, _ = f.gate(t)
-	require.Equal(t, "success", check.Conclusion)
-}
-
-func TestAgenticCommentHandoffWaitsForHookAndReports(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a")
-	f.autoHook = false
-	f.reconcile(t, nil)
-	gate, state := f.gate(t)
-	require.True(t, state.Dispatch.Posted)
-	require.Empty(t, f.allJobs(t), "controller must not create ProwJobs")
-	require.NotEqual(t, "success", gate.Conclusion, "posting a comment is not a report")
-	body := f.gh.comments[len(f.gh.comments)-1].Body
-	require.Contains(t, body, "\n/test job-a\n")
-	require.NotContains(t, body, "```")
-	require.False(t, agenticCommandRE.MatchString(body))
-	require.False(t, isAgenticPlanComment(body))
-	comments := len(f.gh.comments)
-	f.reconcile(t, nil)
-	require.Len(t, f.gh.comments, comments, "waiting must not repost")
-	f.processHook(body)
-	f.reconcile(t, nil)
-	gate, _ = f.gate(t)
-	require.NotEqual(t, "success", gate.Conclusion, "job existence is not a report")
-	f.report(t, v1.FailureState)
-	f.reconcile(t, nil)
-	gate, _ = f.gate(t)
-	require.Equal(t, "success", gate.Conclusion, "failed tests still reported their contexts")
-}
-
-func TestAgenticRemainingRetriesOnlyMissingHookRuns(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a", "job-b")
-	f.autoHook = false
-	f.reconcile(t, nil) // Hook misses the first comment.
-	f.reconcile(t, f.command(500, "required"))
-	f.processHook("/test job-a") // Hook handles only part of the forced request.
-	f.report(t, v1.FailureState)
-	f.reconcile(t, f.command(501, "remaining"))
-	_, state := f.gate(t)
-	require.Zero(t, state.ForceRequestID, "remaining must not inherit force")
-	body := f.gh.comments[len(f.gh.comments)-1].Body
-	require.Contains(t, body, "\n/test job-b\n")
-	require.NotContains(t, body, "/test job-a")
-	require.Equal(t, f.allJobs(t)[0].Name, state.Dispatch.Executions[0].Name)
-	f.processHook(body)
-	f.report(t, v1.FailureState)
-	f.reconcile(t, nil)
-	gate, _ := f.gate(t)
-	require.Equal(t, "success", gate.Conclusion)
-	comments := len(f.gh.comments)
-	f.reconcile(t, f.command(502, "remaining"))
-	require.Len(t, f.gh.comments, comments+1, "remaining reran existing failed tests")
-}
-
-func TestAgenticReviewRequestCorrelationAndCrashRecovery(t *testing.T) {
+func TestAgenticManualRequestDoesNotAuthorizeNewHead(t *testing.T) {
 	f := newAgenticFixture(t, "manual")
 	f.plan(t, "job-a")
 	f.reconcile(t, nil)
-	f.gh.failCommentAfterWrite = true
-	require.Error(t, f.tryReconcile(f.command(500, "agent-review")), "expected lost comment response")
-	f.reconcile(t, nil)
-	_, state := f.gate(t)
-	if state.Review == nil || !state.ReviewPosted || state.Plan != nil || len(f.gh.comments) != 3 {
-		t.Fatalf("fresh review failed to correlate/deduplicate: %+v; comments=%d", state, len(f.gh.comments))
-	}
+	request := f.command(500, "required")
+	f.reconcile(t, request)
 	f.passFirstStage(t)
-	// A new same-HEAD automatic reply is still not a response to this request.
-	f.plan(t, "job-b")
-	f.reconcile(t, f.command(501, "remaining"))
-	_, state = f.gate(t)
-	if state.Plan != nil || f.jobs.creates != 0 {
-		t.Fatal("uncorrelated reply satisfied a fresh review request")
-	}
-	body := formatAgenticPlan(agenticPlan{HeadSHA: f.gh.pr.Head.SHA, BaseBranch: "main", Jobs: []string{"job-b"}, Rationale: "Refreshed selection.", RequestID: state.Review.RequestID})
-	f.gh.comments = append(f.gh.comments, github.IssueComment{ID: 2000, Body: body, User: github.User{Login: "chai[bot]"}, CreatedAt: f.now})
 	f.reconcile(t, nil)
-	require.Zero(t, f.jobs.creates, "rejected pre-selection command authorized dispatch")
-	f.reconcile(t, f.command(2001, "remaining"))
-	if f.jobs.creates != 1 || f.allJobs(t)[0].Spec.Job != "job-b" {
-		t.Fatal("correlated reply was not dispatched")
-	}
-}
-
-func TestAgenticNoDispatchWithoutDurableGate(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto", "job-a")
-	f.gh.failCheck = true
-	require.Error(t, f.tryReconcile(nil), "expected gate persistence failure")
-	require.Zero(t, f.jobs.creates, "dispatched jobs before recording their identities")
-}
-
-func TestAgenticFirstStageNewerRunWinsOverOldSuccess(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto")
-	f.reconcile(t, nil) // Persist the earlier success before a rerun arrives.
-	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "first", nil)
-	pj.Name, pj.Namespace, pj.CreationTimestamp = "new-first-stage", "ci", metav1.NewTime(f.now)
-	pj.Status.State = v1.PendingState
-	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
+	f.reconcile(t, request)
+	require.Equal(t, 1, f.jobs.creates)
+	oldGate, _ := f.gate(t)
+	f.gh.pr.Head.SHA = strings.Repeat("c", 40)
+	f.now = f.now.Add(time.Minute)
 	f.reconcile(t, nil)
-	check, state := f.gate(t)
-	require.NotEqual(t, "success", check.Conclusion, "old success bypassed a newer pending first-stage execution")
-	require.Empty(t, state.FirstStage)
+	require.Len(t, f.gh.checks, 1, "new HEAD created a gate before readiness")
+	f.passFirstStage(t)
+	f.plan(t, "job-a")
+	f.reconcile(t, request)
+	gate, state := f.gate(t)
+	require.NotEqual(t, oldGate.ID, gate.ID)
+	require.Zero(t, state.ManualRequestID)
+	require.Nil(t, state.Dispatch)
+	require.Equal(t, 1, f.jobs.creates)
 }
 
-func TestAgenticFirstStageReadinessNeedsNoGitHubReports(t *testing.T) {
-	for _, scenario := range []string{"override URL differs", "no report"} {
-		t.Run(scenario, func(t *testing.T) {
-			f := newAgenticFixture(t, "auto")
-			f.passFirstStage(t)
-			pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "override", nil)
-			pj.Name, pj.Namespace, pj.CreationTimestamp = "override-first-stage", "ci", metav1.NewTime(f.now)
-			pj.Status.State, pj.Status.URL = v1.SuccessState, "https://github.com/org/repo/pull/42#issuecomment-500"
-			require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
-			if scenario == "no report" {
-				f.gh.statuses = nil
+func TestAgenticForcedRerunClosesGateAndExcludesOldRuns(t *testing.T) {
+	for _, lag := range []string{"created", "deleted"} {
+		t.Run(lag, func(t *testing.T) {
+			f := newReadyAgenticFixture(t, "auto", "job-a")
+			f.reconcile(t, nil)
+			f.report(t, v1.SuccessState)
+			f.reconcile(t, nil)
+			gate, old := f.gate(t)
+			oldJobs := f.allJobs(t)
+			var cachedJobs v1.ProwJobList
+			require.NoError(t, f.jobs.List(context.Background(), &cachedJobs))
+			if lag == "created" {
+				cachedJobs.Items = slices.DeleteFunc(cachedJobs.Items, func(pj v1.ProwJob) bool { return pj.Spec.Job != "first-stage" })
+			} else {
+				f.deleteJobs(t, oldJobs...) // The informer still has the deleted green run.
+			}
+			cache := fake.NewClientBuilder().WithScheme(f.jobs.Scheme()).WithLists(&cachedJobs).Build()
+			f.a.reader = cache
+			f.gh.beforeComment = func(string) { require.NotEqual(t, "success", f.gh.checks[0].Conclusion) }
+			f.reconcile(t, f.command(500, "required"))
+			current, state := f.gate(t)
+			require.Len(t, f.gh.checks, 1)
+			require.Equal(t, gate.ID, current.ID)
+			require.NotEqual(t, old.Dispatch.ID, state.Dispatch.ID)
+			require.Contains(t, state.Dispatch.Executions[0].Previous, oldJobs[0].Name)
+			require.NotEqual(t, "success", current.Conclusion)
+			if lag == "created" {
+				delayed := oldJobs[0].DeepCopy()
+				delayed.ResourceVersion = ""
+				require.NoError(t, cache.Create(context.Background(), delayed))
 			}
 			f.reconcile(t, nil)
-			_, state := f.gate(t)
-			require.NotNil(t, state.WaitingSince)
-			require.Equal(t, f.now, *state.WaitingSince)
-			require.Zero(t, f.gh.getCombinedStatusCalls)
-			f.now = f.now.Add(defaultAgenticTimeout)
+			current, _ = f.gate(t)
+			require.NotEqual(t, "success", current.Conclusion, "cache lag adopted a pre-rerun success")
+			// If the new pending run disappears, an older green run still cannot pass.
+			for _, pj := range f.allJobs(t) {
+				if pj.Name != oldJobs[0].Name {
+					f.deleteJobs(t, pj)
+				}
+			}
+			require.NoError(t, f.a.closeStore())
 			f.reconcile(t, nil)
-			_, state = f.gate(t)
-			require.Equal(t, "timeout", state.Plan.Source)
-			require.Equal(t, 2, f.jobs.creates)
+			current, _ = f.gate(t)
+			require.NotEqual(t, "success", current.Conclusion)
 		})
 	}
+}
+
+func TestAgenticRemainingRequestsOnlyMissingExecutions(t *testing.T) {
+	f := newReadyAgenticFixture(t, "auto", "job-a", "job-b")
+	f.autoHook = false
+	f.reconcile(t, nil)
+	f.reconcile(t, f.command(500, "required"))
+	f.processHook("/test job-a")
+	f.report(t, v1.SuccessState)
+	f.reconcile(t, f.command(501, "remaining"))
+	body := f.gh.comments[len(f.gh.comments)-1].Body
+	require.Contains(t, body, "\n/test job-b\n")
+	require.NotContains(t, body, "/test job-a")
+	f.processHook(body)
+	f.report(t, v1.SuccessState)
+	f.reconcile(t, nil)
+	gate, _ := f.gate(t)
+	require.Equal(t, "success", gate.Conclusion)
+}
+
+func TestAgenticExplicitReviewIsDelayedAndCorrelated(t *testing.T) {
+	f := newAgenticFixture(t, "manual")
+	f.reconcile(t, nil)
+	f.reconcile(t, f.command(500, "agent-review"))
+	_, state := f.gate(t)
+	require.Nil(t, state.WaitingSince)
+	require.False(t, state.ReviewPosted)
+	f.passFirstStage(t)
+	f.gh.failCommentAfterWrite = true
+	require.Error(t, f.tryReconcile(nil))
+	require.NoError(t, f.a.closeStore())
+	f.reconcile(t, nil)
+	_, state = f.gate(t)
+	require.True(t, state.ReviewPosted)
+	require.Len(t, f.gh.comments, 2, "lost response duplicated the review request")
+	f.plan(t, "job-a")
+	f.reconcile(t, nil)
+	_, state = f.gate(t)
+	require.Nil(t, state.Plan, "uncorrelated reply satisfied an explicit review")
+	comment := f.plan(t, "job-b")
+	f.gh.comments[len(f.gh.comments)-1].Body = formatAgenticPlan(agenticPlan{
+		HeadSHA: state.HeadSHA, BaseBranch: state.BaseBranch, Jobs: []string{"job-b"}, RequestID: state.Review.RequestID})
+	f.reconcile(t, &comment)
+	f.reconcile(t, f.command(700, "remaining"))
+	require.Equal(t, 1, f.jobs.creates)
+	require.Equal(t, "job-b", f.allJobs(t)[0].Spec.Job)
 }
