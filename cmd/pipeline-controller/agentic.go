@@ -471,9 +471,9 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 	if state.FirstStage == nil {
 		state.FirstStage = map[string]firstStageSuccessWitness{}
 	}
-	eligible, ready, failed := agenticFirstStageProgress(static, latest, state.FirstStage, pr.Base.Ref)
+	ready, failed := agenticFirstStageComplete(static, latest, state.FirstStage, pr.Base.Ref)
 	var comments []github.IssueComment
-	if state.RevisionPending || state.PendingDispatch || (!state.Frozen && (state.ActivatedAt != nil || eligible)) || comment != nil ||
+	if state.RevisionPending || state.PendingDispatch || (!state.Frozen && (state.ActivatedAt != nil || ready)) || comment != nil ||
 		(state.Command != nil && !state.Command.Applied) || (state.Review != nil && !state.ReviewPosted) ||
 		(state.Dispatch != nil && !state.Dispatch.Posted) {
 		comments, err = a.gh.ListIssueComments(org, repo, number)
@@ -535,7 +535,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 			return a.failState(gate, state, invalidPlan)
 		}
 	}
-	if state.ActivatedAt == nil && eligible && !pr.Draft && (pr.Mergable == nil || *pr.Mergable) {
+	if state.ActivatedAt == nil && ready && !pr.Draft && (pr.Mergable == nil || *pr.Mergable) {
 		if err := checkCollision(); err != nil {
 			return a.failExistingGate(gate, state, err)
 		}
@@ -552,7 +552,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 	}
 	if state.ActivatedAt == nil {
 		state.PendingDispatch = false
-		return a.saveState(gate, state, "", "Waiting for at least half of first-stage tests to pass without failures.")
+		return a.saveState(gate, state, "", "Waiting for all required first-stage tests to pass.")
 	}
 	if err := a.applyCommand(gate, state, cfg, pr, comments); err != nil {
 		return a.failState(gate, state, err)

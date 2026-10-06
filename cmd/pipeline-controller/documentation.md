@@ -219,9 +219,9 @@ Global flags: `--agentic-trusted-author=<chai-login>` (required, repeatable),
 `--agentic-state-dir=/var/lib/pipeline-controller` (required outside dry run),
 and `--agentic-timeout=20m` (default); no repository-level trust/timeout.
 
-No check is created before readiness. Once at least half of applicable required
-first-stage jobs pass (rounded up), with no failures, the controller creates
-`ci/tests-dispatched` as `in_progress`. Chai reacts to `check_run.created` and posts:
+No check is created until all applicable required first-stage jobs pass.
+The controller then creates `ci/tests-dispatched` as `in_progress`.
+Chai reacts to `check_run.created` and posts:
 
 ```markdown
 Chai test plan for `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` → `main`
@@ -240,8 +240,8 @@ Request: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
 ```
 
 Both paths use the latest matching ProwJobs for first-stage success, including `/override`.
-Dispatch waits for all first-stage jobs and the existing trigger. The timeout
-starts at the readiness threshold and falls back to normal selection. Late plans
+Dispatch rechecks first-stage success and waits for the existing trigger. The timeout
+starts after first-stage success and falls back to normal selection. Late plans
 cannot replace fallback or a dispatched selection; push a new commit to change it.
 
 - `/pipeline required` reruns the selected set; `/pipeline remaining` runs only missing jobs. Before a valid selection exists, they are rejected with a comment, not queued; post the command again after Chai or timeout selects the jobs.

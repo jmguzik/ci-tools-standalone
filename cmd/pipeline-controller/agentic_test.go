@@ -341,7 +341,7 @@ func (f *agenticFixture) report(t *testing.T, state v1.ProwJobState) {
 	}
 }
 
-func TestAgenticReadinessThreshold(t *testing.T) {
+func TestAgenticWaitsForFirstStageSuccess(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		states   []v1.ProwJobState
@@ -349,11 +349,11 @@ func TestAgenticReadinessThreshold(t *testing.T) {
 		selected bool
 	}{
 		{"missing", nil, false, false},
-		{"one-of-three", []v1.ProwJobState{v1.SuccessState, v1.PendingState, v1.PendingState}, false, false},
-		{"rounded-up-half", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.PendingState}, true, false},
+		{"pending", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.PendingState}, false, false},
+		{"all-green", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.SuccessState}, true, false},
 		{"failure-veto", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.FailureState}, false, false},
 		{"abort-veto", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.AbortedState}, false, false},
-		{"selected-awaits-all-green", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.PendingState}, true, true},
+		{"selected-awaits-all-green", []v1.ProwJobState{v1.SuccessState, v1.SuccessState, v1.PendingState}, false, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
@@ -384,13 +384,14 @@ func TestAgenticReadinessThreshold(t *testing.T) {
 			_, state := f.gate(t)
 			require.Equal(t, test.active, state.ActivatedAt != nil)
 			require.Equal(t, test.active && !test.selected, state.WaitingSince != nil)
-			require.Nil(t, state.Dispatch, "threshold must not dispatch before selection/all prerequisites")
+			require.Nil(t, state.Dispatch, "first-stage success and a selection are both required")
 			if test.active {
 				require.Len(t, f.gh.checks, 1)
 				check := f.gh.checks[0]
 				require.Equal(t, "in_progress", check.Status)
 				if !test.selected {
 					require.Equal(t, "Waiting for Chai", check.Output.Title)
+					require.Equal(t, &f.now, state.WaitingSince, "timeout starts only after first-stage success")
 				}
 				require.Contains(t, check.Output.Summary, "Pipeline for `"+f.gh.pr.Head.SHA+"` → `main`.")
 				require.Equal(t, agenticExternalID("org", "repo", 42), check.ExternalID)
@@ -404,6 +405,7 @@ func TestAgenticReadinessThreshold(t *testing.T) {
 				require.NoError(t, f.jobs.Update(context.Background(), &pj))
 				f.reconcile(t, nil)
 				require.Equal(t, 1, f.jobs.creates)
+				require.Len(t, f.gh.checks, 1, "create the gate only after the final first-stage success")
 			}
 		})
 	}

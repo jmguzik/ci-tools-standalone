@@ -230,32 +230,28 @@ func latestAgenticJobs(pjs []v1.ProwJob, org, repo string, pr *github.PullReques
 	return latest
 }
 
-// Readiness counts applicable required first-stage jobs, never second-stage runs.
-func agenticFirstStageProgress(static []config.Presubmit, latest map[string]*v1.ProwJob, witnesses map[string]firstStageSuccessWitness, branch string) (eligible, ready, failed bool) {
-	passed, total := 0, 0
+// All applicable required first-stage jobs must pass; second-stage runs do not count.
+func agenticFirstStageComplete(static []config.Presubmit, latest map[string]*v1.ProwJob, witnesses map[string]firstStageSuccessWitness, branch string) (ready, failed bool) {
 	ready = true
 	for _, p := range static {
 		if !p.ContextRequired() || agenticSecondStage(p) || !p.CouldRun(branch) {
 			continue
 		}
 		pj := latest[p.Name]
-		// Conditional first-stage jobs absent at this revision do not count.
+		// Conditional first-stage jobs absent at this revision do not block completion.
 		_, witnessed := witnesses[p.Name]
 		if !p.AlwaysRun && pj == nil && !witnessed {
 			continue
 		}
-		total++
 		if pj != nil && (pj.Status.State == v1.FailureState || pj.Status.State == v1.ErrorState || pj.Status.State == v1.AbortedState) {
 			failed = true
 		}
 		if pj != nil && pj.Spec.Context != p.Context {
 			delete(witnesses, p.Name)
 			ready = false
-		} else if firstStageJobPassed(p, pj, true, witnesses) {
-			passed++
-		} else {
+		} else if !firstStageJobPassed(p, pj, true, witnesses) {
 			ready = false
 		}
 	}
-	return !failed && passed >= (total+1)/2, ready, failed
+	return ready, failed
 }
