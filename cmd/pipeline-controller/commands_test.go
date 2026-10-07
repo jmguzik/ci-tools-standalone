@@ -20,9 +20,10 @@ func TestPipelineHelpDoesNotReconcile(t *testing.T) {
 			}
 			event := github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: f.gh.pr.Base.Repo,
 				Issue: github.Issue{Number: 42, PullRequest: &struct{}{}}, Comment: github.IssueComment{Body: "/pipeline help"}}
-			if mode == "edited" {
+			switch mode {
+			case "edited":
 				event.Action = github.IssueCommentActionEdited
-			} else if mode == "not-pr" {
+			case "not-pr":
 				event.Issue.PullRequest = nil
 			}
 			cw.handleIssueComment(f.a.logger, event)
