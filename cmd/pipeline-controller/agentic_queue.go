@@ -70,7 +70,8 @@ func (a *agenticController) enqueue(org, repo string, number int, comment *githu
 func agenticUnfinished(r *agenticRecord) bool {
 	s := r.State
 	return r.Dirty || (!s.Inactive && (s.PendingDispatch || s.RevisionPending ||
-		(s.Command != nil && !s.Command.Applied) || (s.Review != nil && !s.ReviewPosted && s.ActivatedAt != nil)))
+		(s.Command != nil && !s.Command.Applied) || (s.Review != nil && !s.ReviewPosted && s.ActivatedAt != nil) ||
+		(agenticDispatchComplete(s) && r.Gate.Conclusion != "success")))
 }
 
 // Caller holds queueMu. Concurrent events cannot shorten a server cooldown.

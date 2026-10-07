@@ -34,7 +34,7 @@ func TestAgenticProwJobInitialCreates(t *testing.T) {
 }
 
 func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
-	for _, phase := range []string{"untracked", "first-stage", "manual-plan", "empty-plan", "inflight", "completed"} {
+	for _, phase := range []string{"untracked", "first-stage", "manual-plan", "empty-plan", "dispatched"} {
 		t.Run(phase, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				mode := "auto"
@@ -52,11 +52,7 @@ func TestAgenticRestartDoesNotScanGitHub(t *testing.T) {
 						f.plan(t, "job-a")
 					}
 					f.reconcile(t, nil)
-					if phase == "completed" {
-						f.report(t, v1.SuccessState)
-						f.reconcile(t, nil)
-					}
-					if phase == "empty-plan" || phase == "completed" {
+					if phase == "empty-plan" || phase == "dispatched" {
 						gate, _ := f.gate(t)
 						require.Equal(t, "success", gate.Conclusion)
 					}

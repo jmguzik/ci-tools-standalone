@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -53,7 +54,7 @@ func assertAgenticIdle(t *testing.T, f *agenticFixture, duration time.Duration) 
 
 func restartAgenticFixture(f *agenticFixture) {
 	previous := f.a
-	f.a = &agenticController{gh: previous.gh, reader: previous.reader, apiReader: previous.apiReader, config: previous.config,
+	f.a = &agenticController{gh: previous.gh, reader: previous.reader, config: previous.config,
 		watcher: previous.watcher, lgtmWatcher: previous.lgtmWatcher, appID: previous.appID,
 		logger: previous.logger, options: previous.options, now: previous.now}
 }
@@ -149,21 +150,56 @@ func TestAgenticQueueKeepsEventsArrivingDuringDispatch(t *testing.T) {
 }
 
 func TestAgenticQueueRecoversAmbiguousDispatchWithoutReposting(t *testing.T) {
+	for _, checkpointed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("context-checkpoint-%t", checkpointed), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newScheduledAgenticFixture(t, "auto")
+				f.passFirstStage(t)
+				f.plan(t, "job-a")
+				f.gh.failCommentAfterWrite = true
+				require.Error(t, f.tryReconcile(nil))
+				if !checkpointed {
+					// Earlier schema-2 records lack the context-publication checkpoint.
+					_, state := f.gate(t)
+					state.Dispatch.ContextsPublished = false
+					require.NoError(t, f.a.writeRecord(t.Context(), state.record))
+				}
+				comments := len(f.gh.comments)
+				require.NoError(t, f.a.closeStore())
+				restartAgenticFixture(f)
+				stop := startAgenticRunner(f)
+				defer stop()
+				_, state := f.gate(t)
+				require.True(t, state.Dispatch.Posted)
+				require.Equal(t, "success", f.gh.checks[0].Conclusion)
+				require.Equal(t, 1, f.gh.statusWrites, "retry reset an already-reported job context")
+				require.Len(t, f.gh.comments, comments)
+				require.Equal(t, 1, f.jobs.creates)
+				assertAgenticIdle(t, f, time.Hour)
+			})
+		})
+	}
+}
+
+func TestAgenticQueueCompletesPreviouslyPostedDispatch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := newScheduledAgenticFixture(t, "auto")
 		f.passFirstStage(t)
 		f.plan(t, "job-a")
-		f.gh.failCommentAfterWrite = true
-		require.Error(t, f.tryReconcile(nil))
-		comments := len(f.gh.comments)
+		f.reconcile(t, nil)
+		_, state := f.gate(t)
+		// Existing schema-2 records may still have the old results-waiting gate.
+		state.record.Gate.Status, state.record.Gate.Conclusion = "in_progress", ""
+		f.gh.checks[0].Status, f.gh.checks[0].Conclusion = "in_progress", ""
+		require.NoError(t, f.a.writeRecord(t.Context(), state.record))
+		comments, writes := len(f.gh.comments), f.gh.statusWrites
 		require.NoError(t, f.a.closeStore())
 		restartAgenticFixture(f)
 		stop := startAgenticRunner(f)
 		defer stop()
-		_, state := f.gate(t)
-		require.True(t, state.Dispatch.Posted)
+		require.Equal(t, "success", f.gh.checks[0].Conclusion)
 		require.Len(t, f.gh.comments, comments)
-		require.Equal(t, 1, f.jobs.creates)
+		require.Equal(t, writes, f.gh.statusWrites)
 		assertAgenticIdle(t, f, time.Hour)
 	})
 }

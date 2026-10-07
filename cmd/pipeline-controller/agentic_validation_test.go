@@ -108,7 +108,7 @@ func TestAgenticResolveJobsValidation(t *testing.T) {
 		{name: "duplicate names", names: []string{"protected", "protected"}, wantErr: true},
 		{name: "too many jobs", names: make([]string, 257), wantErr: true},
 		{name: "ambiguous definition", names: []string{"protected"}, mutate: func(j []config.Presubmit) []config.Presubmit { return append(j, j[0]) }, wantErr: true},
-		{name: "reserved context", names: []string{"protected"}, mutate: func(j []config.Presubmit) []config.Presubmit { j[0].Context = agenticGate; return j }, wantErr: true},
+		{name: "reserved context", names: []string{"protected"}, mutate: func(j []config.Presubmit) []config.Presubmit { j[0].Context = pipelineGate; return j }, wantErr: true},
 		{name: "missing context", names: []string{"protected"}, mutate: func(j []config.Presubmit) []config.Presubmit { j[0].Context = ""; return j }, wantErr: true},
 		{name: "unselected context collision", names: []string{"protected"}, mutate: func(j []config.Presubmit) []config.Presubmit { j[1].Context = j[0].Context; return j }, wantErr: true},
 		{name: "other branch context is independent", names: []string{"protected"}, mutate: func(j []config.Presubmit) []config.Presubmit { j[9].Context = j[0].Context; return j }},

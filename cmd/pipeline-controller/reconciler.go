@@ -87,6 +87,7 @@ type reconciler struct {
 	lgtmWatcher        *watcher
 	pipelineAutoCache  *PipelineAutoCache
 	agentic            *agenticController
+	checks             *dispatchChecks
 }
 
 func NewReconciler(
@@ -270,7 +271,7 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 		return err
 	}
 
-	return sendComment(presubmits, &pj, r.ghc, func() { r.ids.Delete(composeKey(pj.Spec.Refs)) }, r.lister)
+	return sendCommentWithMode(presubmits, &pj, r.ghc, func() { r.ids.Delete(composeKey(pj.Spec.Refs)) }, r.lister, modeDelta, false, r.checks)
 }
 
 func (r *reconciler) reportSuccessOnPR(ctx context.Context, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {

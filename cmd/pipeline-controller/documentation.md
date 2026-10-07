@@ -10,6 +10,22 @@ All modes support [agentic selection](#agentic-selection-chai). Otherwise,
 the normal-selection behavior below applies.
 The same opening notification is used with either selection method.
 
+With GitHub App authentication, traditional pipelines create
+`ci/tests-dispatched` on PR open/push/reopen. It stays pending until the configured
+trigger dispatches the applicable jobs through a `/test` comment, then succeeds
+without waiting for test results or Chai. An empty/already-dispatched selection
+also succeeds; planning or dispatch errors never turn it green. Individual job
+contexts gate test results and are published pending before `/test`.
+Publication failures block scheduling. Require the controller-App check in
+Tide/branch protection on enrolled branches to prevent merges when dispatch is missed.
+Empty retries leave successful checks unchanged. No additional flags, storage
+or startup scan are needed for traditional mode.
+
+`/pipeline help` lists all commands with short descriptions.
+`/pipeline tests-dispatched` manually makes `ci/tests-dispatched` green for the
+current HEAD/base (organization members or repository collaborators only).
+It does not run tests or override job results. A new push starts a fresh pipeline.
+
 ## Three Operating Modes
 
 ### 1. Manual Mode
@@ -248,32 +264,33 @@ cannot replace fallback or a dispatched selection; push a new commit to change i
 - `/pipeline agent-review` requests a fresh plan with a new timeout and clears opt-out before dispatch; use it after a same-SHA base retarget.
 - `/pipeline skip-agent-review` adds `pipeline-skip-agent-review`: normal selection persists across pushes; already-dispatched jobs stay unchanged.
 
-`ci/tests-dispatched` succeeds only when all first-stage and selected second-stage
-jobs pass. Results come from the shared ProwJob cache, not GitHub statuses or
-reporter acknowledgments. Same-second runs are treated conservatively: a tied
-pending or failing run blocks success. Both modes post `/test` comments; Hook creates jobs.
+`ci/tests-dispatched` succeeds after dispatch, without waiting for job results.
+Both modes post `/test` comments; Hook creates jobs. Dispatch publishes
+pending contexts for requested jobs before posting; job contexts gate results.
+Agentic context publication is saved before posting, so retries do not reset job results.
 Requests are saved before posting and retries deduplicate controller-authored
-comments. Posting alone never opens the gate. Forced reruns exclude existing
-runs and reopen the same check before dispatch; a missing Hook event needs a
-new manual command. A new SHA starts a new decision/check; old results do not count.
+comments. Forced reruns reopen the same check before dispatch; a missing Hook
+event needs a new manual command. A new SHA starts a new decision/check.
+The manual dispatch override persists for this revision; `/pipeline required`,
+`/pipeline remaining`, or an accepted `/pipeline agent-review` resumes dispatch.
 
 One compact JSON record per PR on the existing PVC stores intent, gate identity
-and success witnesses for jobs Sinker removes—not GitHub status history or retry
-timers. New revisions reset it; observed closure deletes it. Malformed state
+and first-stage success witnesses—not GitHub status history or retry timers.
+New revisions reset it; observed closure deletes it. Malformed state
 blocks startup and is preserved for repair.
-The record schema is now version 2. If upgrading an older agentic deployment,
-use a fresh state directory (retain the old one) and fresh PR heads.
+Existing schema-2 records are reused; pre-v2 upgrades require a fresh state
+directory (retain the old one) and fresh PR heads.
 Optional `--agentic-state-ttl=720h` expires PR records unmodified for 30 days (`0`: disabled). Age uses last file modification, refreshed by successful writes, not PR creation. Cleanup checks locally at startup, periodically and before reuse; no GitHub calls. Even open PRs lose their saved decision and may rerun tests; gates stay unchanged until another event. Temporary files are not covered.
 Enabling TTL permanently requires a fresh post-tracking plan when local state is missing, even if TTL is later disabled. Tracked PRs still accept early plans for new commits.
 The standard PR-keyed workqueue restores only selection deadlines and unfinished
 actions. No GitHub scan, initial-job replay or polling; missed events may require
 another event or manual command. Operational retries honor server cooldowns.
-Dispatch and gate completion still validate current refs and authorization; selected contexts remain tracked after configuration changes.
+Dispatch validates current refs and authorization. Job contexts report results independently of the dispatch check.
 
 Before enrolling:
 
 - Configure Chai's authenticated **Check runs** and **Issue comments** webhook delivery and matching identities; forward `pull_request` and `issue_comment` to the controller. GitHub emits no queued-to-in-progress webhook, so creation is the wake-up.
-- Grant App Checks read/write, PR/comment/label/member access; Kubernetes ProwJob `get/list/watch`. Keep permissions needed by ordinary mode. Use distinct HEADs.
+- Grant App Checks and commit-status read/write, PR/comment/label/member access; Kubernetes ProwJob `get/list/watch`. Keep permissions needed by ordinary mode. Use distinct HEADs.
 - Mount a durable, writable PVC supporting file locks, atomic rename and `fsync` at `--agentic-state-dir`; deploy one replica with `Recreate`. An exclusive file lock rejects a second writer. Back up the volume; do not prune open-PR state. Normal-only enrollment and dry run need no storage.
 - Require the controller-App gate in GitHub and Tide only on enrolled branches; make it optional elsewhere. Keep other required contexts and Tide batch coverage.
 - Enroll a fresh HEAD if old placeholders remain; rerun first-stage jobs removed before success was recorded. Deployment configuration is in `openshift/release`.

@@ -5,11 +5,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 )
 
 func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
-	for _, action := range []string{"ownership", "dispatch", "first-success", "lookup-error"} {
+	for _, action := range []string{"ownership", "dispatch", "lookup-error"} {
 		t.Run(action, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
 			if action == "dispatch" || action == "lookup-error" {
@@ -17,10 +16,6 @@ func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
 			}
 			f.plan(t, "job-a")
 			f.passFirstStage(t)
-			if action == "first-success" {
-				f.reconcile(t, nil)
-				f.report(t, v1.SuccessState)
-			}
 			created := f.jobs.creates
 			f.gh.getPullRequestsCalls = 0
 			if action == "lookup-error" {
@@ -45,17 +40,9 @@ func TestAgenticFreshCollisionCheckBeforeActions(t *testing.T) {
 }
 
 func TestAgenticStableEventDoesNotListRepositoryPulls(t *testing.T) {
-	for _, reported := range []bool{false, true} {
-		t.Run(map[bool]string{false: "inflight", true: "complete"}[reported], func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
-			f.reconcile(t, nil)
-			if reported {
-				f.report(t, v1.SuccessState)
-				f.reconcile(t, nil)
-			}
-			f.gh.getPullRequestsCalls = 0
-			f.reconcile(t, nil)
-			require.Zero(t, f.gh.getPullRequestsCalls)
-		})
-	}
+	f := newReadyAgenticFixture(t, "auto", "job-a")
+	f.reconcile(t, nil)
+	f.gh.getPullRequestsCalls = 0
+	f.reconcile(t, nil)
+	require.Zero(t, f.gh.getPullRequestsCalls)
 }

@@ -11,15 +11,15 @@ import (
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-var agenticCommandRE = regexp.MustCompile(`(?im)^/pipeline[\t ]+(required|remaining|auto|agent-review|skip-agent-review)[\t ]*$`)
+var agenticCommandRE = regexp.MustCompile(`(?im)^/pipeline[\t ]+(required|remaining|auto|agent-review|skip-agent-review|tests-dispatched)[\t ]*$`)
 
 // Preserve ordinary-mode command prefixes while filtering unrelated comments
 // before any GitHub read, including in mixed-mode repositories.
-var pipelineCommentRE = regexp.MustCompile(`(?im)^/pipeline\s+(required|remaining|auto|agent-review|skip-agent-review)`)
+var pipelineCommentRE = regexp.MustCompile(`(?im)^/pipeline\s+(required|remaining|auto|agent-review|skip-agent-review|tests-dispatched)`)
 
 func validAgenticCommand(command string) bool {
 	switch command {
-	case "required", "remaining", "auto", "agent-review", "skip-agent-review":
+	case "required", "remaining", "auto", "agent-review", "skip-agent-review", "tests-dispatched":
 		return true
 	default:
 		return false
@@ -37,7 +37,7 @@ func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticS
 	if comment.CreatedAt.IsZero() || comment.CreatedAt.Before(state.ObservedAt) {
 		return nil
 	}
-	trusted, err := a.trustedCommandAuthor(state.Org, state.Repo, comment.User.Login)
+	trusted, err := trustedPipelineCommandAuthor(a.gh, state.Org, state.Repo, comment.User.Login)
 	if err != nil {
 		return err
 	}
@@ -56,25 +56,17 @@ func (a *agenticController) recordCommand(gate *github.CheckRun, state *agenticS
 	}
 	state.LastCommandID = comment.ID
 	state.Command = command
+	if command.Command == "tests-dispatched" {
+		return a.writeRecord(context.Background(), state.record) // Success-only commands must not reopen a green gate.
+	}
 	return a.saveState(gate, state, "", "Pipeline request recorded for this HEAD/base.")
-}
-
-func (a *agenticController) trustedCommandAuthor(org, repo, login string) (bool, error) {
-	if login == "" {
-		return false, nil
-	}
-	member, err := a.gh.IsMember(org, login)
-	if err != nil || member {
-		return member, err
-	}
-	return a.gh.IsCollaborator(org, repo, login)
 }
 
 func (a *agenticController) explainUnboundCommand(state *agenticState, comment github.IssueComment, comments []github.IssueComment) error {
 	if state.Command != nil || state.ManualRequestID != 0 || comment.ID > state.LastCommandID || !agenticCommandRE.MatchString(comment.Body) {
 		return nil
 	}
-	trusted, err := a.trustedCommandAuthor(state.Org, state.Repo, comment.User.Login)
+	trusted, err := trustedPipelineCommandAuthor(a.gh, state.Org, state.Repo, comment.User.Login)
 	if err != nil || !trusted {
 		return err
 	}
@@ -82,15 +74,23 @@ func (a *agenticController) explainUnboundCommand(state *agenticState, comment g
 	return a.ensureComment(state, comments, body)
 }
 
-func (a *agenticController) ensureComment(state *agenticState, comments []github.IssueComment, body string) error {
+func (a *agenticController) hasOwnedComment(comments []github.IssueComment, body string) (bool, error) {
 	isBot, err := a.gh.BotUserChecker()
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, comment := range comments {
 		if isBot(comment.User.Login) && comment.Body == body {
-			return nil
+			return true, nil
 		}
+	}
+	return false, nil
+}
+
+func (a *agenticController) ensureComment(state *agenticState, comments []github.IssueComment, body string) error {
+	exists, err := a.hasOwnedComment(comments, body)
+	if err != nil || exists {
+		return err
 	}
 	return a.gh.CreateComment(state.Org, state.Repo, state.Number, body)
 }
@@ -107,11 +107,18 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 		}
 		switch command.Command {
 		case "required":
+			state.DispatchOverrideID = 0
 			state.ManualRequestID, state.ForceRequestID = state.LastCommandID, state.LastCommandID
 			state.Dispatch = nil
 		case "remaining":
+			state.DispatchOverrideID = 0
 			state.ManualRequestID = state.LastCommandID
 			state.ForceRequestID = 0
+		case "tests-dispatched":
+			state.DispatchOverrideID = state.LastCommandID
+			state.PendingDispatch, state.WaitingSince, state.Review = true, nil, nil
+			command.Applied = true
+			return a.writeRecord(context.Background(), state.record)
 		case "auto":
 			if cfg.Trigger != "lgtm" {
 				body := fmt.Sprintf("`/pipeline auto` is available only in LGTM mode.\n\n<!-- pipeline-controller:command:%d -->", state.LastCommandID)
@@ -146,6 +153,7 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 					return err
 				}
 			} else {
+				state.DispatchOverrideID = 0
 				if hasAgenticLabel(pr, agenticSkipLabel) {
 					if err := a.gh.RemoveLabel(state.Org, state.Repo, state.Number, agenticSkipLabel); err != nil {
 						return err
@@ -175,7 +183,7 @@ func (a *agenticController) applyCommand(gate *github.CheckRun, state *agenticSt
 			return err
 		}
 	}
-	if state.Review != nil && !state.ReviewPosted && state.ActivatedAt != nil {
+	if state.DispatchOverrideID == 0 && state.Review != nil && !state.ReviewPosted && state.ActivatedAt != nil {
 		if err := a.ensureComment(state, comments, formatAgenticReview(*state.Review)); err != nil {
 			return err
 		}

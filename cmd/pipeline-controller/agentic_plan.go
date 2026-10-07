@@ -13,7 +13,6 @@ import (
 
 const (
 	agenticPlanMarker = "Chai test plan"
-	agenticGate       = "ci/tests-dispatched"
 	agenticSkipLabel  = "pipeline-skip-agent-review"
 )
 
@@ -149,7 +148,7 @@ func resolveAgenticJobs(names []string, static []config.Presubmit, branch string
 			return nil, fmt.Errorf("job %q must resolve to one static presubmit for branch %q", name, branch)
 		}
 		p := matches[0]
-		if !agenticAllowedJob(p) || p.SkipReport || p.Context == "" || p.Context == agenticGate {
+		if !agenticAllowedJob(p) || p.SkipReport || p.Context == "" || p.Context == pipelineGate {
 			return nil, fmt.Errorf("job %q must be a reporting second-stage presubmit", name)
 		}
 		if seenContexts[p.Context] {

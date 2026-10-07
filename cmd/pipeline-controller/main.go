@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/prow/pkg/logrusutil"
 )
 
-const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs, `/pipeline remaining` to request missing second-stage tests, or `/pipeline required` to rerun the selected second-stage set."
+const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs, `/pipeline remaining` to request missing second-stage tests, or `/pipeline required` to rerun the selected second-stage set. Use `/pipeline help` for all commands."
 
 const RepoNotConfiguredMessage = "This repository is not currently configured for [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) support."
 
@@ -111,6 +111,7 @@ type clientWrapper struct {
 	pjLister           ctrlruntimeclient.Reader
 	pipelineAutoCache  *PipelineAutoCache
 	agentic            *agenticController
+	checks             *dispatchChecks
 	// ids provides a per-SHA idempotency guard for the LGTM and /pipeline
 	// remaining scheduling paths, which do not run under the reconciler's own
 	// ids cache. Keyed by composeKey (org/repo/pr/baseRef/SHA).
@@ -317,7 +318,7 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 		}
 
 		logger.Info("Sending comment for LGTM label addition")
-		if err := sendComment(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister); err != nil {
+		if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister, modeDelta, false, cw.checks); err != nil {
 			logger.WithError(err).Error("failed to send a comment")
 		} else {
 			logger.Info("Successfully sent comment for LGTM label addition")
@@ -328,6 +329,12 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueCommentEvent) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
+	if event.Action == github.IssueCommentActionCreated && event.Issue.IsPullRequest() && pipelineHelpRE.MatchString(event.Comment.Body) {
+		if err := cw.ghc.CreateComment(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, pipelineHelp); err != nil {
+			l.WithError(err).Error("failed to post pipeline help")
+		}
+		return
+	}
 	if cw.agentic != nil && cw.agentic.handleIssueComment(l, event) {
 		return
 	}
@@ -355,8 +362,10 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	matchesRequired := pipelineRequiredRegex.MatchString(event.Comment.Body)
 	matchesRemaining := pipelineRemainingRegex.MatchString(event.Comment.Body)
 	matchesAuto := pipelineAutoRegex.MatchString(event.Comment.Body)
+	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 &&
+		pipelineTestsDispatchedRE.MatchString(event.Comment.Body) && len(agenticCommandRE.FindAllStringSubmatch(event.Comment.Body, -1)) == 1
 
-	if !matchesRequired && !matchesRemaining && !matchesAuto {
+	if !matchesRequired && !matchesRemaining && !matchesAuto && !matchesDispatched {
 		return
 	}
 
@@ -371,6 +380,8 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	})
 
 	switch {
+	case matchesDispatched:
+		logger.Info("Processing /pipeline tests-dispatched comment")
 	case matchesAuto:
 		logger.Info("Processing /pipeline auto comment")
 	case matchesRemaining && !matchesRequired:
@@ -384,7 +395,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	presubmits := cw.configDataProvider.GetPresubmits(org + "/" + repo)
 
 	// Check if there are any pipeline-controlled jobs
-	if len(presubmits.protected) == 0 && len(presubmits.alwaysRequired) == 0 &&
+	if !matchesDispatched && len(presubmits.protected) == 0 && len(presubmits.alwaysRequired) == 0 &&
 		len(presubmits.conditionallyRequired) == 0 && len(presubmits.pipelineConditionallyRequired) == 0 &&
 		len(presubmits.pipelineSkipOnlyRequired) == 0 {
 		return
@@ -431,6 +442,26 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 
 	if !branchEnabled {
 		logger.WithField("base_branch", baseBranch).Debug("Branch not enabled for pipeline controller, skipping")
+		return
+	}
+	if matchesDispatched {
+		if cw.checks == nil {
+			if err := cw.ghc.CreateComment(org, repo, number, "`/pipeline tests-dispatched` requires GitHub App authentication."); err != nil {
+				logger.WithError(err).Error("failed to explain unavailable command")
+			}
+			return
+		}
+		trusted, err := trustedPipelineCommandAuthor(cw.checks.gh, org, repo, event.Comment.User.Login)
+		if err != nil || !trusted || pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" {
+			if err != nil {
+				logger.WithError(err).Error("failed to authorize dispatch override")
+			}
+			return
+		}
+		refs := &v1.Refs{Org: org, Repo: repo, BaseRef: pr.Base.Ref, Pulls: []v1.Pull{{Number: number, SHA: pr.Head.SHA}}}
+		if err := cw.checks.markDispatched(refs, event.Comment.ID); err != nil {
+			logger.WithError(err).Error("failed to mark tests dispatched")
+		}
 		return
 	}
 
@@ -539,7 +570,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 
 	// Generate the comment with test/override commands. explicit=true: a human
 	// /pipeline command always gets a response, even when nothing needs scheduling.
-	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode, true); err != nil {
+	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode, true, cw.checks); err != nil {
 		logger.WithError(err).Error("failed to send comment in response to pipeline command")
 	}
 }
@@ -615,6 +646,12 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 		"pr":   number,
 		"sha":  sha,
 	})
+	if sha != "" {
+		refs := &v1.Refs{Org: org, Repo: repo, BaseRef: baseBranch, Pulls: []v1.Pull{{Number: number, SHA: sha}}}
+		if err := cw.checks.pending(refs); err != nil {
+			logger.WithError(err).Error("failed to create pipeline dispatch check")
+		}
+	}
 
 	// Get changed files for this PR
 	changedFiles, err := cw.ghc.GetPullRequestChanges(org, repo, number)
@@ -849,7 +886,12 @@ func main() {
 			logger.WithError(err).Fatal("invalid GitHub App ID")
 		}
 	}
-	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), apiReader: mgr.GetAPIReader(), config: cfg,
+	var checks *dispatchChecks
+	if appID > 0 {
+		checks = &dispatchChecks{gh: githubClient, appID: appID}
+	}
+	reconciler.checks = checks
+	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), config: cfg,
 		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
 	if err := agentic.validateEnrollment(); err != nil {
 		logger.WithError(err).Fatal("invalid agentic configuration")
@@ -874,6 +916,7 @@ func main() {
 		pjLister:           mgr.GetCache(),
 		pipelineAutoCache:  pipelineAutoCache,
 		agentic:            agentic,
+		checks:             checks,
 	}
 
 	// Evict stale per-SHA idempotency keys from the LGTM / /pipeline remaining

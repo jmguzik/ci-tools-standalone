@@ -24,13 +24,10 @@ import (
 
 type agenticGitHubClient interface {
 	minimalGhClient
+	pipelineCheckClient
+	pipelineCommandClient
 	GetPullRequests(org, repo string) ([]github.PullRequest, error)
 	ListIssueComments(org, repo string, number int) ([]github.IssueComment, error)
-	ListCheckRuns(org, repo, ref string) (*github.CheckRunList, error)
-	CreateCheckRun(org, repo string, check github.CheckRun) (int64, error)
-	UpdateCheckRun(org, repo string, id int64, check github.CheckRun) error
-	IsMember(org, user string) (bool, error)
-	IsCollaborator(org, repo, user string) (bool, error)
 	BotUserChecker() (func(string) bool, error)
 	RemoveLabel(org, repo string, number int, label string) error
 }
@@ -49,55 +46,54 @@ type agenticCommand struct {
 }
 
 type agenticExecution struct {
-	Job       string   `json:"job"`
-	Context   string   `json:"context"`
-	Previous  []string `json:"previous,omitempty"`
-	Requested bool     `json:"requested,omitempty"`
-	Passed    bool     `json:"passed,omitempty"`
+	Job       string `json:"job"`
+	Context   string `json:"context"`
+	Requested bool   `json:"requested,omitempty"`
 }
 
 type agenticDispatch struct {
-	ID         string             `json:"id"`
-	Posted     bool               `json:"posted,omitempty"`
-	Executions []agenticExecution `json:"executions"`
+	ID                string             `json:"id"`
+	ContextsPublished bool               `json:"contexts_published,omitempty"`
+	Posted            bool               `json:"posted,omitempty"`
+	Executions        []agenticExecution `json:"executions"`
 }
 
 // The per-PR filesystem record is authoritative. No dispatch is allowed
 // before its selection and comment request have been saved there. Hook owns
-// ProwJob creation; the controller observes the resulting executions.
+// ProwJob creation; posting its scheduling comment completes dispatch.
 type agenticState struct {
-	Version          int                                 `json:"version"`
-	Org              string                              `json:"org"`
-	Repo             string                              `json:"repo"`
-	Number           int                                 `json:"number"`
-	HeadSHA          string                              `json:"head_sha"`
-	BaseBranch       string                              `json:"base_branch"`
-	ObservedAt       time.Time                           `json:"observed_at"`
-	RevisionID       string                              `json:"revision_id"`
-	Inactive         bool                                `json:"inactive,omitempty"`
-	PlanNotBefore    *time.Time                          `json:"plan_not_before,omitempty"`
-	PlanCommentFloor int                                 `json:"plan_comment_floor,omitempty"`
-	LastCommandID    int                                 `json:"last_command_id,omitempty"`
-	ManualRequestID  int                                 `json:"manual_request_id,omitempty"`
-	ForceRequestID   int                                 `json:"force_request_id,omitempty"`
-	Command          *agenticCommand                     `json:"command,omitempty"`
-	Review           *agenticReviewRequest               `json:"review,omitempty"`
-	ReviewPosted     bool                                `json:"review_posted,omitempty"`
-	Plan             *agenticSelection                   `json:"plan,omitempty"`
-	Frozen           bool                                `json:"frozen,omitempty"`
-	ActivatedAt      *time.Time                          `json:"activated_at,omitempty"`
-	WaitingSince     *time.Time                          `json:"waiting_since,omitempty"`
-	Dispatch         *agenticDispatch                    `json:"dispatch,omitempty"`
-	FirstStage       map[string]firstStageSuccessWitness `json:"first_stage,omitempty"`
-	PendingDispatch  bool                                `json:"pending_dispatch,omitempty"`
-	RevisionPending  bool                                `json:"revision_pending,omitempty"`
-	record           *agenticRecord
+	Version            int                                 `json:"version"`
+	Org                string                              `json:"org"`
+	Repo               string                              `json:"repo"`
+	Number             int                                 `json:"number"`
+	HeadSHA            string                              `json:"head_sha"`
+	BaseBranch         string                              `json:"base_branch"`
+	ObservedAt         time.Time                           `json:"observed_at"`
+	RevisionID         string                              `json:"revision_id"`
+	Inactive           bool                                `json:"inactive,omitempty"`
+	PlanNotBefore      *time.Time                          `json:"plan_not_before,omitempty"`
+	PlanCommentFloor   int                                 `json:"plan_comment_floor,omitempty"`
+	LastCommandID      int                                 `json:"last_command_id,omitempty"`
+	ManualRequestID    int                                 `json:"manual_request_id,omitempty"`
+	ForceRequestID     int                                 `json:"force_request_id,omitempty"`
+	DispatchOverrideID int                                 `json:"dispatch_override_id,omitempty"`
+	Command            *agenticCommand                     `json:"command,omitempty"`
+	Review             *agenticReviewRequest               `json:"review,omitempty"`
+	ReviewPosted       bool                                `json:"review_posted,omitempty"`
+	Plan               *agenticSelection                   `json:"plan,omitempty"`
+	Frozen             bool                                `json:"frozen,omitempty"`
+	ActivatedAt        *time.Time                          `json:"activated_at,omitempty"`
+	WaitingSince       *time.Time                          `json:"waiting_since,omitempty"`
+	Dispatch           *agenticDispatch                    `json:"dispatch,omitempty"`
+	FirstStage         map[string]firstStageSuccessWitness `json:"first_stage,omitempty"`
+	PendingDispatch    bool                                `json:"pending_dispatch,omitempty"`
+	RevisionPending    bool                                `json:"revision_pending,omitempty"`
+	record             *agenticRecord
 }
 
 type agenticController struct {
 	gh          agenticGitHubClient
 	reader      ctrlruntimeclient.Reader // shared ProwJob cache
-	apiReader   ctrlruntimeclient.Reader // live snapshot only for forced-rerun exclusions
 	config      config.Getter
 	watcher     *watcher
 	lgtmWatcher *watcher
@@ -146,10 +142,6 @@ func agenticID(parts ...string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(parts, "\x00"))))[:32]
 }
 
-func agenticExternalID(org, repo string, number int) string {
-	return fmt.Sprintf("pipeline-controller:%s/%s#%d", org, repo, number)
-}
-
 func newAgenticState(org, repo string, pr *github.PullRequest, now time.Time) *agenticState {
 	return &agenticState{Version: agenticStateVersion, Org: org, Repo: repo, Number: pr.Number, HeadSHA: pr.Head.SHA, BaseBranch: pr.Base.Ref, ObservedAt: now,
 		RevisionID: agenticID(org, repo, strconv.Itoa(pr.Number), pr.Head.SHA, pr.Base.Ref, now.Format(time.RFC3339Nano)), RevisionPending: true}
@@ -171,7 +163,7 @@ func (a *agenticController) loadState(org, repo string, pr *github.PullRequest) 
 		if checks != nil {
 			for i := range checks.CheckRuns {
 				check := &checks.CheckRuns[i]
-				if check.Name == agenticGate && check.App.ID == a.appID && check.ExternalID == agenticExternalID(org, repo, pr.Number) && (gate == nil || check.ID > gate.ID) {
+				if check.Name == pipelineGate && check.App.ID == a.appID && check.ExternalID == pipelineExternalID(org, repo, pr.Number) && (gate == nil || check.ID > gate.ID) {
 					gate = check
 				}
 			}
@@ -223,29 +215,15 @@ func (a *agenticController) loadState(org, repo string, pr *github.PullRequest) 
 
 // Used only when the local record has no gate for this SHA.
 func (a *agenticController) findGate(org, repo string, pr *github.PullRequest) (*github.CheckRun, error) {
-	checks, err := a.gh.ListCheckRuns(org, repo, pr.Head.SHA)
-	if err != nil {
-		return nil, err
-	}
-	gate := &github.CheckRun{}
-	if checks == nil {
-		return nil, fmt.Errorf("empty check-run response")
-	}
-	for _, check := range checks.CheckRuns {
-		if check.Name == agenticGate && check.App.ID == a.appID && check.ID > gate.ID {
-			copy := check
-			gate = &copy
-		}
-	}
-	return gate, nil
+	return findPipelineCheck(a.gh, a.appID, org, repo, pr.Head.SHA)
 }
 
 func validateAgenticState(state *agenticState) error {
-	if state.ManualRequestID < 0 || state.ManualRequestID > state.LastCommandID || state.ForceRequestID < 0 || state.ForceRequestID > state.ManualRequestID || state.PlanCommentFloor < 0 {
+	if state.ManualRequestID < 0 || state.ManualRequestID > state.LastCommandID || state.ForceRequestID < 0 || state.ForceRequestID > state.ManualRequestID || state.PlanCommentFloor < 0 || state.DispatchOverrideID < 0 || state.DispatchOverrideID > state.LastCommandID {
 		return fmt.Errorf("invalid persisted request identity")
 	}
 	for name, witness := range state.FirstStage {
-		if name == "" || witness.Context == "" || witness.Context == agenticGate {
+		if name == "" || witness.Context == "" || witness.Context == pipelineGate {
 			return fmt.Errorf("invalid first-stage witness")
 		}
 	}
@@ -266,7 +244,7 @@ func validateAgenticState(state *agenticState) error {
 	}
 	jobs, contexts := map[string]string{}, map[string]bool{}
 	for _, job := range state.Plan.Jobs {
-		if job.Name == "" || job.Context == "" || job.Context == agenticGate || jobs[job.Name] != "" || contexts[job.Context] {
+		if job.Name == "" || job.Context == "" || job.Context == pipelineGate || jobs[job.Name] != "" || contexts[job.Context] {
 			return fmt.Errorf("invalid persisted job/context list")
 		}
 		jobs[job.Name], contexts[job.Context] = job.Context, true
@@ -288,6 +266,9 @@ func validateAgenticState(state *agenticState) error {
 }
 
 func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState, conclusion, summary string) error {
+	if state.DispatchOverrideID > 0 && conclusion == "" {
+		conclusion, summary = "success", dispatchOverrideSummary(state.DispatchOverrideID)
+	}
 	status := "queued"
 	if state.ActivatedAt != nil {
 		status = "in_progress"
@@ -302,7 +283,7 @@ func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState
 	if state.Frozen {
 		summary += "\n\nTest selection is locked for this commit. Later Chai plans are ignored; push a new commit to change the selection."
 	}
-	next := github.CheckRun{Name: agenticGate, HeadSHA: state.HeadSHA, ExternalID: agenticExternalID(state.Org, state.Repo, state.Number), Status: status, Conclusion: conclusion,
+	next := github.CheckRun{Name: pipelineGate, HeadSHA: state.HeadSHA, ExternalID: pipelineExternalID(state.Org, state.Repo, state.Number), Status: status, Conclusion: conclusion,
 		Output: github.CheckRunOutput{Title: "Pipeline", Summary: summary}}
 	if state.Plan == nil && status == "in_progress" {
 		next.Output.Title = "Waiting for Chai"
@@ -319,7 +300,7 @@ func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState
 	r.Gate.ExternalID = next.ExternalID // Commit-scoped gate ownership can transfer after collision validation.
 	// Creation is the Chai wake-up. Never consume it on a queued check or an
 	// early error: GitHub does not emit queued -> in_progress updates.
-	if gate.ID == 0 && (state.ActivatedAt == nil || status != "in_progress") {
+	if gate.ID == 0 && state.DispatchOverrideID == 0 && (state.ActivatedAt == nil || status != "in_progress") {
 		r.Dirty = false
 		return a.writeRecord(context.Background(), r)
 	}
@@ -356,29 +337,10 @@ func (a *agenticController) saveState(gate *github.CheckRun, state *agenticState
 			}
 		}
 	}
-	if gate.ID == 0 {
-		id, err := a.gh.CreateCheckRun(state.Org, state.Repo, next)
-		if err != nil {
-			return err
-		}
-		next.ID = id
-	} else {
-		// Keep one CheckRun: Tide can prefer an older successful same-name run
-		// over a new pending one. Remove the old success before reopening, even
-		// when the client cannot express conclusion:null in the following PATCH.
-		if r.Reopen && status != "completed" {
-			if err := a.gh.UpdateCheckRun(state.Org, state.Repo, gate.ID, github.CheckRun{Status: "completed", Conclusion: "failure", Output: next.Output}); err != nil {
-				return err
-			}
-		}
-		if err := a.gh.UpdateCheckRun(state.Org, state.Repo, gate.ID, next); err != nil {
-			return err
-		}
-		next.ID = gate.ID
+	if err := writePipelineCheck(a.gh, a.appID, state.Org, state.Repo, gate, next, r.Reopen); err != nil {
+		return err
 	}
-	next.App.ID = a.appID
-	*gate = next
-	r.Gate, r.Dirty, r.Reopen = snapshotAgenticGate(next), false, false
+	r.Gate, r.Dirty, r.Reopen = snapshotAgenticGate(*gate), false, false
 	return a.writeRecord(context.Background(), r)
 }
 
@@ -396,7 +358,7 @@ func (a *agenticController) failExistingGate(gate *github.CheckRun, state *agent
 	if agenticRetryFor(err).githubRateLimit {
 		return err
 	}
-	if gate.ID == 0 || gate.ExternalID == agenticExternalID(state.Org, state.Repo, state.Number) {
+	if gate.ID == 0 || gate.ExternalID == pipelineExternalID(state.Org, state.Repo, state.Number) {
 		return a.failState(gate, state, err)
 	}
 	// A collision closes the shared gate without overwriting its owner's plan.
@@ -460,24 +422,18 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		return a.failExistingGate(gate, state, err)
 	}
 	static := a.config().GetPresubmitsStatic(org + "/" + repo)
-	var pjs v1.ProwJobList
-	listOptions := []ctrlruntimeclient.ListOption{ctrlruntimeclient.InNamespace(a.config().ProwJobNamespace), ctrlruntimeclient.MatchingLabels{
-		kube.OrgLabel: org, kube.RepoLabel: repo, kube.PullLabel: strconv.Itoa(number), kube.ProwJobTypeLabel: string(v1.PresubmitJob),
-	}}
-	if err := a.reader.List(ctx, &pjs, listOptions...); err != nil {
-		return a.failExistingGate(gate, state, err)
-	}
-	latest := latestAgenticJobs(pjs.Items, org, repo, pr)
-	if state.FirstStage == nil {
-		state.FirstStage = map[string]firstStageSuccessWitness{}
-	}
-	ready, failed := agenticFirstStageComplete(static, latest, state.FirstStage, pr.Base.Ref)
 	var comments []github.IssueComment
-	if state.RevisionPending || state.PendingDispatch || (!state.Frozen && (state.ActivatedAt != nil || ready)) || comment != nil ||
-		(state.Command != nil && !state.Command.Applied) || (state.Review != nil && !state.ReviewPosted) ||
-		(state.Dispatch != nil && !state.Dispatch.Posted) {
+	dispatched := agenticDispatchComplete(state)
+	commentsLoaded := state.RevisionPending || (state.Command != nil && !state.Command.Applied) ||
+		(!dispatched && (state.PendingDispatch || (!state.Frozen && state.ActivatedAt != nil) ||
+			(state.Review != nil && !state.ReviewPosted) || (state.Dispatch != nil && !state.Dispatch.Posted))) ||
+		(comment != nil && (!dispatched || agenticCommandRE.MatchString(comment.Body)))
+	if commentsLoaded {
 		comments, err = a.gh.ListIssueComments(org, repo, number)
 		if err != nil {
+			if dispatched {
+				return err // A failed read cannot undo dispatch; retry the new command without changing the gate.
+			}
 			return a.failExistingGate(gate, state, err)
 		}
 	}
@@ -528,6 +484,36 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 	}
 	if err := a.applyCommand(gate, state, cfg, pr, comments); err != nil {
 		return a.failState(gate, state, err)
+	}
+	if agenticDispatchComplete(state) {
+		state.PendingDispatch, state.WaitingSince = false, nil
+		if gate.Status != "completed" || gate.Conclusion != "success" {
+			if err := checkCollision(); err != nil {
+				return a.failExistingGate(gate, state, err)
+			}
+		}
+		summary := dispatchSuccessSummary
+		if state.DispatchOverrideID > 0 {
+			summary = dispatchOverrideSummary(state.DispatchOverrideID)
+		}
+		return a.saveState(gate, state, "success", summary)
+	}
+	var pjs v1.ProwJobList
+	if err := a.reader.List(ctx, &pjs, ctrlruntimeclient.InNamespace(a.config().ProwJobNamespace), ctrlruntimeclient.MatchingLabels{
+		kube.OrgLabel: org, kube.RepoLabel: repo, kube.PullLabel: strconv.Itoa(number), kube.ProwJobTypeLabel: string(v1.PresubmitJob),
+	}); err != nil {
+		return a.failExistingGate(gate, state, err)
+	}
+	latest := latestAgenticJobs(pjs.Items, org, repo, pr)
+	if state.FirstStage == nil {
+		state.FirstStage = map[string]firstStageSuccessWitness{}
+	}
+	ready, failed := agenticFirstStageComplete(static, latest, state.FirstStage, pr.Base.Ref)
+	if ready && !state.Frozen && !commentsLoaded {
+		comments, err = a.gh.ListIssueComments(org, repo, number)
+		if err != nil {
+			return a.failExistingGate(gate, state, err)
+		}
 	}
 	invalidPlan := a.refreshPlan(state, pr, comments)
 	if invalidPlan != nil {
@@ -618,22 +604,12 @@ func (a *agenticController) reconcilePull(ctx context.Context, org, repo string,
 		if err := checkCollision(); err != nil {
 			return a.failState(gate, state, err)
 		}
-		existing := pjs.Items
-		if state.ForceRequestID > 0 {
-			// Informer lag must not let a pre-existing green run satisfy a
-			// forced rerun. Only this generation boundary needs a live list.
-			var snapshot v1.ProwJobList
-			if err := a.apiReader.List(ctx, &snapshot, listOptions...); err != nil {
-				return a.failState(gate, state, err)
-			}
-			existing = append(existing, snapshot.Items...)
-		}
-		a.prepareDispatch(state, pr, latest, existing)
-		if err := a.saveState(gate, state, "", "Dispatching selected jobs; waiting for their results."); err != nil {
+		a.prepareDispatch(state, latest)
+		if err := a.saveState(gate, state, "", "Dispatching selected jobs."); err != nil {
 			return err
 		}
 	}
-	return a.dispatch(gate, state, pr, pjs.Items, static, comments, checkCollision)
+	return a.dispatch(gate, state, static, comments, checkCollision)
 }
 
 func hasAgenticLabel(pr *github.PullRequest, name string) bool {
@@ -711,33 +687,17 @@ func agenticDispatchID(state *agenticState) string {
 	return agenticID(state.Org, state.Repo, strconv.Itoa(state.Number), state.HeadSHA, state.BaseBranch, state.RevisionID, strconv.Itoa(state.ManualRequestID))
 }
 
-func (a *agenticController) prepareDispatch(state *agenticState, pr *github.PullRequest, latest map[string]*v1.ProwJob, existing []v1.ProwJob) {
+func agenticDispatchComplete(state *agenticState) bool {
+	return state.DispatchOverrideID > 0 || (state.Dispatch != nil && state.Dispatch.Posted && state.Dispatch.ID == agenticDispatchID(state))
+}
+
+func (a *agenticController) prepareDispatch(state *agenticState, latest map[string]*v1.ProwJob) {
 	force := state.ForceRequestID > 0
 	dispatch := &agenticDispatch{ID: agenticDispatchID(state), Executions: []agenticExecution{}}
 	for _, job := range state.Plan.Jobs {
 		execution := agenticExecution{Job: job.Name, Context: job.Context}
-		if force {
-			// Names, not timestamps: Kubernetes creation times have second
-			// precision, so a forced rerun must exclude every existing run.
-			for _, pj := range existing {
-				if pj.Spec.Job == job.Name && matchesAgenticPull(&pj, state.Org, state.Repo, pr) && !slices.Contains(execution.Previous, pj.Name) {
-					execution.Previous = append(execution.Previous, pj.Name)
-				}
-			}
-			execution.Requested = true
-		} else {
-			if state.Dispatch != nil {
-				for _, old := range state.Dispatch.Executions {
-					if old.Job == job.Name && old.Context == job.Context {
-						execution = old // Keep success and any outstanding forced-rerun boundary.
-						break
-					}
-				}
-			}
-			pj := latest[job.Name]
-			present := pj != nil && pj.Spec.Context == job.Context && !slices.Contains(execution.Previous, pj.Name)
-			execution.Requested = !present && !execution.Passed
-		}
+		pj := latest[job.Name]
+		execution.Requested = force || pj == nil || pj.Spec.Context != job.Context
 		dispatch.Executions = append(dispatch.Executions, execution)
 	}
 	state.Dispatch = dispatch
@@ -746,7 +706,7 @@ func (a *agenticController) prepareDispatch(state *agenticState, pr *github.Pull
 	state.WaitingSince = nil
 }
 
-func (a *agenticController) dispatch(gate *github.CheckRun, state *agenticState, pr *github.PullRequest, pjs []v1.ProwJob, static []config.Presubmit, comments []github.IssueComment, ensureFreshCollision func() error) error {
+func (a *agenticController) dispatch(gate *github.CheckRun, state *agenticState, static []config.Presubmit, comments []github.IssueComment, ensureFreshCollision func() error) error {
 	if !state.Dispatch.Posted {
 		var commands []config.Presubmit
 		for _, execution := range state.Dispatch.Executions {
@@ -764,59 +724,36 @@ func (a *agenticController) dispatch(gate *github.CheckRun, state *agenticState,
 			if err := ensureFreshCollision(); err != nil {
 				return a.failState(gate, state, err)
 			}
-			current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
+			body := fmt.Sprintf("Scheduling selected tests for `%s` → `%s`:%s\n\n<!-- pipeline-controller:dispatch:%s -->", state.HeadSHA, state.BaseBranch, testCommands(commands), state.Dispatch.ID)
+			exists, err := a.hasOwnedComment(comments, body)
 			if err != nil {
 				return a.failState(gate, state, err)
 			}
-			cfg, enabled := a.repoConfig(state.Org, state.Repo, current.Base.Ref)
-			if current.Head.SHA != state.HeadSHA || current.Base.Ref != state.BaseBranch || current.State != github.PullRequestStateOpen || current.Draft || !enabled || !agenticAuthorized(cfg, state, current) || (current.Mergable != nil && !*current.Mergable) {
-				return nil
-			}
-			body := fmt.Sprintf("Scheduling selected tests for `%s` → `%s`:%s\n\n<!-- pipeline-controller:dispatch:%s -->", state.HeadSHA, state.BaseBranch, testCommands(commands), state.Dispatch.ID)
-			if err := a.ensureComment(state, comments, body); err != nil {
-				return a.failState(gate, state, err)
+			if !exists {
+				if !state.Dispatch.ContextsPublished {
+					if err := publishPendingContexts(a.gh, state.Org, state.Repo, state.HeadSHA, commands); err != nil {
+						return a.failState(gate, state, err)
+					}
+					state.Dispatch.ContextsPublished = true
+					if err := a.writeRecord(context.Background(), state.record); err != nil {
+						return err // Never repeat status publication after the comment can run jobs.
+					}
+				}
+				current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
+				if err != nil {
+					return a.failState(gate, state, err)
+				}
+				cfg, enabled := a.repoConfig(state.Org, state.Repo, current.Base.Ref)
+				if current.Head.SHA != state.HeadSHA || current.Base.Ref != state.BaseBranch || current.State != github.PullRequestStateOpen || current.Draft || !enabled || !agenticAuthorized(cfg, state, current) || (current.Mergable != nil && !*current.Mergable) {
+					return nil
+				}
+				if err := a.gh.CreateComment(state.Org, state.Repo, state.Number, body); err != nil {
+					return a.failState(gate, state, err)
+				}
 			}
 		}
 		state.Dispatch.Posted = true
 	}
-	allPassed, failed := true, false
-	for i := range state.Dispatch.Executions {
-		execution := &state.Dispatch.Executions[i]
-		var pj *v1.ProwJob
-		for j := range pjs {
-			candidate := &pjs[j]
-			if !matchesAgenticPull(candidate, state.Org, state.Repo, pr) || candidate.Spec.Job != execution.Job || candidate.Spec.Context != execution.Context || slices.Contains(execution.Previous, candidate.Name) {
-				continue
-			}
-			if preferAgenticJob(candidate, pj) {
-				pj = candidate
-			}
-		}
-		if pj != nil {
-			execution.Passed = pj.Status.State == v1.SuccessState
-			failed = failed || pj.Status.State == v1.FailureState || pj.Status.State == v1.ErrorState || pj.Status.State == v1.AbortedState
-		}
-		allPassed = allPassed && execution.Passed
-	}
 	state.PendingDispatch = false
-	if allPassed {
-		if gate.Status != "completed" || gate.Conclusion != "success" {
-			if err := ensureFreshCollision(); err != nil {
-				return a.failState(gate, state, err)
-			}
-		}
-		current, err := a.gh.GetPullRequest(state.Org, state.Repo, state.Number)
-		if err != nil {
-			return a.failState(gate, state, err)
-		}
-		currentConfig, enabled := a.repoConfig(state.Org, state.Repo, current.Base.Ref)
-		if current.Head.SHA != state.HeadSHA || current.Base.Ref != state.BaseBranch || current.State != github.PullRequestStateOpen || current.Draft || !enabled || !agenticAuthorized(currentConfig, state, current) {
-			return nil
-		}
-		return a.saveState(gate, state, "success", "First-stage and all selected second-stage tests passed.")
-	}
-	if failed {
-		return a.saveState(gate, state, "failure", "Selected second-stage tests failed; rerun the failed jobs or use `/pipeline required`.")
-	}
-	return a.saveState(gate, state, "", "Waiting for all selected second-stage tests to pass.")
+	return a.saveState(gate, state, "success", dispatchSuccessSummary)
 }

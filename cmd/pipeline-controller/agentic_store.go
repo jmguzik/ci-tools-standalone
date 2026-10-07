@@ -22,8 +22,8 @@ const agenticStateVersion = 2
 var agenticRecordFilename = regexp.MustCompile(`^pipeline-agentic-[0-9a-f]{32}\.json$`)
 
 // Keep intent and the last published gate identity, not GitHub projections or
-// retry timers. Job results come from ProwJobs, with compact success witnesses
-// retained for jobs Sinker has already removed.
+// retry timers. First-stage success witnesses survive ProwJob cleanup; selected
+// job results are reported by their own contexts, not this dispatch check.
 type agenticRecord struct {
 	State  *agenticState       `json:"state"`
 	Gate   agenticGateSnapshot `json:"gate"`
@@ -49,7 +49,7 @@ func (g agenticGateSnapshot) checkRun(appID int64) github.CheckRun {
 	gate := github.CheckRun{ID: g.ID, HeadSHA: g.HeadSHA, ExternalID: g.ExternalID, Status: g.Status, Conclusion: g.Conclusion,
 		Output: github.CheckRunOutput{Title: "Pipeline", Summary: g.Summary}}
 	if g.ID != 0 {
-		gate.Name, gate.App.ID = agenticGate, appID
+		gate.Name, gate.App.ID = pipelineGate, appID
 	}
 	return gate
 }
@@ -192,7 +192,7 @@ func decodeAgenticRecord(name string, data []byte) (*agenticRecord, error) {
 	if err := validateAgenticState(s); err != nil {
 		return nil, fmt.Errorf("invalid agentic record %s: %w", name, err)
 	}
-	if r.Gate.ID < 0 || (r.Gate.ID != 0 && (r.Gate.HeadSHA != s.HeadSHA || r.Gate.ExternalID != agenticExternalID(s.Org, s.Repo, s.Number))) {
+	if r.Gate.ID < 0 || (r.Gate.ID != 0 && (r.Gate.HeadSHA != s.HeadSHA || r.Gate.ExternalID != pipelineExternalID(s.Org, s.Repo, s.Number))) {
 		return nil, fmt.Errorf("invalid gate identity in %s", name)
 	}
 	s.record = &r

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,10 +62,8 @@ func TestAgenticRevisionBoundaries(t *testing.T) {
 	}
 }
 
-func TestAgenticPassedWitnessesSurviveRestartAndGarbageCollection(t *testing.T) {
+func TestAgenticDispatchSuccessSurvivesRestartAndJobCleanup(t *testing.T) {
 	f := newReadyAgenticFixture(t, "auto", "job-a", "job-b")
-	f.reconcile(t, nil)
-	f.report(t, v1.SuccessState)
 	f.reconcile(t, nil)
 	var jobs v1.ProwJobList
 	require.NoError(t, f.jobs.List(context.Background(), &jobs))
@@ -78,28 +77,22 @@ func TestAgenticPassedWitnessesSurviveRestartAndGarbageCollection(t *testing.T) 
 	require.Len(t, state.Dispatch.Executions, 2, "expected work must not come from the observed subset")
 	require.Equal(t, 2, f.jobs.creates)
 
-	// A newer same-SHA rerun revokes the witness, even without a URL/report.
-	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[1], "manual", nil)
-	pj.Name, pj.Namespace, pj.CreationTimestamp = "new-run", "ci", metav1.NewTime(f.now.Add(time.Minute))
-	pj.Status.State = v1.PendingState
-	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
-	f.reconcile(t, nil)
-	gate, state = f.gate(t)
-	require.NotEqual(t, "success", gate.Conclusion)
-	require.False(t, state.Dispatch.Executions[0].Passed)
 }
 
 func TestAgenticNewFirstStageRunRevokesOldWitness(t *testing.T) {
-	f := newReadyAgenticFixture(t, "auto")
+	f := newAgenticFixture(t, "auto")
+	f.passFirstStage(t)
 	f.reconcile(t, nil)
 	pj := pjutil.NewPresubmit(f.gh.pr, f.gh.pr.Base.SHA, f.cfg.GetPresubmitsStatic("org/repo")[0], "first", nil)
 	pj.Name, pj.Namespace, pj.CreationTimestamp = "new-first-stage", "ci", metav1.NewTime(f.now)
 	pj.Status.State = v1.PendingState
 	require.NoError(t, f.jobs.Client.Create(context.Background(), &pj))
+	f.plan(t, "job-a")
 	f.reconcile(t, nil)
 	gate, state := f.gate(t)
 	require.NotEqual(t, "success", gate.Conclusion)
 	require.Empty(t, state.FirstStage)
+	require.Nil(t, state.Dispatch)
 }
 
 func TestAgenticFrozenSelectionAndOptOutAcrossPushes(t *testing.T) {
@@ -124,6 +117,36 @@ func TestAgenticFrozenSelectionAndOptOutAcrossPushes(t *testing.T) {
 	require.Equal(t, 3, f.jobs.creates)
 }
 
+func TestAgenticCompletedDispatchIgnoresLatePlansAndReadFailures(t *testing.T) {
+	for _, completion := range []string{"posted", "override"} {
+		t.Run(completion, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			f.passFirstStage(t)
+			if completion == "posted" {
+				f.plan(t, "job-a")
+			}
+			f.reconcile(t, nil)
+			if completion == "override" {
+				f.reconcile(t, f.command(500, "tests-dispatched"))
+			}
+			gate, _ := f.gate(t)
+			reads, creates := f.gh.listCommentsCalls, f.jobs.creates
+			f.gh.listCommentsError = io.ErrUnexpectedEOF
+			latePlan := f.plan(t, "job-b")
+			f.reconcile(t, &latePlan)
+			require.Equal(t, reads, f.gh.listCommentsCalls, "completed dispatch must not reread irrelevant late plans")
+			require.Equal(t, gate.Conclusion, f.gh.checks[0].Conclusion)
+			command := f.command(900, "required")
+			require.Error(t, f.tryReconcile(command))
+			require.Equal(t, gate.Conclusion, f.gh.checks[0].Conclusion, "a failed command read must not revoke completed dispatch")
+			require.Equal(t, creates, f.jobs.creates)
+			f.gh.listCommentsError = nil
+			f.reconcile(t, command)
+			require.Equal(t, creates+1, f.jobs.creates, "the command must still work after the read recovers")
+		})
+	}
+}
+
 func TestAgenticUncertainSuccessIsClearedBeforeForcedRerun(t *testing.T) {
 	f := newReadyAgenticFixture(t, "auto", "job-a")
 	f.reconcile(t, nil)
@@ -143,7 +166,7 @@ func TestAgenticUncertainSuccessIsClearedBeforeForcedRerun(t *testing.T) {
 	f.reconcile(t, nil)
 	require.Equal(t, 2, f.jobs.creates)
 	require.Equal(t, gate.ID, f.gh.checks[0].ID)
-	require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
+	require.Equal(t, "success", f.gh.checks[0].Conclusion)
 }
 
 func TestAgenticMalformedRecordFailsClosed(t *testing.T) {

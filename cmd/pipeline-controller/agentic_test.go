@@ -33,6 +33,8 @@ type fakeAgenticGitHub struct {
 	member                bool
 	collaborator          bool
 	statusWrites          int
+	statusUpdates         []github.Status
+	failStatus            bool
 	checkWrites           []github.CheckRun
 	failCheck             bool
 	failCheckAfterCreate  bool
@@ -49,6 +51,7 @@ type fakeAgenticGitHub struct {
 	afterCheckWrite       func(github.CheckRun)
 	listCheckRunsCalls    int
 	listCommentsCalls     int
+	listCommentsError     error
 }
 
 func (f *fakeAgenticGitHub) GetPullRequest(_, _ string, _ int) (*github.PullRequest, error) {
@@ -92,13 +95,17 @@ func (f *fakeAgenticGitHub) nextCommentID() int {
 
 func (f *fakeAgenticGitHub) ListIssueComments(_, _ string, _ int) ([]github.IssueComment, error) {
 	f.listCommentsCalls++
-	return append([]github.IssueComment{}, f.comments...), nil
+	return append([]github.IssueComment{}, f.comments...), f.listCommentsError
 }
 func (f *fakeAgenticGitHub) GetPullRequestChanges(_, _ string, _ int) ([]github.PullRequestChange, error) {
 	return f.changes, nil
 }
-func (f *fakeAgenticGitHub) CreateStatus(_, _, _ string, _ github.Status) error {
+func (f *fakeAgenticGitHub) CreateStatus(_, _, _ string, status github.Status) error {
 	f.statusWrites++
+	if f.failStatus {
+		return fmt.Errorf("status write failed: %w", io.ErrUnexpectedEOF)
+	}
+	f.statusUpdates = append(f.statusUpdates, status)
 	return nil
 }
 func (f *fakeAgenticGitHub) AddLabel(_, _ string, _ int, label string) error {
@@ -233,7 +240,7 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1.AddToScheme(scheme))
 	f.jobs = &agenticTestJobs{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
-	f.a = &agenticController{gh: f.gh, reader: f.jobs, apiReader: f.jobs, config: func() *config.Config { return f.cfg },
+	f.a = &agenticController{gh: f.gh, reader: f.jobs, config: func() *config.Config { return f.cfg },
 		watcher: &watcher{config: enrollment}, lgtmWatcher: &watcher{}, appID: 101, now: func() time.Time { return f.now }, logger: logrus.NewEntry(logrus.New()),
 		options: agenticOptions{timeout: defaultAgenticTimeout, trustedAuthors: flagutil.NewStrings("chai[bot]"), stateDir: t.TempDir()}}
 	// Most tests use an immediate fake Hook; handoff tests disable it to
@@ -394,7 +401,7 @@ func TestAgenticWaitsForFirstStageSuccess(t *testing.T) {
 					require.Equal(t, &f.now, state.WaitingSince, "timeout starts only after first-stage success")
 				}
 				require.Contains(t, check.Output.Summary, "Pipeline for `"+f.gh.pr.Head.SHA+"` → `main`.")
-				require.Equal(t, agenticExternalID("org", "repo", 42), check.ExternalID)
+				require.Equal(t, pipelineExternalID("org", "repo", 42), check.ExternalID)
 			} else {
 				require.Empty(t, f.gh.checks, "do not consume the creation event before readiness")
 			}
@@ -411,64 +418,43 @@ func TestAgenticWaitsForFirstStageSuccess(t *testing.T) {
 	}
 }
 
-func TestAgenticGateUsesSelectedProwJobResults(t *testing.T) {
-	for _, state := range []v1.ProwJobState{v1.PendingState, v1.FailureState, v1.ErrorState, v1.AbortedState, v1.SuccessState} {
-		t.Run(string(state), func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
-			f.reconcile(t, nil)
-			require.Equal(t, 1, f.jobs.creates, "only Hook should create the selected job")
-			require.Zero(t, f.gh.statusWrites, "controller must not publish job placeholders")
-			f.report(t, state)
-			// A tied old success must not hide this run's pending/failing state.
-			stale := f.allJobs(t)[0].DeepCopy()
-			stale.Name, stale.ResourceVersion, stale.Status.State = "z-old-success", "", v1.SuccessState
-			require.NoError(t, f.jobs.Client.Create(context.Background(), stale))
-			f.reconcile(t, nil)
-			gate, saved := f.gate(t)
-			require.Equal(t, state == v1.SuccessState, saved.Dispatch.Executions[0].Passed)
-			switch state {
-			case v1.PendingState:
-				require.Equal(t, "in_progress", gate.Status)
-			case v1.SuccessState:
-				require.Equal(t, "success", gate.Conclusion)
-			default:
-				require.Equal(t, "failure", gate.Conclusion)
-			}
-			if state != v1.SuccessState {
-				stale.Name, stale.ResourceVersion = "a-new-success", ""
-				stale.CreationTimestamp = metav1.NewTime(f.now.Add(time.Second))
-				require.NoError(t, f.jobs.Client.Create(context.Background(), stale))
-				f.reconcile(t, nil)
-				gate, _ = f.gate(t)
-				require.Equal(t, "success", gate.Conclusion, "an unambiguously newer success must release the gate")
-			}
-		})
+func TestAgenticGateCompletesOnDispatch(t *testing.T) {
+	f := newReadyAgenticFixture(t, "auto", "job-a")
+	f.autoHook = false
+	f.gh.beforeComment = func(string) {
+		require.Equal(t, 1, f.gh.statusWrites, "publish the job's pending context before dispatch")
+		require.Equal(t, "ci/job-a", f.gh.statusUpdates[0].Context)
+		require.Equal(t, "pending", f.gh.statusUpdates[0].State)
+		require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
 	}
+	f.reconcile(t, nil)
+	gate, state := f.gate(t)
+	require.Equal(t, "success", gate.Conclusion)
+	require.True(t, state.Dispatch.Posted)
+	require.Zero(t, f.jobs.creates, "the check must not wait for Hook or test results")
+	f.processHook(f.gh.comments[len(f.gh.comments)-1].Body)
+	f.report(t, v1.FailureState)
+	f.a.reader = errorLister{} // Completed dispatch no longer depends on the ProwJob cache.
+	f.reconcile(t, nil)
+	current, _ := f.gate(t)
+	require.Equal(t, gate, current)
+	require.Equal(t, 1, f.gh.statusWrites, "later events must not overwrite job results")
 }
 
-func TestAgenticSelectedResultsRequireCurrentIdentity(t *testing.T) {
-	for _, wrong := range []string{"sha", "base", "context", "job"} {
-		t.Run(wrong, func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
-			f.reconcile(t, nil)
-			pj := f.allJobs(t)[0]
-			pj.Status.State = v1.SuccessState
-			switch wrong {
-			case "sha":
-				pj.Spec.Refs.Pulls[0].SHA = strings.Repeat("c", 40)
-			case "base":
-				pj.Spec.Refs.BaseRef = "release"
-			case "context":
-				pj.Spec.Context = "other-context"
-			case "job":
-				pj.Spec.Job = "other-job"
-			}
-			require.NoError(t, f.jobs.Update(context.Background(), &pj))
-			f.reconcile(t, nil)
-			gate, _ := f.gate(t)
-			require.NotEqual(t, "success", gate.Conclusion)
-		})
-	}
+func TestAgenticPendingContextFailureBlocksDispatch(t *testing.T) {
+	f := newReadyAgenticFixture(t, "auto", "job-a")
+	f.gh.failStatus = true
+	require.Error(t, f.tryReconcile(nil))
+	gate, state := f.gate(t)
+	require.NotEqual(t, "success", gate.Conclusion)
+	require.False(t, state.Dispatch.Posted)
+	require.Zero(t, f.jobs.creates)
+	require.Len(t, f.gh.comments, 1, "failed context publication must not post /test")
+	f.gh.failStatus = false
+	f.reconcile(t, nil)
+	gate, _ = f.gate(t)
+	require.Equal(t, "success", gate.Conclusion)
+	require.Equal(t, 1, f.jobs.creates)
 }
 
 func TestAgenticTimeoutStartsAtReadinessAndLocksFallback(t *testing.T) {
@@ -597,52 +583,19 @@ func TestAgenticManualRequestDoesNotAuthorizeNewHead(t *testing.T) {
 	require.Equal(t, 1, f.jobs.creates)
 }
 
-func TestAgenticForcedRerunClosesGateAndExcludesOldRuns(t *testing.T) {
-	for _, lag := range []string{"created", "deleted"} {
-		t.Run(lag, func(t *testing.T) {
-			f := newReadyAgenticFixture(t, "auto", "job-a")
-			f.reconcile(t, nil)
-			f.report(t, v1.SuccessState)
-			f.reconcile(t, nil)
-			gate, old := f.gate(t)
-			oldJobs := f.allJobs(t)
-			var cachedJobs v1.ProwJobList
-			require.NoError(t, f.jobs.List(context.Background(), &cachedJobs))
-			if lag == "created" {
-				cachedJobs.Items = slices.DeleteFunc(cachedJobs.Items, func(pj v1.ProwJob) bool { return pj.Spec.Job != "first-stage" })
-			} else {
-				f.deleteJobs(t, oldJobs...) // The informer still has the deleted green run.
-			}
-			cache := fake.NewClientBuilder().WithScheme(f.jobs.Scheme()).WithLists(&cachedJobs).Build()
-			f.a.reader = cache
-			f.gh.beforeComment = func(string) { require.NotEqual(t, "success", f.gh.checks[0].Conclusion) }
-			f.reconcile(t, f.command(500, "required"))
-			current, state := f.gate(t)
-			require.Len(t, f.gh.checks, 1)
-			require.Equal(t, gate.ID, current.ID)
-			require.NotEqual(t, old.Dispatch.ID, state.Dispatch.ID)
-			require.Contains(t, state.Dispatch.Executions[0].Previous, oldJobs[0].Name)
-			require.NotEqual(t, "success", current.Conclusion)
-			if lag == "created" {
-				delayed := oldJobs[0].DeepCopy()
-				delayed.ResourceVersion = ""
-				require.NoError(t, cache.Create(context.Background(), delayed))
-			}
-			f.reconcile(t, nil)
-			current, _ = f.gate(t)
-			require.NotEqual(t, "success", current.Conclusion, "cache lag adopted a pre-rerun success")
-			// If the new pending run disappears, an older green run still cannot pass.
-			for _, pj := range f.allJobs(t) {
-				if pj.Name != oldJobs[0].Name {
-					f.deleteJobs(t, pj)
-				}
-			}
-			require.NoError(t, f.a.closeStore())
-			f.reconcile(t, nil)
-			current, _ = f.gate(t)
-			require.NotEqual(t, "success", current.Conclusion)
-		})
-	}
+func TestAgenticForcedRerunClosesGateUntilDispatch(t *testing.T) {
+	f := newReadyAgenticFixture(t, "auto", "job-a")
+	f.reconcile(t, nil)
+	gate, old := f.gate(t)
+	f.gh.beforeComment = func(string) { require.NotEqual(t, "success", f.gh.checks[0].Conclusion) }
+	f.reconcile(t, f.command(500, "required"))
+	current, state := f.gate(t)
+	require.Len(t, f.gh.checks, 1)
+	require.Equal(t, gate.ID, current.ID)
+	require.NotEqual(t, old.Dispatch.ID, state.Dispatch.ID)
+	require.Equal(t, "success", current.Conclusion)
+	require.Equal(t, 2, f.jobs.creates)
+	require.Equal(t, 2, f.gh.statusWrites)
 }
 
 func TestAgenticRemainingRequestsOnlyMissingExecutions(t *testing.T) {

@@ -28,7 +28,8 @@ func mixedAgenticFixture(t *testing.T) (*agenticFixture, *clientWrapper) {
 		"org/repo": {protected: []config.Presubmit{{JobBase: config.JobBase{Name: "repo-release-protected"},
 			Reporter: config.Reporter{Context: "ci/legacy"}, RerunCommand: "/test legacy"}}},
 	}}
-	cw := &clientWrapper{ghc: f.gh, agentic: f.a, watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, configDataProvider: provider, pjLister: f.jobs}
+	cw := &clientWrapper{ghc: f.gh, agentic: f.a, watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, configDataProvider: provider, pjLister: f.jobs,
+		checks: &dispatchChecks{gh: f.gh, appID: f.a.appID}}
 	return f, cw
 }
 
@@ -58,6 +59,7 @@ func TestAgenticMixedModeRejectsStaleLegacyEvents(t *testing.T) {
 			if len(f.gh.comments) != 0 || f.gh.statusWrites != 0 || f.jobs.creates != 0 {
 				t.Fatal("old normal-branch event performed legacy side effects on an agentic PR")
 			}
+			require.Empty(t, f.gh.checks)
 		})
 	}
 }
@@ -99,7 +101,7 @@ func TestAgenticMixedModeRejectsStaleProwJob(t *testing.T) {
 			f.gh.getPullRequestError = errors.New("GitHub unavailable")
 		}
 		r := &reconciler{pjclientset: f.jobs, lister: f.jobs, configDataProvider: cw.configDataProvider, ghc: f.gh,
-			watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, agentic: f.a, logger: f.a.logger,
+			watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher, agentic: f.a, logger: f.a.logger, checks: cw.checks,
 			closedPRsCache: closedPRsCache{prs: map[string]pullRequest{}, ghc: f.gh}}
 		err := r.reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: pj.Namespace, Name: pj.Name}})
 		if (err != nil) != lookupFails {
@@ -108,6 +110,7 @@ func TestAgenticMixedModeRejectsStaleProwJob(t *testing.T) {
 		if len(f.gh.comments) != 0 || f.gh.statusWrites != 0 {
 			t.Fatal("old normal-branch ProwJob dispatched legacy tests")
 		}
+		require.Empty(t, f.gh.checks)
 	}
 }
 
@@ -134,6 +137,7 @@ func TestAgenticMixedModeLiveGuardAndNormalCoexistence(t *testing.T) {
 			if f.gh.statusWrites != wantWrites {
 				t.Fatalf("got %d legacy contexts, want %d", f.gh.statusWrites, wantWrites)
 			}
+			require.Len(t, f.gh.checks, wantWrites)
 			if scenario == "normal-only" && f.gh.getPullRequestCalls != 0 {
 				t.Fatal("normal-only repository acquired a new live-PR lookup")
 			}
