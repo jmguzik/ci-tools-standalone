@@ -1,20 +1,37 @@
 package main
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 const pipelineHelp = "Pipeline commands:\n\n" +
 	"- `/pipeline help` — list commands.\n" +
-	"- `/pipeline required` — rerun the required/selected second-stage tests.\n" +
+	"- `/pipeline required` — rerun the traditional second-stage set.\n" +
 	"- `/pipeline remaining` — run missing second-stage tests.\n" +
 	"- `/pipeline auto` — enable automatic dispatch in LGTM mode.\n" +
-	"- `/pipeline agent-review` — request a fresh Chai plan before dispatch (agentic only).\n" +
-	"- `/pipeline skip-agent-review` — use normal job selection (agentic only).\n" +
-	"- `/pipeline tests-dispatched` — manually mark `ci/tests-dispatched` successful; does not run tests or override their results (members/collaborators only)."
+	"- `/pipeline agentic-mode` — restore configured agentic mode; already-agentic PRs are unchanged.\n" +
+	"- `/pipeline skip-agentic-mode` — use traditional scheduling for this PR, including future pushes.\n" +
+	"- `/pipeline mark-pipeline-gate [<HEAD>]` — mark `ci/pipeline-gate` green; omitted HEAD means current HEAD. Does not run tests or override results."
 
 var (
-	pipelineHelpRE            = regexp.MustCompile(`(?im)^/pipeline[\t ]+help[\t ]*$`)
-	pipelineTestsDispatchedRE = regexp.MustCompile(`(?im)^/pipeline[\t ]+tests-dispatched[\t ]*$`)
+	pipelineHelpRE    = regexp.MustCompile(`(?im)^/pipeline[\t ]+help[\t ]*$`)
+	pipelineCommandRE = regexp.MustCompile(`(?im)^/pipeline[\t ]+(required|remaining|auto|agentic-mode|skip-agentic-mode|mark-pipeline-gate)(?:[\t ]+([0-9a-f]{40}))?[\t ]*$`)
 )
+
+type pipelineCommand struct{ name, head string }
+
+func parsePipelineCommand(body string) (pipelineCommand, bool) {
+	matches := pipelineCommandRE.FindAllStringSubmatch(body, -1)
+	if len(matches) != 1 {
+		return pipelineCommand{}, false
+	}
+	command := pipelineCommand{name: strings.ToLower(matches[0][1]), head: strings.ToLower(matches[0][2])}
+	if command.head != "" && command.name != "mark-pipeline-gate" {
+		return pipelineCommand{}, false
+	}
+	return command, true
+}
 
 type pipelineCommandClient interface {
 	IsMember(org, user string) (bool, error)

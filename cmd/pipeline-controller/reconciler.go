@@ -167,7 +167,7 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 		return nil
 	}
 	if _, enabled := r.agentic.repoConfig(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.BaseRef); enabled {
-		if len(pj.Spec.Refs.Pulls) != 1 {
+		if len(pj.Spec.Refs.Pulls) != 1 || !isFirstStageJob(r.configDataProvider.GetPresubmits(pj.Spec.Refs.Org+"/"+pj.Spec.Refs.Repo), pj.Spec.Job) {
 			return nil
 		}
 		r.agentic.enqueue(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number, nil)

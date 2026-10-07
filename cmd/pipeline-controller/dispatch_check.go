@@ -3,21 +3,26 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
 )
 
-const pipelineGate = "ci/tests-dispatched"
+const pipelineGate = "ci/pipeline-gate"
 const dispatchSuccessSummary = "Applicable second-stage tests were dispatched, already had runs, or were not required. Individual job contexts report test results."
 
 func dispatchOverrideSummary(commentID int) string {
-	return fmt.Sprintf("Manually marked dispatched with `/pipeline tests-dispatched` (comment %d). No tests were started or test results overridden.", commentID)
+	return fmt.Sprintf("Dispatch completion acknowledged with `/pipeline mark-pipeline-gate` (comment %d). No tests were started or test results overridden.", commentID)
 }
 
-func pipelineExternalID(org, repo string, number int) string {
+func pipelinePRIdentity(org, repo string, number int) string {
 	return fmt.Sprintf("pipeline-controller:%s/%s#%d", org, repo, number)
+}
+
+func pipelineExternalID(refs *v1.Refs) string {
+	return pipelinePRIdentity(refs.Org, refs.Repo, refs.Pulls[0].Number) + ":" + refs.BaseRef
 }
 
 type pipelineCheckClient interface {
@@ -82,22 +87,35 @@ type dispatchChecks struct {
 
 func traditionalCheck(refs *v1.Refs, status, conclusion, summary string) github.CheckRun {
 	return github.CheckRun{Name: pipelineGate, HeadSHA: refs.Pulls[0].SHA,
-		ExternalID: pipelineExternalID(refs.Org, refs.Repo, refs.Pulls[0].Number), Status: status, Conclusion: conclusion,
+		ExternalID: pipelineExternalID(refs), Status: status, Conclusion: conclusion,
 		Output: github.CheckRunOutput{Title: "Pipeline dispatch", Summary: fmt.Sprintf("Pipeline for `%s` → `%s`.\n\n%s", refs.Pulls[0].SHA, refs.BaseRef, summary)}}
 }
 
 func (c *dispatchChecks) pending(refs *v1.Refs) error {
+	return c.pendingWithReset(refs, false)
+}
+
+func (c *dispatchChecks) pendingWithReset(refs *v1.Refs, reset bool) error {
 	if c == nil {
 		return nil // Normal token-authenticated deployments retain their workflow.
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	gate, err := findPipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, refs.Pulls[0].SHA)
-	if err != nil || gate.ID != 0 {
-		return err // Repeated PR events must not reset a successful dispatch.
+	if err != nil {
+		return err
+	}
+	if reset && gate.ID == 0 {
+		return nil // A mode switch must not create a readiness signal.
+	}
+	if !reset && gate.ID != 0 && gate.ExternalID == pipelineExternalID(refs) {
+		return nil // Repeated PR events must not reset a successful dispatch.
+	}
+	if gate.ID != 0 && !strings.HasPrefix(gate.ExternalID, pipelinePRIdentity(refs.Org, refs.Repo, refs.Pulls[0].Number)+":") {
+		return fmt.Errorf("pipeline gate belongs to a different PR")
 	}
 	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate,
-		traditionalCheck(refs, "queued", "", "Waiting for the configured trigger to dispatch second-stage tests."), false)
+		traditionalCheck(refs, "queued", "", "Waiting for the configured trigger to dispatch second-stage tests."), gate.Conclusion == "success")
 }
 
 // The caller holds c.mu across planning and dispatch, when checks are enabled.
@@ -112,7 +130,10 @@ func (c *dispatchChecks) dispatch(refs *v1.Refs, hasJobs bool, post func() error
 	if err != nil {
 		return err
 	}
-	if !hasJobs && gate.Status == "completed" && gate.Conclusion == "success" {
+	if gate.ID != 0 && !strings.HasPrefix(gate.ExternalID, pipelinePRIdentity(refs.Org, refs.Repo, refs.Pulls[0].Number)+":") {
+		return fmt.Errorf("pipeline gate belongs to a different PR")
+	}
+	if !hasJobs && gate.ExternalID == pipelineExternalID(refs) && gate.Status == "completed" && gate.Conclusion == "success" {
 		return post() // An empty retry or acknowledgment cannot undo dispatch.
 	}
 	if hasJobs {
@@ -129,13 +150,17 @@ func (c *dispatchChecks) dispatch(refs *v1.Refs, hasJobs bool, post func() error
 	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate, next, false)
 }
 
-func (c *dispatchChecks) markDispatched(refs *v1.Refs, commentID int) error {
+func (c *dispatchChecks) markGate(refs *v1.Refs, commentID int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	gate, err := findPipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, refs.Pulls[0].SHA)
 	if err != nil {
 		return err
 	}
-	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate,
-		traditionalCheck(refs, "completed", "success", dispatchOverrideSummary(commentID)), false)
+	if gate.ID == 0 || gate.ExternalID != pipelineExternalID(refs) {
+		return fmt.Errorf("no active owned pipeline gate for the current HEAD/base")
+	}
+	next := traditionalCheck(refs, "completed", "success", dispatchOverrideSummary(commentID))
+	next.Output.Title = gate.Output.Title
+	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate, next, false)
 }

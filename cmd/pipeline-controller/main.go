@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/prow/pkg/logrusutil"
 )
 
-const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs, `/pipeline remaining` to request missing second-stage tests, or `/pipeline required` to rerun the selected second-stage set. Use `/pipeline help` for all commands."
+const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs and `/pipeline help` for commands."
 
 const RepoNotConfiguredMessage = "This repository is not currently configured for [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) support."
 
@@ -330,6 +330,9 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
 	if event.Action == github.IssueCommentActionCreated && event.Issue.IsPullRequest() && pipelineHelpRE.MatchString(event.Comment.Body) {
+		if cw.agentic != nil && cw.agentic.trustedChai(event.Comment.User.Login) {
+			cw.agentic.handleIssueComment(l, event)
+		}
 		if err := cw.ghc.CreateComment(event.Repo.Owner.Login, event.Repo.Name, event.Issue.Number, pipelineHelp); err != nil {
 			l.WithError(err).Error("failed to post pipeline help")
 		}
@@ -362,10 +365,11 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	matchesRequired := pipelineRequiredRegex.MatchString(event.Comment.Body)
 	matchesRemaining := pipelineRemainingRegex.MatchString(event.Comment.Body)
 	matchesAuto := pipelineAutoRegex.MatchString(event.Comment.Body)
-	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 &&
-		pipelineTestsDispatchedRE.MatchString(event.Comment.Body) && len(agenticCommandRE.FindAllStringSubmatch(event.Comment.Body, -1)) == 1
+	command, commandValid := parsePipelineCommand(event.Comment.Body)
+	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 && commandValid && command.name == "mark-pipeline-gate"
+	matchesMode := event.Action == github.IssueCommentActionCreated && commandValid && (command.name == "agentic-mode" || command.name == "skip-agentic-mode")
 
-	if !matchesRequired && !matchesRemaining && !matchesAuto && !matchesDispatched {
+	if !matchesRequired && !matchesRemaining && !matchesAuto && !matchesDispatched && !matchesMode {
 		return
 	}
 
@@ -381,7 +385,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 
 	switch {
 	case matchesDispatched:
-		logger.Info("Processing /pipeline tests-dispatched comment")
+		logger.Info("Processing /pipeline mark-pipeline-gate comment")
 	case matchesAuto:
 		logger.Info("Processing /pipeline auto comment")
 	case matchesRemaining && !matchesRequired:
@@ -395,7 +399,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	presubmits := cw.configDataProvider.GetPresubmits(org + "/" + repo)
 
 	// Check if there are any pipeline-controlled jobs
-	if !matchesDispatched && len(presubmits.protected) == 0 && len(presubmits.alwaysRequired) == 0 &&
+	if !matchesDispatched && !matchesMode && len(presubmits.protected) == 0 && len(presubmits.alwaysRequired) == 0 &&
 		len(presubmits.conditionallyRequired) == 0 && len(presubmits.pipelineConditionallyRequired) == 0 &&
 		len(presubmits.pipelineSkipOnlyRequired) == 0 {
 		return
@@ -444,9 +448,15 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		logger.WithField("base_branch", baseBranch).Debug("Branch not enabled for pipeline controller, skipping")
 		return
 	}
+	if matchesMode {
+		if err := cw.ghc.CreateComment(org, repo, number, "Agentic mode is not configured for this repository/branch."); err != nil {
+			logger.WithError(err).Error("failed to explain unavailable agentic mode")
+		}
+		return
+	}
 	if matchesDispatched {
 		if cw.checks == nil {
-			if err := cw.ghc.CreateComment(org, repo, number, "`/pipeline tests-dispatched` requires GitHub App authentication."); err != nil {
+			if err := cw.ghc.CreateComment(org, repo, number, "`/pipeline mark-pipeline-gate` requires GitHub App authentication."); err != nil {
 				logger.WithError(err).Error("failed to explain unavailable command")
 			}
 			return
@@ -458,9 +468,15 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			}
 			return
 		}
+		if command.head != "" && command.head != pr.Head.SHA {
+			if err := cw.ghc.CreateComment(org, repo, number, fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA)); err != nil {
+				logger.WithError(err).Error("failed to explain outdated completion command")
+			}
+			return
+		}
 		refs := &v1.Refs{Org: org, Repo: repo, BaseRef: pr.Base.Ref, Pulls: []v1.Pull{{Number: number, SHA: pr.Head.SHA}}}
-		if err := cw.checks.markDispatched(refs, event.Comment.ID); err != nil {
-			logger.WithError(err).Error("failed to mark tests dispatched")
+		if err := cw.checks.markGate(refs, event.Comment.ID); err != nil {
+			logger.WithError(err).Error("failed to mark pipeline gate")
 		}
 		return
 	}
@@ -891,13 +907,10 @@ func main() {
 		checks = &dispatchChecks{gh: githubClient, appID: appID}
 	}
 	reconciler.checks = checks
-	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), config: cfg,
+	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), configDataProvider: configDataProvider, checks: checks,
 		watcher: watcher, lgtmWatcher: lgtmWatcher, appID: appID, dryRun: o.dryrun, logger: logger, options: o.agentic}
 	if err := agentic.validateEnrollment(); err != nil {
 		logger.WithError(err).Fatal("invalid agentic configuration")
-	}
-	if err := agentic.prepareStore(); err != nil {
-		logger.WithError(err).Fatal("cannot open agentic recovery state")
 	}
 	watcher.setOnChange(agentic.configurationChanged)
 	lgtmWatcher.setOnChange(agentic.configurationChanged)
@@ -945,7 +958,7 @@ func main() {
 			return
 		}
 		if err := agentic.Run(ctx); err != nil {
-			logger.WithError(err).Error("Cannot start agentic recovery")
+			logger.WithError(err).Error("Cannot start agentic handoff")
 			interrupts.Terminate()
 		}
 	})

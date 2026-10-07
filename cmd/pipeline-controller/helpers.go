@@ -329,32 +329,18 @@ func existsAtSHA(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.
 	return false, nil
 }
 
-type firstStageSuccessWitness struct {
-	Context string `json:"context"`
+func isFirstStageJob(presubmits presubmitTests, name string) bool {
+	for _, jobs := range [][]config.Presubmit{presubmits.alwaysRequired, presubmits.conditionallyRequired} {
+		for _, job := range jobs {
+			if job.Name == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Both paths trust the latest matching ProwJob, including successful overrides.
-// Agentic callers retain successes for this HEAD/base after ProwJob cleanup.
-func firstStageJobPassed(job config.Presubmit, pj *v1.ProwJob, required bool, witnesses map[string]firstStageSuccessWitness) bool {
-	if pj == nil {
-		witness, seen := witnesses[job.Name]
-		return !required || (seen && witness.Context == job.Context)
-	}
-	if pj.Status.State != v1.SuccessState {
-		delete(witnesses, job.Name)
-		return false
-	}
-	if witnesses != nil {
-		witnesses[job.Name] = firstStageSuccessWitness{Context: job.Context}
-	}
-	return true
-}
-
-// checkFirstStageComplete checks if all first-stage tests have completed
-// successfully for the given ProwJob's SHA. This is used by the /pipeline auto
-// handler to trigger second-stage tests immediately when first-stage is already
-// done, since the event-driven reconciler won't fire if all ProwJob updates
-// occurred before the pipeline-auto label was added.
 func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
 	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
 		return false, nil
@@ -395,7 +381,7 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if !firstStageJobPassed(presubmit, latestBatch[presubmit.Name], true, nil) {
+		if job := latestBatch[presubmit.Name]; job == nil || job.Status.State != v1.SuccessState {
 			return false, nil
 		}
 	}
@@ -405,7 +391,7 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if !firstStageJobPassed(presubmit, latestBatch[presubmit.Name], false, nil) {
+		if job := latestBatch[presubmit.Name]; job != nil && job.Status.State != v1.SuccessState {
 			return false, nil
 		}
 	}
