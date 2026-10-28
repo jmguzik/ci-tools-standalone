@@ -1,0 +1,26 @@
+# Minimal demo fixture. Production mounts release/core-services/slack-bot/_ops-alerts.yaml.
+version: 1
+defaults:
+  color: orange
+  category: other
+source_policies:
+  chai_reports:
+    kind: report
+    color: green
+    category: chai_reports
+    view: chai_reports
+  ship_outages:
+    kind: alert
+    color: yellow
+    category: other
+    component_categories:
+    - component: Build Farm
+      category: cluster_fleet
+    - component: Downstream CI
+      subcomponent: CI-Config
+      category: repo_automation
+platform_alerts:
+- alertname: MachineWithNoRunningPhase
+  color: red
+  category: cluster_fleet
+legacy_alerts: []

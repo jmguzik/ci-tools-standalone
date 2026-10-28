@@ -1,0 +1,32 @@
+# Replace identity placeholders with verified Slack-issued IDs before running live.
+slack:
+  workspace_id: T_REPLACE_WORKSPACE
+  channel_id: CHY2E1BL4
+  workspace_url: https://redhat-internal.slack.com
+  # History defaults to a rolling 48h; override with --history-window.
+  # Optional earliest go-live date, still bounded by that window:
+  # cutover: "2026-10-28T06:00:00Z"
+  writer:
+    user_id: U_REPLACE_DPTP_BOT
+  sources:
+  - name: Prometheus
+    kind: alertmanager
+    bot_ids: [B_REPLACE_ALERTMANAGER]
+  - name: Prow
+    kind: prow
+    bot_ids: [B_REPLACE_CRIER]
+  - name: DPTP Bot
+    kind: ship
+    user_ids: [U_REPLACE_DPTP_BOT]
+  - name: Chai
+    kind: chai
+    user_ids: [U_REPLACE_CHAI]
+access:
+  external_url: https://ops-alerts.example.com
+  user_header: X-Forwarded-Email
+  operators: [operator@example.com]
+  trusted_proxies: [127.0.0.1/32, "::1/128"]
+monitoring:
+  enabled: true
+  rules_namespace: ci-monitoring
+  query_url: http://thanos-query-frontend-ci-query.ci-monitoring.svc.cluster.local:9090

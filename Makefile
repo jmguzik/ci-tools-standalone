@@ -1,4 +1,4 @@
-TOOLS := alert-proxy backport-verifier cluster-manifest-verifier commenter ci-scheduling-webhook determinize-peribolos dispatcher-dashboard gpu-scheduling-webhook helpdesk-faq pipeline-controller pr-reminder publicize retester
+TOOLS := alert-proxy backport-verifier cluster-manifest-verifier commenter ci-scheduling-webhook determinize-peribolos dispatcher-dashboard gpu-scheduling-webhook helpdesk-faq ops-alert-dashboard pipeline-controller pr-reminder publicize retester
 
 .PHONY: build-all test clean format gofmt lint validate-modules $(addprefix build-,$(TOOLS)) $(addprefix image-,$(TOOLS))
 
@@ -9,6 +9,9 @@ build-cluster-manifest-verifier:
 
 build-dispatcher-dashboard:
 	go build -o _output/dispatcher-dashboard ./cmd/dispatcher-dashboard/
+
+build-ops-alert-dashboard:
+	go build -o _output/ops-alert-dashboard ./cmd/ops-alert-dashboard/
 
 build-%:
 	go build -o _output/$* ./cmd/$*/

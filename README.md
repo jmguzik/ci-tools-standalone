@@ -13,6 +13,7 @@ Standalone CI tools extracted from [openshift/ci-tools](https://github.com/opens
 | [`dispatcher-dashboard`](cmd/dispatcher-dashboard/README.md) | Read-only web dashboard for dispatcher policy, placement, overrides, and optional Kubernetes pod-log diagnostics |
 | `gpu-scheduling-webhook` | Kubernetes mutating admission webhook for GPU/KVM workload scheduling |
 | `helpdesk-faq` | Web service that serves helpdesk FAQ items from Kubernetes ConfigMaps |
+| [`ops-alert-dashboard`](cmd/ops-alert-dashboard/README.md) | Slack-backed alert feed, investigation workflow, daily snooze and Chai reports |
 | `pipeline-controller` | Kubernetes controller that manages CI pipeline resources |
 | `pr-reminder` | Sends Slack reminders to team members about PRs awaiting review |
 | `publicize` | Prow plugin that mirrors private PR merges to public repositories |

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Test Platform · Operations</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="chrome"><span class="logo" aria-hidden="true">▦</span><div class="brand">Test Platform<small>OPERATIONS</small></div><span id="operator">Connecting…</span></header>
+<div id="demo" class="banner demo" hidden>Demo workspace · Synthetic Slack data. Actions affect this in-memory demo only.</div>
+<div class="app"><aside class="sidebar"><p class="eyebrow">Workspace</p><nav id="navigation" aria-label="Operations views"></nav><p class="side-note">Shared workflow<br>One card per Slack parent</p></aside>
+<main id="main"><div class="page-head"><div><h1 id="title">Feed</h1><p id="subtitle" class="muted">Unacknowledged occurrences needing triage</p></div><button id="refresh" class="btn" type="button">↻ Refresh</button></div>
+<section id="coverage" class="banner" role="status" aria-live="polite">Connecting to retained Slack history…</section>
+<div id="action-error" class="banner error" role="alert" hidden></div>
+<div id="retry-panel" class="banner warning" hidden><p id="retry-text"></p><button id="retry" class="btn" type="button">↻ Retry same request</button><button id="dismiss-expired" class="btn" type="button" hidden>Dismiss expired local retry</button></div>
+<p id="outcome" role="status" aria-live="polite"></p>
+<div class="toolbar"><label class="search">Search occurrences<input id="search" type="search" placeholder="Title, identifier, source or evidence…" autocomplete="off"></label><label id="color-label">Priority<select id="color"><option value="">All priorities</option><option value="red">Red</option><option value="orange">Orange</option><option value="yellow">Yellow</option></select></label></div>
+<div id="filters" class="filters" aria-label="Filter by category"></div>
+<div id="content"></div>
+<footer><span>Slack is the shared source of workflow history.</span><span>Workflow state does not establish source health · All times UTC</span></footer>
+</main></div>
+<dialog id="action-dialog" aria-labelledby="dialog-title"><form id="action-form"><div class="dialog-head"><h2 id="dialog-title"></h2><button class="btn" id="dialog-close" type="button" aria-label="Close preview">✕ Close</button></div><p id="dialog-context" class="muted"></p><label id="draft-label" for="draft"></label><textarea id="draft" required></textarea><div id="preview" class="preview" aria-live="polite"></div><p id="form-error" class="error-text" role="alert"></p><div class="actions"><button type="submit" class="btn primary" id="confirm"></button><button type="button" class="btn" id="cancel">Cancel</button></div></form></dialog>
+</body>
+</html>
