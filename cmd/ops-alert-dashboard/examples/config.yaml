@@ -3,8 +3,9 @@ slack:
   workspace_id: T_REPLACE_WORKSPACE
   channel_id: CHY2E1BL4
   workspace_url: https://redhat-internal.slack.com
-  # Keep a fixed cutover across restarts. Do not substitute "now" at startup.
-  cutover: "2026-10-28T06:00:00Z"
+  # History defaults to a rolling 48h; override with --history-window.
+  # Optional earliest go-live date, still bounded by that window:
+  # cutover: "2026-10-28T06:00:00Z"
   writer:
     user_id: U_REPLACE_DPTP_BOT
   sources:

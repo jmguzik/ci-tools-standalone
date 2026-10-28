@@ -28,6 +28,13 @@
   function announce(message) { el('outcome').textContent = message; }
   function error(message) { const shown = state.storageError || message; el('action-error').hidden = !shown; el('action-error').textContent = shown; }
   function pendingKey(user) { return 'ops-alert-dashboard.pending.v1.' + encodeURIComponent(user); }
+  function pendingExpired() {
+    const timestamp = state.pending?.occurrence_id?.match(/^[^:]+:(\d+)\.(\d{1,6})$/);
+    const start = Date.parse(state.snapshot?.status?.cutover);
+    if (!timestamp || !Number.isFinite(start)) return false;
+    const reported = Number(timestamp[1]) * 1000 + Number((timestamp[2] + '000').slice(0, 3));
+    return Number.isSafeInteger(reported) && reported < start && !items().some(o => id(o) === state.pending.occurrence_id);
+  }
   function validPending(request) {
     const fields = ['occurrence_id', 'kind', 'expected_revision', 'request_id', 'pattern', 'question'];
     return request && typeof request === 'object' && !Array.isArray(request) && Object.keys(request).every(key => fields.includes(key) && typeof request[key] === 'string') && ['acknowledge', 'unacknowledge', 'close', 'reopen', 'snooze', 'unsnooze', 'investigate'].includes(request.kind) && !!request.occurrence_id && !!request.expected_revision && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.request_id);
@@ -65,9 +72,15 @@
       if (sessionStorage.getItem(pendingKey(user)) !== null) throw new Error('Retained request was not removed.');
       if (state.pending?.request_id === request.request_id && state.pendingUser === user) { state.pending = null; state.pendingUser = ''; state.pendingUnconfirmed = false; }
     } catch {
-      state.storageError = 'The server returned a final result, but this browser could not clear its retained request. Actions are paused. Restore session storage and refresh to reconcile the same request.';
+      state.storageError = 'This browser could not clear its retained request. Actions are paused. Restore session storage and refresh to reconcile the same request.';
       error('');
     }
+  }
+  function dismissExpired() {
+    if (!pendingExpired() || state.sending || state.snapshot?.status?.phase !== 'ready' || state.fetchError || state.storageError || state.pendingUser !== state.snapshot?.user || state.storageUser !== state.snapshot?.user) return;
+    clearPending(state.pendingUser, state.pending);
+    if (!state.pending) { error(''); announce('Expired local retry dismissed. Delivery remains unconfirmed; check the original Slack thread. No Slack action was sent or undone.'); }
+    render();
   }
   function fact(list, label, value) { append(list, append(node('div'), node('dt', label), node('dd', value))); }
   function renderStatus() {
@@ -76,13 +89,17 @@
     const phase = coverage?.phase || 'catching_up';
     box.className = 'banner ' + (state.fetchError || phase === 'degraded' ? 'error' : phase === 'ready' ? 'ready' : 'warning');
     box.textContent = state.fetchError || (phase === 'ready' ? 'Coverage ready' : phase === 'degraded' ? 'Coverage degraded · actions paused' : 'Catching up on retained Slack history · actions paused');
-    if (coverage) box.textContent += ' · Last complete sync: ' + date(coverage.last_sync) + ' · Retained since: ' + date(coverage.cutover) + (coverage.error ? ' · ' + coverage.error : '');
+    if (coverage) box.textContent += ' · Last complete sync: ' + date(coverage.last_sync) + ' · Window starts: ' + date(coverage.cutover) + (coverage.error ? ' · ' + coverage.error : '');
     el('demo').hidden = !state.snapshot?.demo;
     el('operator').textContent = state.snapshot?.user ? 'Operator · ' + state.snapshot.user : 'Connecting…';
     el('refresh').disabled = state.fetching;
     el('retry-panel').hidden = !state.pending || state.sending;
-    el('retry-text').textContent = state.pending ? 'Delivery is unconfirmed. Request ' + state.pending.request_id + ' is retained. Check the thread or refresh, then retry this same request to reconcile it. No second request will be created.' : '';
-    el('retry').disabled = state.snapshot?.status?.phase !== 'ready' || !!state.fetchError || state.sending || !!state.storageError || state.pendingUser !== state.snapshot?.user;
+    const expired = pendingExpired();
+    el('retry-text').textContent = state.pending ? 'Delivery is unconfirmed. Request ' + state.pending.request_id + (expired ? ' belongs to an alert outside the history window. Check the original Slack thread. You can dismiss this local retry to continue; dismissal does not confirm or undo delivery.' : ' is retained. Check the thread or refresh, then retry this same request to reconcile it. No second request will be created.') : '';
+    const blocked = state.snapshot?.status?.phase !== 'ready' || !!state.fetchError || state.sending || !!state.storageError || state.pendingUser !== state.snapshot?.user || state.storageUser !== state.snapshot?.user;
+    el('retry').disabled = blocked || expired;
+    el('dismiss-expired').hidden = !expired;
+    el('dismiss-expired').disabled = blocked;
     if (state.storageError) error('');
   }
   function renderNav() {
@@ -639,7 +656,7 @@
     await sendPending();
   }
   async function sendPending() {
-    if (!state.pending || state.sending || state.snapshot?.status?.phase !== 'ready' || state.fetchError || state.storageError || state.pendingUser !== state.snapshot.user) return;
+    if (!state.pending || pendingExpired() || state.sending || state.snapshot?.status?.phase !== 'ready' || state.fetchError || state.storageError || state.pendingUser !== state.snapshot.user) return;
     const request = state.pending;
     const user = state.pendingUser;
     if (!retainPending(user, request)) return;
@@ -675,6 +692,7 @@
   }
   el('refresh').addEventListener('click', refresh);
   el('retry').addEventListener('click', sendPending);
+  el('dismiss-expired').addEventListener('click', dismissExpired);
   el('search').addEventListener('input', event => { state.query = event.target.value; render(); });
   el('color').addEventListener('change', event => { state.color = event.target.value; render(); });
   el('draft').addEventListener('input', updatePreview);

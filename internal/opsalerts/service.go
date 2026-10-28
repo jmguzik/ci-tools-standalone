@@ -60,6 +60,9 @@ type Service struct {
 
 // NewService validates trusted identities and starts with incomplete coverage.
 func NewService(cfg Config, classifier *Classifier, archive Archive, clock Clock) (*Service, error) {
+	if cfg.HistoryWindow == 0 {
+		cfg.HistoryWindow = DefaultHistoryWindow
+	}
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -70,15 +73,18 @@ func NewService(cfg Config, classifier *Classifier, archive Archive, clock Clock
 		clock = realClock{}
 	}
 	s := &Service{cfg: cfg, classifier: classifier, archive: archive, clock: clock, serial: make(chan struct{}, 1)}
-	s.cache = serviceCache{Coverage: Coverage{Phase: "catching_up", Cutover: cfg.Cutover}, Threads: map[string]threadCache{}, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, Pending: map[string]pendingDelivery{}}
+	s.cache = serviceCache{Coverage: Coverage{Phase: "catching_up", Cutover: s.historyStart(clock.Now(), 0)}, Threads: map[string]threadCache{}, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, Pending: map[string]pendingDelivery{}}
 	return s, nil
 }
 
 // validateConfig permits the SHIP writer identity while keeping producers distinct.
 func validateConfig(cfg Config) error {
+	if cfg.HistoryWindow < 0 {
+		return fmt.Errorf("%w: history window must be positive", ErrValidation)
+	}
 	u, err := url.Parse(cfg.WorkspaceURL)
-	if cfg.WorkspaceID == "" || cfg.ChannelID == "" || cfg.Cutover.IsZero() || cfg.Writer.UserID == "" && cfg.Writer.BotID == "" || err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("%w: workspace, channel, HTTPS workspace URL, fixed cutover and writer user/bot identity required", ErrValidation)
+	if cfg.WorkspaceID == "" || cfg.ChannelID == "" || cfg.Writer.UserID == "" && cfg.Writer.BotID == "" || err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%w: workspace, channel, HTTPS workspace URL and writer user/bot identity required", ErrValidation)
 	}
 	writerIDs := sets.New[string]()
 	for kind, id := range map[string]string{"user:": cfg.Writer.UserID, "bot:": cfg.Writer.BotID, "app:": cfg.Writer.AppID} {
@@ -131,6 +137,20 @@ func validateConfig(cfg Config) error {
 	return nil
 }
 
+// historyStart applies the optional go-live floor without extending the rolling window.
+func (s *Service) historyStart(now time.Time, padding time.Duration) time.Time {
+	start := now.Add(-s.cfg.HistoryWindow).Add(-padding)
+	if s.cfg.Cutover.After(start) {
+		start = s.cfg.Cutover
+	}
+	return start
+}
+
+// retained bounds both visible occurrences and the extra day needed for active snooze rules.
+func (s *Service) retained(o Occurrence, now time.Time, padding time.Duration) bool {
+	return !o.Message.ReportedAt.Before(s.historyStart(now, padding)) && !o.Message.ReportedAt.After(now)
+}
+
 // currentCache borrows an immutable published cache.
 func (s *Service) currentCache() serviceCache {
 	s.mu.RLock()
@@ -166,7 +186,8 @@ func (s *Service) Sync(ctx context.Context) error {
 	catchingUp := previous
 	catchingUp.Coverage.Phase = "catching_up"
 	s.publish(catchingUp)
-	history, err := s.archive.History(ctx, s.cfg.ChannelID, s.cfg.Cutover)
+	now := s.clock.Now()
+	history, err := s.archive.History(ctx, s.cfg.ChannelID, s.historyStart(now, 24*time.Hour))
 	if err != nil {
 		return s.degrade(previous, fmt.Errorf("reading retained history: %w", err))
 	}
@@ -175,11 +196,11 @@ func (s *Service) Sync(ctx context.Context) error {
 		if root.SubType == slack.MsgSubTypeMessageChanged && root.SubMessage != nil {
 			root = slack.Message{Msg: *root.SubMessage}
 		}
-		_, admitted, normalizeErr := s.normalize(root)
+		occurrence, admitted, normalizeErr := s.normalize(root)
 		if normalizeErr != nil {
 			return s.degrade(previous, normalizeErr)
 		}
-		if !admitted {
+		if !admitted || !s.retained(occurrence, now, 24*time.Hour) {
 			continue
 		}
 		if existing, exists := threads[root.Timestamp]; exists {
@@ -201,7 +222,8 @@ func (s *Service) Sync(ctx context.Context) error {
 	if err != nil {
 		return s.degrade(previous, err)
 	}
-	cache.Coverage = Coverage{Phase: "ready", LastSync: s.clock.Now(), Cutover: s.cfg.Cutover}
+	now = s.clock.Now()
+	cache.Coverage = Coverage{Phase: "ready", LastSync: now, Cutover: s.historyStart(now, 0)}
 	cache.Decorations = previous.Decorations
 	s.publish(cache)
 	s.publish(s.decorate(ctx, cache))
@@ -211,6 +233,9 @@ func (s *Service) Sync(ctx context.Context) error {
 // replay treats trusted action records as truth and orders rules across all threads.
 func (s *Service) replay(threads map[string]threadCache, pending map[string]pendingDelivery) (serviceCache, error) {
 	cache := serviceCache{Threads: threads, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, Pending: maps.Clone(pending)}
+	now := s.clock.Now()
+	reset := nextSixUTC(now).Add(-24 * time.Hour)
+	retainedThreads := map[string]threadCache{}
 	var records []timedRecord
 	investigationTimestamps := map[string]string{}
 	for _, thread := range threads {
@@ -218,9 +243,10 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		if err != nil {
 			return cache, err
 		}
-		if !admitted {
+		if !admitted || !s.retained(o, now, 24*time.Hour) {
 			continue
 		}
+		retainedThreads[thread.Root.Timestamp] = thread
 		seen := sets.New[string]()
 		replies := append([]slack.Message(nil), thread.Replies...)
 		sort.Slice(replies, func(i, j int) bool { return timestampLess(replies[i].Timestamp, replies[j].Timestamp) })
@@ -267,7 +293,9 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		}
 		o := cache.Occurrences[r.Request.OccurrenceID]
 		o = enrichInvestigation(o, investigationTimestamps[o.Identity.ID], timed.Timestamp)
-		if err := validateTransition(o, r, cache.Rules); err != nil {
+		// Rules expire by action time even when Slack confirms the post after reset.
+		historicalRule := r.At.Before(reset)
+		if err := validateTransition(o, r, cache.Rules, historicalRule); err != nil {
 			return cache, fmt.Errorf("trusted action at %s: %w", timed.Timestamp, err)
 		}
 		o.State, o.Investigation, o.Identity.Revision = r.State, r.Investigation, timed.Timestamp
@@ -282,15 +310,21 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 				}
 			}
 		}
-		if r.Snooze != nil {
+		if r.Snooze != nil && !historicalRule {
 			cache.Rules[r.Snooze.ID] = *r.Snooze
 		}
-		if r.Unsnooze != "" {
+		if r.Unsnooze != "" && !historicalRule {
 			delete(cache.Rules, r.Unsnooze)
 		}
 	}
 	for id, o := range cache.Occurrences {
 		cache.Occurrences[id] = enrichInvestigation(o, investigationTimestamps[o.Identity.ID], "")
+	}
+	cache.Threads = retainedThreads
+	for id, attempt := range cache.Pending {
+		if _, exists := cache.Occurrences[attempt.Request.OccurrenceID]; !exists {
+			delete(cache.Pending, id)
+		}
 	}
 	return cache, nil
 }
@@ -331,7 +365,11 @@ func (s *Service) Snapshot() Snapshot {
 	cache := s.currentCache()
 	snapshot := Snapshot{Status: cache.Coverage, Occurrences: []Occurrence{}}
 	now := s.clock.Now()
+	snapshot.Status.Cutover = s.historyStart(now, 0)
 	for _, occurrence := range cache.Occurrences {
+		if !s.retained(occurrence, now, 0) {
+			continue
+		}
 		snapshot.Occurrences = append(snapshot.Occurrences, effectiveOccurrence(occurrence, cache, now))
 	}
 	sort.Slice(snapshot.Occurrences, func(i, j int) bool {
@@ -395,12 +433,13 @@ func effectiveOccurrence(o Occurrence, cache serviceCache, now time.Time) Occurr
 
 // decorate reconciles only this writer's optional icons, never durable state.
 func (s *Service) decorate(ctx context.Context, cache serviceCache) serviceCache {
-	decorations := maps.Clone(cache.Decorations)
-	if decorations == nil {
-		decorations = map[string]string{}
-	}
+	decorations := map[string]string{}
+	now := s.clock.Now()
 	for id, occurrence := range cache.Occurrences {
-		o := effectiveOccurrence(occurrence, cache, s.clock.Now())
+		if !s.retained(occurrence, now, 0) {
+			continue
+		}
+		o := effectiveOccurrence(occurrence, cache, now)
 		if o.View == "chai_reports" {
 			continue
 		}
@@ -413,7 +452,10 @@ func (s *Service) decorate(ctx context.Context, cache serviceCache) serviceCache
 		case "closed":
 			desired = "white_check_mark"
 		}
-		previous, known := decorations[id]
+		previous, known := cache.Decorations[id]
+		if known {
+			decorations[id] = previous
+		}
 		if known && previous == desired {
 			continue
 		}

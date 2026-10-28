@@ -27,14 +27,18 @@ var ErrDeliveryUncertain = errors.New("delivery uncertain")
 // ErrDeliveryFailed means Slack explicitly rejected a write.
 var ErrDeliveryFailed = errors.New("delivery failed")
 
+// DefaultHistoryWindow bounds the visible queue when no override is supplied.
+const DefaultHistoryWindow = 48 * time.Hour
+
 // Config fixes the archive scope and trusted producer identities.
 type Config struct {
-	WorkspaceID  string    `json:"workspace_id"`
-	ChannelID    string    `json:"channel_id"`
-	WorkspaceURL string    `json:"workspace_url"`
-	Cutover      time.Time `json:"cutover"`
-	Writer       Identity  `json:"writer"`
-	Sources      []Source  `json:"sources"`
+	WorkspaceID   string        `json:"workspace_id"`
+	ChannelID     string        `json:"channel_id"`
+	WorkspaceURL  string        `json:"workspace_url"`
+	Cutover       time.Time     `json:"cutover"`
+	HistoryWindow time.Duration `json:"-"`
+	Writer        Identity      `json:"writer"`
+	Sources       []Source      `json:"sources"`
 }
 
 // Identity contains Slack-issued author identifiers, never display names.

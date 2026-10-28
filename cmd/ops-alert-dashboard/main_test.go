@@ -1,7 +1,12 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/openshift/ci-tools-standalone/internal/opsalerts"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -14,7 +19,12 @@ func TestParseOptions(t *testing.T) {
 		args             []string
 		wantError        string
 		demo, validation bool
+		window           time.Duration
 	}{
+		{name: "history override", args: []string{"--demo", "--history-window=12h"}, demo: true, window: 12 * time.Hour},
+		{name: "zero history rejected", args: []string{"--demo", "--history-window=0"}, wantError: "must be positive"},
+		{name: "negative history rejected", args: []string{"--demo", "--history-window=-1h"}, wantError: "must be positive"},
+		{name: "malformed history rejected", args: []string{"--demo", "--history-window=yesterday"}, wantError: "invalid value"},
 		{name: "local demo", args: []string{"--demo"}, demo: true},
 		{name: "IPv6 local demo", args: []string{"--demo", "--listen=[::1]:8080"}, demo: true},
 		{name: "public demo rejected", args: []string{"--demo", "--listen=0.0.0.0:8080"}, wantError: "loopback"},
@@ -37,6 +47,13 @@ func TestParseOptions(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			wantWindow := opsalerts.DefaultHistoryWindow
+			if tc.window != 0 {
+				wantWindow = tc.window
+			}
+			if got.historyWindow != wantWindow {
+				t.Errorf("history window: want %v, got %v", wantWindow, got.historyWindow)
 			}
 			if diff := cmp.Diff([]bool{tc.demo, tc.validation}, []bool{got.demo, got.validateOnly}); diff != "" {
 				t.Errorf("unexpected startup modes (-want +got):\n%s", diff)
@@ -76,6 +93,48 @@ func TestCompileAccess(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestLoadSettingsWithoutCutover validates rolling configuration without contacting Slack.
+func TestLoadSettingsWithoutCutover(t *testing.T) {
+	cases := []struct {
+		name   string
+		window time.Duration
+	}{
+		{name: "default", window: opsalerts.DefaultHistoryWindow},
+		{name: "override", window: 6 * time.Hour},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := os.ReadFile("examples/config.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(string(data), "\n")
+			var kept []string
+			for _, line := range lines {
+				if strings.HasPrefix(strings.TrimSpace(line), "cutover:") {
+					continue
+				}
+				kept = append(kept, line)
+			}
+			config := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(config, []byte(strings.Join(kept, "\n")), 0600); err != nil {
+				t.Fatal(err)
+			}
+			o, err := parseOptions([]string{"--validate-only", "--config=" + config, "--classification=examples/classification.yaml", "--history-window=" + tc.window.String()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, _, err := loadSettings(o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.Slack.Cutover.IsZero() || cfg.Slack.HistoryWindow != tc.window {
+				t.Fatalf("unexpected rolling settings: %+v", cfg.Slack)
 			}
 		})
 	}

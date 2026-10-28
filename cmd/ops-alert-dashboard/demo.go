@@ -91,9 +91,9 @@ func demoMessage(now time.Time, age time.Duration, user, bot, text string) slack
 }
 
 // demoService seeds every view while using the same parser, actions and replay as production.
-func demoService(ctx context.Context, now time.Time) (*opsalerts.Service, error) {
+func demoService(ctx context.Context, now time.Time, historyWindow time.Duration) (*opsalerts.Service, error) {
 	cfg := opsalerts.Config{
-		WorkspaceID: "T_DEMO", ChannelID: "CHY2E1BL4", WorkspaceURL: "https://demo.slack.com", Cutover: now.Add(-24 * time.Hour),
+		WorkspaceID: "T_DEMO", ChannelID: "CHY2E1BL4", WorkspaceURL: "https://demo.slack.com", HistoryWindow: historyWindow,
 		Writer: opsalerts.Identity{UserID: "U_DPTP", BotID: "B_DPTP"},
 		Sources: []opsalerts.Source{
 			{Name: "Prometheus", Kind: "alertmanager", UserIDs: []string{"U_PROM"}, BotIDs: []string{"B_PROM"}},

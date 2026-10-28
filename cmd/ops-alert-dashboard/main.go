@@ -22,13 +22,14 @@ import (
 
 // options keeps process settings separate from source identities and classification data.
 type options struct {
-	listen       string
-	config       string
-	classes      string
-	credentials  credentialPaths
-	syncInterval time.Duration
-	demo         bool
-	validateOnly bool
+	listen        string
+	config        string
+	classes       string
+	credentials   credentialPaths
+	syncInterval  time.Duration
+	historyWindow time.Duration
+	demo          bool
+	validateOnly  bool
 }
 
 // credentialPaths permits a separate history token when a workspace requires it.
@@ -44,16 +45,17 @@ type settings struct {
 	Access     accessConfig     `json:"access"`
 }
 
-// parseOptions requires a deliberate production configuration and fixed replay cutover.
+// parseOptions requires a deliberate production configuration and a bounded rolling history.
 func parseOptions(args []string) (options, error) {
 	var o options
 	flags := flag.NewFlagSet("ops-alert-dashboard", flag.ContinueOnError)
 	flags.StringVar(&o.listen, "listen", "127.0.0.1:8080", "HTTP listen address; keep the backend private behind authenticated SSO")
-	flags.StringVar(&o.config, "config", "", "Path to Slack source identities, fixed cutover and access configuration")
+	flags.StringVar(&o.config, "config", "", "Path to Slack source identities and access configuration")
 	flags.StringVar(&o.classes, "classification", "", "Path to release/core-services/slack-bot/_ops-alerts.yaml")
 	flags.StringVar(&o.credentials.writer, "slack-token-file", "", "File containing the DPTP-bot Slack token (never sent to the browser)")
 	flags.StringVar(&o.credentials.reader, "slack-history-token-file", "", "Optional separate history/replies token; defaults to the bot token")
 	flags.DurationVar(&o.syncInterval, "sync-interval", time.Minute, "Interval between complete channel reconciliations (browser polls memory every 15s)")
+	flags.DurationVar(&o.historyWindow, "history-window", opsalerts.DefaultHistoryWindow, "Rolling visible Slack history window (positive duration)")
 	flags.BoolVar(&o.demo, "demo", false, "Use synthetic in-memory Slack data on loopback, with no Slack calls")
 	flags.BoolVar(&o.validateOnly, "validate-only", false, "Validate config and classification without connecting to Slack")
 	if err := flags.Parse(args); err != nil {
@@ -61,6 +63,9 @@ func parseOptions(args []string) (options, error) {
 	}
 	if flags.NArg() != 0 || o.syncInterval < time.Second {
 		return o, fmt.Errorf("no positional arguments are accepted and --sync-interval must be at least 1s")
+	}
+	if o.historyWindow <= 0 {
+		return o, fmt.Errorf("--history-window must be positive")
 	}
 	if o.demo {
 		host, _, err := net.SplitHostPort(o.listen)
@@ -88,6 +93,7 @@ func loadSettings(o options) (settings, *opsalerts.Classifier, error) {
 	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
 		return cfg, nil, fmt.Errorf("decoding dashboard configuration: %w", err)
 	}
+	cfg.Slack.HistoryWindow = o.historyWindow
 	data, err = os.ReadFile(o.classes)
 	if err != nil {
 		return cfg, nil, fmt.Errorf("reading classification configuration: %w", err)
@@ -188,7 +194,7 @@ func run(ctx context.Context, args []string) error {
 	var cfg settings
 	var service *opsalerts.Service
 	if o.demo {
-		service, err = demoService(ctx, time.Now().UTC())
+		service, err = demoService(ctx, time.Now().UTC(), o.historyWindow)
 		if o.syncInterval == time.Minute {
 			o.syncInterval = 2 * time.Second
 		}

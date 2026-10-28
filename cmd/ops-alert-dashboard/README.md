@@ -28,6 +28,7 @@ ops-alert-dashboard \
   --config=/etc/ops-alerts/config.yaml \
   --classification=/etc/ops-alerts/_ops-alerts.yaml \
   --slack-token-file=/etc/slack/token \
+  --history-window=48h \
   --listen=127.0.0.1:8080
 ```
 
@@ -169,7 +170,8 @@ Each accepted mutation saves a readable thread reply with a versioned
 state. Only replies from the verified writer identity are replayed as actions.
 An action is successful only after Slack confirms the save. The visible reactions
 are decoration; removing one does not undo an action. Use the dashboard's explicit
-Undo/Unsnooze controls. Expired snooze decoration is reconciled on the next scan.
+Undo/Unsnooze controls. Expired snooze decoration for visible occurrences is
+reconciled on the next scan.
 
 The browser submits the selected revision and a stable request ID. Stale changes
 are rejected; confirmed duplicate requests are reconciled without a second post.
@@ -178,6 +180,9 @@ reloads, without storing credentials or CSRF tokens. Retry is always explicit.
 On uncertain delivery, check the thread and retry the **same** retained request.
 Do not create a new request to work around uncertainty. Unconfirmed retry guards
 are in memory; after a restart, recovery can prove only records retained by Slack.
+If its occurrence leaves the history window, the browser offers an explicit
+Dismiss expired local retry control. It clears only this browser's retry guard;
+delivery remains unconfirmed and the operator must check the original thread.
 
 Ask Chai previews an editable question, then DPTP-bot posts an explicit mention,
 request ID, source context and read-only investigation instructions in that alert's
@@ -188,17 +193,25 @@ does not use Chai's private-DM shortcut.
 
 ## Recovery and operation
 
-Keep `slack.cutover` fixed across restarts. It is the recorded start of retained
-dashboard history, not a moving recent-message window. Startup rebuilds all
-parents since that time and their threads, including actions on old alerts.
-Reconciliation rescans parent history (default every minute), rereading threads
-when reply counts or latest-reply timestamps change. Browser refreshes read memory
-every 15 seconds, not Slack. Config changes require a process restart.
+The dashboard shows a rolling **48-hour** window by default. Change it with
+`--history-window`, for example `--history-window=72h`. The lower boundary moves
+with the clock, including across restarts; older occurrences and Chai reports
+leave all dashboard views while their original messages remain in Slack.
+`slack.cutover` is optional and can set an earliest go-live date within that window.
+
+Recovery reads up to 24 additional hours of parent messages to preserve active
+snoozes whose original occurrence has left the visible window. With the default,
+the scan covers at most 72 hours. Buffer occurrences are hidden and cannot receive
+new actions. Current-day snoozes still expire at the next 06:00 UTC reset.
+Reconciliation rescans this bounded history (default every minute), rereading
+threads when reply counts or latest-reply timestamps change. Browser refreshes
+read memory every 15 seconds, not Slack. Config changes require a process restart.
 
 Incomplete replay or malformed trusted action records expose Catching up/Degraded
 coverage and pause actions. Verify channel retention and full rebuild time before
 rollout. Deleted or expired Slack records cannot be recovered by this service.
-The channel is the persistence boundary, so retention must cover the fixed cutover.
+The channel is the persistence boundary, so retention must cover the history
+window and replay buffer (72 hours with the default settings).
 
 `/healthz` checks process liveness; `/readyz` succeeds only with complete archive
 coverage. Other routes require authenticated operator access. No production

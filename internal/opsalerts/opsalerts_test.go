@@ -38,19 +38,20 @@ func (c *fixedClock) Now() time.Time { return c.now }
 
 // memoryArchive models confirmed, rejected and ambiguously delivered thread writes.
 type memoryArchive struct {
-	roots         []slack.Message
-	replies       map[string][]slack.Message
-	clock         *fixedClock
-	posts         int
-	postError     error
-	storeOnError  bool
-	historyError  error
-	repliesError  error
-	replyCalls    int
-	lastText      string
-	reactionError error
-	reactions     []reactionCall
-	cancelOnReply context.CancelFunc
+	roots          []slack.Message
+	replies        map[string][]slack.Message
+	clock          *fixedClock
+	posts          int
+	postError      error
+	storeOnError   bool
+	historyError   error
+	repliesError   error
+	replyCalls     int
+	lastText       string
+	reactionError  error
+	reactions      []reactionCall
+	cancelOnReply  context.CancelFunc
+	advanceOnReply time.Duration
 }
 
 // reactionCall captures only optional presentation writes.
@@ -67,6 +68,7 @@ func (a *memoryArchive) History(context.Context, string, time.Time) ([]slack.Mes
 // Replies implements Archive.
 func (a *memoryArchive) Replies(_ context.Context, _ string, root string) ([]slack.Message, error) {
 	a.replyCalls++
+	a.clock.now = a.clock.now.Add(a.advanceOnReply)
 	if a.cancelOnReply != nil {
 		a.cancelOnReply()
 	}

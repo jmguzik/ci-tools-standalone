@@ -157,7 +157,7 @@ func sameTime(a, b *time.Time) bool {
 }
 
 // validateTransition detects inconsistent full-state records during recovery.
-func validateTransition(o Occurrence, r actionRecord, rules map[string]Snooze) error {
+func validateTransition(o Occurrence, r actionRecord, rules map[string]Snooze, historicalRule bool) error {
 	if r.Request.ExpectedRevision != o.Identity.Revision {
 		return fmt.Errorf("stale durable action revision")
 	}
@@ -193,7 +193,8 @@ func validateTransition(o Occurrence, r actionRecord, rules map[string]Snooze) e
 		}
 	case "unsnooze":
 		rule, exists := rules[r.Unsnooze]
-		if !exists || rule.Source != o.Message.Source || rule.Channel != o.Identity.Channel || !r.At.Before(rule.Until) {
+		// Expired historical rules can live on parents outside the bounded replay.
+		if !historicalRule && (!exists || rule.Source != o.Message.Source || rule.Channel != o.Identity.Channel || !r.At.Before(rule.Until)) {
 			return fmt.Errorf("undo without matching snooze rule")
 		}
 	case "investigate":
@@ -248,7 +249,7 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 		return Occurrence{}, ErrNotReady
 	}
 	target, exists := cache.Occurrences[req.OccurrenceID]
-	if !exists {
+	if !exists || !s.retained(target, s.clock.Now(), 0) {
 		return Occurrence{}, ErrNotFound
 	}
 	updated, err := s.reloadTarget(ctx, cache, target)
@@ -257,7 +258,11 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 	}
 	cache = updated
 	s.publish(cache)
-	target = effectiveOccurrence(cache.Occurrences[req.OccurrenceID], cache, s.clock.Now())
+	target, exists = cache.Occurrences[req.OccurrenceID]
+	if !exists || !s.retained(target, s.clock.Now(), 0) {
+		return Occurrence{}, ErrNotFound
+	}
+	target = effectiveOccurrence(target, cache, s.clock.Now())
 	if record, exists := cache.Records[req.RequestID]; exists {
 		if record.Request != req || record.Actor != actor {
 			return target, ErrConflict
@@ -293,6 +298,9 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 	}
 	if err := ctx.Err(); err != nil {
 		return target, errors.Join(ErrNotReady, err)
+	}
+	if !s.retained(target, s.clock.Now(), 0) {
+		return Occurrence{}, ErrNotFound
 	}
 	ts, err := s.archive.Post(ctx, s.cfg.ChannelID, target.Identity.Timestamp, req.RequestID, text)
 	if err == nil {

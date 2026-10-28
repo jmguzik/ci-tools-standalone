@@ -15,7 +15,7 @@
 <main id="main"><div class="page-head"><div><h1 id="title">Feed</h1><p id="subtitle" class="muted">Unacknowledged occurrences needing triage</p></div><button id="refresh" class="btn" type="button">↻ Refresh</button></div>
 <section id="coverage" class="banner" role="status" aria-live="polite">Connecting to retained Slack history…</section>
 <div id="action-error" class="banner error" role="alert" hidden></div>
-<div id="retry-panel" class="banner warning" hidden><p id="retry-text"></p><button id="retry" class="btn" type="button">↻ Retry same request</button></div>
+<div id="retry-panel" class="banner warning" hidden><p id="retry-text"></p><button id="retry" class="btn" type="button">↻ Retry same request</button><button id="dismiss-expired" class="btn" type="button" hidden>Dismiss expired local retry</button></div>
 <p id="outcome" role="status" aria-live="polite"></p>
 <div class="toolbar"><label class="search">Search occurrences<input id="search" type="search" placeholder="Title, identifier, source or evidence…" autocomplete="off"></label><label id="color-label">Priority<select id="color"><option value="">All priorities</option><option value="red">Red</option><option value="orange">Orange</option><option value="yellow">Yellow</option></select></label></div>
 <div id="filters" class="filters" aria-label="Filter by category"></div>
