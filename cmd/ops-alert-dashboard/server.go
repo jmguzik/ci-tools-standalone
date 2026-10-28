@@ -19,6 +19,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -39,19 +41,21 @@ type alertService interface {
 
 // accessConfig describes the authenticated reverse proxy, never browser-supplied identity.
 type accessConfig struct {
+	Authorization  string   `json:"authorization"`
 	UserHeader     string   `json:"user_header"`
 	Operators      []string `json:"operators"`
 	TrustedProxies []string `json:"trusted_proxies"`
 	ExternalURL    string   `json:"external_url"`
 }
 
-// accessPolicy compiles the small allowlist once at startup.
+// accessPolicy compiles proxy trust and operator authorization once at startup.
 type accessPolicy struct {
-	header  string
-	users   sets.Set[string]
-	proxies []netip.Prefix
-	origin  string
-	demo    bool
+	header             string
+	users              sets.Set[string]
+	proxies            []netip.Prefix
+	origin             string
+	demo               bool
+	proxyAuthorization bool
 }
 
 // dashboard serves private Slack data only after the proxy and operator checks.
@@ -104,6 +108,22 @@ func newDashboard(service alertService, cfg accessConfig, demo bool) (*dashboard
 // compileAccess rejects an accidentally public identity-header trust boundary.
 func compileAccess(cfg accessConfig, demo bool) (accessPolicy, error) {
 	policy := accessPolicy{header: cfg.UserHeader, users: sets.New[string](), demo: demo}
+	switch cfg.Authorization {
+	case "":
+	case "proxy":
+		if demo {
+			return policy, fmt.Errorf("access.authorization proxy cannot be combined with demo mode")
+		}
+		if len(cfg.Operators) != 0 {
+			return policy, fmt.Errorf("access.authorization proxy cannot be combined with access.operators")
+		}
+		if len(cfg.TrustedProxies) == 0 {
+			return policy, fmt.Errorf("access.authorization proxy requires explicit access.trusted_proxies")
+		}
+		policy.proxyAuthorization = true
+	default:
+		return policy, fmt.Errorf("access.authorization must be empty or proxy")
+	}
 	if policy.header == "" {
 		policy.header = "X-Forwarded-Email"
 	}
@@ -120,12 +140,12 @@ func compileAccess(cfg accessConfig, demo bool) (accessPolicy, error) {
 	policy.origin = origin.Scheme + "://" + origin.Host
 	for _, user := range cfg.Operators {
 		user = strings.ToLower(strings.TrimSpace(user))
-		if user == "" || strings.ContainsAny(user, ",\r\n") {
+		if !validIdentity(user) {
 			return policy, fmt.Errorf("access.operators contains an invalid identity")
 		}
 		policy.users.Insert(user)
 	}
-	if !demo && policy.users.Len() == 0 {
+	if !demo && !policy.proxyAuthorization && policy.users.Len() == 0 {
 		return policy, fmt.Errorf("access.operators must allow at least one authenticated operator")
 	}
 	proxies := cfg.TrustedProxies
@@ -140,6 +160,16 @@ func compileAccess(cfg accessConfig, demo bool) (accessPolicy, error) {
 		policy.proxies = append(policy.proxies, prefix)
 	}
 	return policy, nil
+}
+
+// validIdentity rejects ambiguous or malformed proxy identities before authorization.
+func validIdentity(user string) bool {
+	return user != "" && len(user) <= 256 && strings.IndexFunc(user, invalidIdentityRune) == -1
+}
+
+// invalidIdentityRune excludes header lists, control characters and embedded whitespace.
+func invalidIdentityRune(r rune) bool {
+	return r == ',' || unicode.IsControl(r) || unicode.IsSpace(r)
 }
 
 // isLoopbackHost keeps unauthenticated demo mode on the local machine.
@@ -182,7 +212,10 @@ func (p accessPolicy) actor(r *http.Request) (string, error) {
 		return "", fmt.Errorf("authenticated identity is required")
 	}
 	user := strings.ToLower(strings.TrimSpace(values[0]))
-	if len(user) > 256 || !p.users.Has(user) {
+	if !utf8.ValidString(values[0]) || strings.IndexFunc(values[0], unicode.IsControl) != -1 || !validIdentity(user) {
+		return "", fmt.Errorf("authenticated identity is invalid")
+	}
+	if !p.proxyAuthorization && !p.users.Has(user) {
 		return "", fmt.Errorf("operator access is required")
 	}
 	return user, nil

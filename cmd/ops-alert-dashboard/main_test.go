@@ -71,6 +71,14 @@ func TestCompileAccess(t *testing.T) {
 		wantError string
 	}{
 		{name: "production", cfg: testAccess()},
+		{name: "proxy authorized", cfg: proxyAccess()},
+		{name: "proxy cannot bypass identity in demo", cfg: proxyAccess(), demo: true, wantError: "cannot be combined with demo"},
+		{name: "proxy requires explicit trusted proxies", cfg: accessConfig{Authorization: "proxy", ExternalURL: "https://alerts.example.test"}, wantError: "requires explicit"},
+		{name: "proxy cannot combine operators", cfg: accessConfig{Authorization: "proxy", Operators: []string{"operator"}, TrustedProxies: []string{"127.0.0.1/32"}}, wantError: "cannot be combined"},
+		{name: "unknown authorization rejected", cfg: accessConfig{Authorization: "allow-all"}, wantError: "must be empty or proxy"},
+		{name: "proxy requires origin", cfg: accessConfig{Authorization: "proxy", TrustedProxies: []string{"127.0.0.1/32"}}, wantError: "without a path"},
+		{name: "proxy requires https", cfg: accessConfig{Authorization: "proxy", ExternalURL: "http://alerts.example.test", TrustedProxies: []string{"127.0.0.1/32"}}, wantError: "must use https"},
+		{name: "proxy rejects universal CIDR", cfg: accessConfig{Authorization: "proxy", ExternalURL: "https://alerts.example.test", TrustedProxies: []string{"0.0.0.0/0"}}, wantError: "non-universal"},
 		{name: "missing allowlist", cfg: accessConfig{ExternalURL: "https://alerts.example.test"}, wantError: "at least one"},
 		{name: "insecure production", cfg: accessConfig{ExternalURL: "http://alerts.example.test", Operators: []string{"operator"}}, wantError: "must use https"},
 		{name: "origin cannot contain path", cfg: accessConfig{ExternalURL: "https://alerts.example.test/dashboard"}, wantError: "without a path"},
