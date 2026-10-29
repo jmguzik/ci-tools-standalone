@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
-from google.api_core.exceptions import NotFound, PermissionDenied, RetryError, ServiceUnavailable
+from google.api_core.exceptions import DeadlineExceeded, NotFound, PermissionDenied, RetryError, ServiceUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from commands.create import create as create_command
@@ -74,6 +74,8 @@ class CommandsTest(unittest.TestCase):
             ("existing secret gets a new version", None, 0, "updated successfully"),
             ("missing secret is reported", NotFound("missing"), 1, "does not exist in collection"),
             ("missing permission is reported", PermissionDenied("denied"), 1, "don't have permission"),
+            ("other Google error is reported", DeadlineExceeded("slow"), 1, "Failed to access secret 'aws/key'"),
+            ("expired login is passed on to main", ServiceUnavailable("expired"), 1, ""),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
@@ -88,6 +90,7 @@ class CommandsTest(unittest.TestCase):
                 self.assertEqual(result.exit_code, want_exit, result.output)
                 self.assertIn(want_output, result.output)
                 self.assertEqual(client.add_secret_version.called, want_exit == 0)
+                self.assertEqual(isinstance(result.exception, ServiceUnavailable), isinstance(get_error, ServiceUnavailable))
                 if want_exit == 0:
                     self.assertEqual(
                         client.add_secret_version.call_args.kwargs["parent"],

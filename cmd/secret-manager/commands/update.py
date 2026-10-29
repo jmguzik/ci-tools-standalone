@@ -10,6 +10,7 @@ from util import (
     create_payload,
     destroy_previous_versions,
     get_secret_name,
+    is_login_error,
     validate_collection,
     validate_path,
     validate_secret_source,
@@ -55,6 +56,12 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
     except NotFound as e:
         raise click.ClickException(
             f"Secret '{secret_path}' does not exist in collection '{collection}'."
+        ) from e
+    except Exception as e:
+        if is_login_error(e):
+            raise  # reported by main
+        raise click.ClickException(
+            f"Failed to access secret '{secret_path}' in collection '{collection}': {e}."
         ) from e
 
     try:
