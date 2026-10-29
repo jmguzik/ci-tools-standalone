@@ -137,11 +137,14 @@ func extractIdentifiers(source Source, text string) []string {
 	case "alertmanager":
 		patterns = append(patterns, `(?m)(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_:.-]*)\s+\[ops_color=`, `(?i)\balertname\s*[=:]\s*["\x60*]?([A-Za-z_][A-Za-z0-9_:.-]*)`, `(?im)\balert:\s*[*\x60]?([A-Za-z_][A-Za-z0-9_:.-]*)`, `(?m)\[(?:FIRING|RESOLVED)(?::[0-9]+)?\]\s*([A-Za-z_][A-Za-z0-9_:.-]*)`)
 	case "prow":
-		patterns = append(patterns, `(?i)\bjob(?:_name)?\s*[=:]?\s*[*\x60]?((?:periodic|pull|postsubmit|rehearse)-[A-Za-z0-9_.-]+)`, `\b((?:periodic|pull|postsubmit|rehearse)-[A-Za-z0-9_.-]+)`)
+		patterns = append(patterns, `(?i)\bjob(?:_name)?\s*[=:]?\s*[*\x60]?((?:periodic|pull|postsubmit|rehearse|branch-ci)-[A-Za-z0-9_.-]+)`, `\b((?:periodic|pull|postsubmit|rehearse|branch-ci)-[A-Za-z0-9_.-]+)`)
 	case "ship":
 		component, subcomponent, outage := shipParts(text)
 		if outage {
 			identifiers = append(identifiers, component+"/"+subcomponent)
+		}
+		if identifier := shipLegacyIdentifier(text); identifier != "" {
+			identifiers = append(identifiers, identifier)
 		}
 	}
 	if source.IdentifierPattern != "" {
@@ -175,7 +178,9 @@ func (s *Service) classify(source Source, m slack.Message, text string, identifi
 		return Classification{Color: p.Color, Category: p.Category, Origin: "policy"}, true
 	}
 	if source.Kind == "ship" {
-		return s.shipClassification(text), true
+		if _, _, outage := shipParts(text); outage {
+			return s.shipClassification(text), true
+		}
 	}
 	rx := regexp.MustCompile(`\[ops_color=([a-z_]+)\s+ops_category=([a-z_]+)\]`)
 	var classifications []Classification
@@ -198,7 +203,19 @@ func (s *Service) classify(source Source, m slack.Message, text string, identifi
 				}
 			}
 			if !supplied {
-				classifications = append(classifications, s.classifier.fallback(identifier))
+				classifications = append(classifications, s.classifier.fallback(identifier, true))
+			}
+		}
+	}
+	if len(classifications) == 0 {
+		if source.Kind == "prow" {
+			for _, identifier := range identifiers {
+				classifications = append(classifications, s.classifier.fallback(identifier, false))
+			}
+		}
+		if source.Kind == "ship" {
+			if identifier := shipLegacyIdentifier(text); identifier != "" {
+				classifications = append(classifications, s.classifier.fallback(identifier, false))
 			}
 		}
 	}
@@ -235,11 +252,27 @@ func shipParts(text string) (string, string, bool) {
 	line, _, _ := strings.Cut(text, "\n")
 	header, found := strings.CutPrefix(line, "🚨 Outage Detected: ")
 	if !found {
+		header, found = strings.CutPrefix(line, ":rotating_light: Outage Detected: ")
+	}
+	if !found {
 		return "", "", false
 	}
 	component, subcomponent, found := strings.Cut(header, "/")
 	component, subcomponent = strings.TrimSpace(component), strings.TrimSpace(subcomponent)
 	return component, subcomponent, found && component != "" && subcomponent != ""
+}
+
+// shipLegacyIdentifier recognizes historical DPTP headers, never body mentions.
+func shipLegacyIdentifier(text string) string {
+	line, _, _ := strings.Cut(text, "\n")
+	if line == "Repo brancher fast-forward failures" || regexp.MustCompile(`^Repo brancher has [0-9]+ active fast-forward failure\(s\)(?:[.:]|$)`).MatchString(line) {
+		return "repo-brancher-fast-forward-failures"
+	}
+	match := regexp.MustCompile(`^\[(?:FIRING|NO LONGER FIRING IN ALERTMANAGER)\]\s+([A-Za-z_][A-Za-z0-9_.-]*)(?:\s|:|$)`).FindStringSubmatch(line)
+	if len(match) > 1 {
+		return match[1]
+	}
+	return ""
 }
 
 // shipClassification uses component names from the published SHIP root format.
