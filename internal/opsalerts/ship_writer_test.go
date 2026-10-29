@@ -57,6 +57,7 @@ func TestSharedSHIPWriterNormalization(t *testing.T) {
 	cases := []struct {
 		name, user, bot, text, thread string
 		want                          bool
+		metadata                      slack.SlackMetadata
 		classification                Classification
 		identifiers                   []string
 	}{
@@ -67,6 +68,8 @@ func TestSharedSHIPWriterNormalization(t *testing.T) {
 		{name: "own thread action", user: "U01AP73A3AP", text: "Acknowledged\n" + ActionMarker + "{}", thread: "123.000000"},
 		{name: "own root action", user: "U01AP73A3AP", text: "Acknowledged\n" + ActionMarker + "{}"},
 		{name: "own bot root malformed action", bot: "B_WRITER", text: ActionMarker + "{broken}"},
+		{name: "own metadata root", user: "U01AP73A3AP", text: "acknowledged", metadata: slack.SlackMetadata{EventType: ActionMetadataEvent}},
+		{name: "own receipt with lost metadata", user: "U01AP73A3AP", text: ActionReceiptPrefix + "acknowledged"},
 		{name: "unknown human outage", user: "U_HUMAN", text: "🚨 Outage Detected: Build Farm/Prow"},
 	}
 	for _, tc := range cases {
@@ -79,7 +82,7 @@ func TestSharedSHIPWriterNormalization(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			message := slack.Message{Msg: slack.Msg{Timestamp: archive.roots[0].Timestamp, User: tc.user, BotID: tc.bot, Text: tc.text, ThreadTimestamp: tc.thread}}
+			message := slack.Message{Msg: slack.Msg{Timestamp: archive.roots[0].Timestamp, User: tc.user, BotID: tc.bot, Text: tc.text, Metadata: tc.metadata, ThreadTimestamp: tc.thread}}
 			got, admitted, err := s.normalize(message)
 			if err != nil {
 				t.Fatal(err)
@@ -133,7 +136,7 @@ func TestSharedSHIPWriterReplay(t *testing.T) {
 			if want.State.AcknowledgedAt == nil {
 				t.Fatal("action did not acknowledge SHIP root")
 			}
-			archive.roots = append(archive.roots, slack.Message{Msg: slack.Msg{Timestamp: fmt.Sprintf("%d.000002", clock.Now().Unix()), User: "U_WRITER", BotID: "B_WRITER", Text: archive.lastText}})
+			archive.roots = append(archive.roots, slack.Message{Msg: slack.Msg{Timestamp: fmt.Sprintf("%d.000002", clock.Now().Unix()), User: "U_WRITER", BotID: "B_WRITER", Text: archive.lastMessage.Text, Metadata: archive.lastMessage.Metadata}})
 			restarted, err := NewService(cfg, s.classifier, archive, clock)
 			if err != nil {
 				t.Fatal(err)

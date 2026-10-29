@@ -18,6 +18,16 @@ import (
 // ActionMarker identifies a single-line durable record in a trusted writer reply.
 const ActionMarker = "OPS_ALERT_ACTION_V1 "
 
+// ActionMetadataEvent identifies durable dashboard records in Slack metadata.
+const ActionMetadataEvent = "ops_alert_action_v1"
+
+// MaxActionMetadataBytes is a conservative application budget for serialized metadata.
+// It is a local safety limit, not a claim about Slack's server limit.
+const MaxActionMetadataBytes = 3000
+
+// ActionReceiptPrefix reserves readable receipts so missing metadata fails closed.
+const ActionReceiptPrefix = "Ops dashboard: "
+
 // actionRecord carries complete occurrence state plus the associated rule mutation.
 type actionRecord struct {
 	ObservedWIP   string         `json:"observed_wip,omitempty"`
@@ -150,6 +160,37 @@ func decodeRecord(text, target string) (actionRecord, bool, error) {
 	}
 	if record.Request.Kind == "investigate" && (record.Investigation == nil || record.Investigation.RequestID != record.Request.RequestID || record.Investigation.Question != record.Request.Question) {
 		return record, false, fmt.Errorf("missing investigation state")
+	}
+	return record, true, nil
+}
+
+// decodeMessageRecord accepts legacy records and strictly validated metadata copies.
+// Callers must verify the writer identity before trusting either surface.
+func decodeMessageRecord(message slack.Msg, target string) (actionRecord, bool, error) {
+	legacy, hasLegacy, err := decodeRecord(message.Text, target)
+	if err != nil {
+		return actionRecord{}, false, err
+	}
+	metadata := message.Metadata
+	if metadata.EventType != ActionMetadataEvent {
+		if strings.HasPrefix(message.Text, ActionReceiptPrefix) && !hasLegacy {
+			return actionRecord{}, false, fmt.Errorf("action receipt missing supported metadata or legacy record")
+		}
+		return legacy, hasLegacy, nil
+	}
+	raw, ok := metadata.EventPayload["record"].(string)
+	if !ok || len(metadata.EventPayload) != 1 || raw == "" || strings.ContainsAny(raw, "\r\n") {
+		return actionRecord{}, false, fmt.Errorf("invalid action metadata envelope")
+	}
+	record, exists, err := decodeRecord(ActionMarker+raw, target)
+	if err != nil {
+		return actionRecord{}, false, fmt.Errorf("decoding action metadata: %w", err)
+	}
+	if !exists {
+		return actionRecord{}, false, fmt.Errorf("missing action metadata record")
+	}
+	if hasLegacy && !sameRecord(legacy, record) {
+		return actionRecord{}, false, fmt.Errorf("conflicting legacy and metadata action records")
 	}
 	return record, true, nil
 }
@@ -357,7 +398,7 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 	if err != nil {
 		return target, err
 	}
-	text, err := s.actionText(record, target)
+	message, err := s.actionMessage(record, target)
 	if err != nil {
 		return target, err
 	}
@@ -367,7 +408,7 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 	if !s.retained(target, s.clock.Now(), 0) {
 		return Occurrence{}, ErrNotFound
 	}
-	ts, err := s.archive.Post(ctx, s.cfg.ChannelID, target.Identity.Timestamp, req.RequestID, text)
+	ts, err := s.archive.Post(ctx, s.cfg.ChannelID, target.Identity.Timestamp, req.RequestID, message)
 	if err == nil {
 		if _, tsErr := slackTime(ts); tsErr != nil {
 			err = fmt.Errorf("invalid successful post timestamp: %w", tsErr)
@@ -378,7 +419,7 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 	}
 	threads := maps.Clone(cache.Threads)
 	thread := threads[target.Identity.Timestamp]
-	thread.Replies = append(append([]slack.Message(nil), thread.Replies...), slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: target.Identity.Timestamp, User: s.cfg.Writer.UserID, BotID: s.cfg.Writer.BotID, Text: text}})
+	thread.Replies = append(append([]slack.Message(nil), thread.Replies...), slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: target.Identity.Timestamp, User: s.cfg.Writer.UserID, BotID: s.cfg.Writer.BotID, Text: message.Text, Metadata: message.Metadata}})
 	thread.Root.ReplyCount++
 	thread.Root.LatestReply = ts
 	threads[target.Identity.Timestamp] = thread
@@ -509,17 +550,54 @@ func escapeSlack(text string) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(text)
 }
 
-// actionText combines a readable confirmation or Chai question with its record.
-func (s *Service) actionText(r actionRecord, o Occurrence) (string, error) {
+// actionReceipt describes the visible outcome while keeping identifiers in metadata.
+func actionReceipt(r actionRecord) string {
+	label := "👀 WIP"
+	switch r.Request.Kind {
+	case "unacknowledge":
+		label = "Released"
+	case "close":
+		label = "✅ Closed"
+	case "reopen":
+		label = "Reopened"
+	case "snooze":
+		label = "💤 Snoozed"
+	case "unsnooze":
+		label = "Unsnoozed"
+	}
+	scope := ""
+	if r.Request.Scope == "regex" || r.Request.Kind == "snooze" && r.Request.Scope == "" {
+		scope = " matching alerts"
+	}
+	expiry := ""
+	if r.WIPRule != nil {
+		expiry = " until " + r.WIPRule.Until.UTC().Format("2006-01-02 15:04 UTC")
+	}
+	if r.Snooze != nil {
+		expiry = " until " + r.Snooze.Until.UTC().Format("2006-01-02 15:04 UTC")
+	}
+	return fmt.Sprintf("%s%s%s by %s%s.", ActionReceiptPrefix, label, scope, escapeSlack(r.Actor), expiry)
+}
+
+// actionMessage keeps durable state in metadata and only readable confirmation in text.
+func (s *Service) actionMessage(r actionRecord, o Occurrence) (slack.Msg, error) {
 	data, err := json.Marshal(r)
 	if err != nil {
-		return "", fmt.Errorf("encoding action record: %w", err)
+		return slack.Msg{}, fmt.Errorf("encoding action record: %w", err)
 	}
-	confirmation := fmt.Sprintf("Ops dashboard: %s by %s (request %s).", r.Request.Kind, escapeSlack(r.Actor), r.Request.RequestID)
+	confirmation := actionReceipt(r)
 	if r.Request.Kind == "investigate" {
-		confirmation = fmt.Sprintf("<@%s> Please investigate this alert in this thread. Request ID: %s\nSource: <%s|Slack occurrence>\nContext: %s\nQuestion: %s\nUse read-only evidence. Summarize findings, evidence links, and suggested next checks here. Do not make changes, acknowledge, or close the alert.", s.chaiUser(), r.Request.RequestID, o.Message.SlackURL, escapeSlack(o.Message.Title), escapeSlack(r.Request.Question))
+		confirmation = fmt.Sprintf("%s<@%s> Please investigate this alert in this thread. Request ID: %s\nSource: <%s|Slack occurrence>\nContext: %s\nQuestion: %s\nUse read-only evidence. Summarize findings, evidence links, and suggested next checks here. Do not make changes, acknowledge, or close the alert.", ActionReceiptPrefix, s.chaiUser(), r.Request.RequestID, o.Message.SlackURL, escapeSlack(o.Message.Title), escapeSlack(r.Request.Question))
 	}
-	return confirmation + "\n" + ActionMarker + string(data), nil
+	message := slack.Msg{Text: confirmation, Metadata: slack.SlackMetadata{EventType: ActionMetadataEvent, EventPayload: map[string]interface{}{"record": string(data)}}}
+	envelope, err := json.Marshal(message.Metadata)
+	if err != nil {
+		return slack.Msg{}, fmt.Errorf("encoding action metadata: %w", err)
+	}
+	if len(envelope) > MaxActionMetadataBytes {
+		return slack.Msg{}, fmt.Errorf("%w: serialized action metadata is %d bytes, exceeds application budget of %d bytes; shorten the question or retained record", ErrValidation, len(envelope), MaxActionMetadataBytes)
+	}
+	return message, nil
 }
 
 // failedDelivery exposes uncertainty while retaining a retry guard in this process.

@@ -365,7 +365,11 @@
     for (const [key, view] of Object.entries(views)) {
       const b = button(view[0] + ' ' + view[1], () => { state.view = key; state.category = ''; state.selected = ''; error(''); rememberPreferences(); if (key === 'unmerged_prs') refreshPRs(); render(); }, key === 'chai_reports' ? 'report-nav' : '');
       if (state.view === key) b.setAttribute('aria-current', 'page');
-      if (key === 'feed') { const count = items().filter(o => o.view === 'feed' && unread(o)).length; b.setAttribute('aria-label', 'Feed · ' + count + ' unread'); append(b, feedUnreadBadge(count)); }
+      if (key === 'feed') {
+        const feed = items().filter(o => !isReport(o) && o.view === 'feed'), count = feed.filter(unread).length;
+        b.setAttribute('aria-label', 'Feed · ' + feed.length + ' total · ' + count + ' unread');
+        append(b, node('span', feed.length, 'count'), feedUnreadBadge(count));
+      }
       else if (!['chai_reports', 'unmerged_prs'].includes(key)) append(b, node('span', items().filter(o => !isReport(o) && o.view === key).length, 'count'));
       el('navigation').append(b);
     }

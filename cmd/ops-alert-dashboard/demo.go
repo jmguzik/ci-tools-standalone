@@ -43,7 +43,7 @@ func (a *demoArchive) Replies(_ context.Context, _ string, root string) ([]slack
 }
 
 // Post commits to memory and simulates Chai's reply without contacting any service.
-func (a *demoArchive) Post(ctx context.Context, channel, root, requestID, text string) (string, error) {
+func (a *demoArchive) Post(ctx context.Context, channel, root, requestID string, message slack.Msg) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -65,10 +65,10 @@ func (a *demoArchive) Post(ctx context.Context, channel, root, requestID, text s
 		}
 		a.next = a.next.Add(time.Millisecond)
 		timestamp := protocolTimestamp(a.next)
-		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: text}})
+		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: message.Text, Metadata: message.Metadata}})
 		a.roots[i].ReplyCount++
 		a.roots[i].LatestReply = timestamp
-		if strings.Contains(text, "<@U_CHAI>") {
+		if strings.Contains(message.Text, "<@U_CHAI>") {
 			a.next = a.next.Add(time.Millisecond)
 			reply := slack.Message{Msg: slack.Msg{Type: "message", User: "U_CHAI", BotID: "B_CHAI", ThreadTimestamp: root, Timestamp: protocolTimestamp(a.next), Text: "Demo Chai reply: this is synthetic evidence. Check the affected controller logs, recent deployment changes, and the linked dashboard. No remediation was run."}}
 			a.threads[root] = append(a.threads[root], reply)

@@ -1015,7 +1015,8 @@ textarea {
 .alert-card strong { font-weight: 500; }
 .alert-card.unread strong { font-weight: 750; }
 .new-indicator { color: var(--red); font-size: 10px; font-weight: 750; letter-spacing: .6px; }
-.unread-count { background: var(--red); color: var(--surface); }
+.unread-count { background: var(--red); color: var(--surface); border-radius: 999px; }
+.count + .unread-count { margin-left: 6px; }
 .source-status { font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
 .slack-body { font-size: 12px; overflow-wrap: anywhere; line-height: 1.65; }
 .slack-body code { font-family: ui-monospace,SFMono-Regular,Consolas,monospace; background: var(--soft); border-radius: 3px; padding: 1px 4px; }

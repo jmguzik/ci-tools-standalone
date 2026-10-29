@@ -468,11 +468,11 @@ func TestWIPDelayedConfirmation(t *testing.T) {
 			if tc.invalidChronology {
 				prepared.At = clock.now
 			}
-			text, err := s.actionText(prepared, displayed)
+			message, err := s.actionMessage(prepared, displayed)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := a.Post(context.Background(), s.cfg.ChannelID, displayed.Identity.Timestamp, req.RequestID, text); err != nil {
+			if _, err := a.Post(context.Background(), s.cfg.ChannelID, displayed.Identity.Timestamp, req.RequestID, message); err != nil {
 				t.Fatal(err)
 			}
 			err = s.Sync(context.Background())
@@ -535,7 +535,7 @@ func TestUncertainFamilyCancellation(t *testing.T) {
 			if _, err := s.Act(ctx, "cancel", cancel); !errors.Is(err, ErrDeliveryUncertain) {
 				t.Fatalf("cancel uncertainty=%v", err)
 			}
-			cancelText := a.lastText
+			cancelMessage := a.lastMessage
 			a.postError = nil
 			a.storeOnError = false
 			clock.now = clock.now.Add(time.Minute)
@@ -570,7 +570,7 @@ func TestUncertainFamilyCancellation(t *testing.T) {
 				}
 				// Slack eventually reveals the original delivery; this is archive evidence, not a retry post.
 				ts := fmt.Sprintf("%d.000001", clock.now.Unix())
-				a.replies[cancelTarget.Identity.Timestamp] = append(a.replies[cancelTarget.Identity.Timestamp], slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: cancelTarget.Identity.Timestamp, User: "U_WRITER", BotID: "B_WRITER", Text: cancelText}})
+				a.replies[cancelTarget.Identity.Timestamp] = append(a.replies[cancelTarget.Identity.Timestamp], slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: cancelTarget.Identity.Timestamp, User: "U_WRITER", BotID: "B_WRITER", Text: cancelMessage.Text, Metadata: cancelMessage.Metadata}})
 				a.roots[2].ReplyCount++
 				a.roots[2].LatestReply = ts
 			}

@@ -140,6 +140,8 @@ this browser's local storage. They survive page reloads and SSO renewal but do n
 synchronize across devices. Existing occurrences form the first-visit baseline;
 explicitly opening a card or Mark all read clears personal unread state. Severity
 colors, shared WIP state and personal unread indicators are independent.
+Feed navigation always shows its shared occurrence total; a separate red badge
+appears only for a nonzero personal unread count.
 New Feed occurrences since the last complete sync remain unread when returning
 after a reload or sign-in. Incomplete coverage preserves the saved read state.
 
@@ -160,7 +162,8 @@ controls session lifetime; the core-ci deployment configures twelve hours.
 
 The separate **Unmerged PRs** view lists open PRs in `openshift/release` from exact
 configured bot logins, including drafts and older PRs outside the Slack history
-window. Defaults are `redhat-chai-bot`, `openshift-bot` and `openshift-ci-robot`.
+window. Defaults are `openshift-bot` and `openshift-ci-robot`; Chai bot PRs are
+excluded from the default watch list. The Chai reports view is independent.
 Override with `--unmerged-pr-authors=login1,login2`, or use an empty value to disable
 the view. It is read-only and never merges PRs or posts GitHub comments.
 
@@ -247,10 +250,16 @@ visible and the browser retains the original plan and request IDs. Conflict,
 rejection or uncertain delivery stops the batch; resuming or discarding the
 remaining plan is explicit and never undoes already confirmed actions.
 
-Each accepted mutation saves a readable thread reply with a versioned
-`OPS_ALERT_ACTION_V1` record, request ID, actor/time, target and complete workflow
-state. Only replies from the verified writer identity are replayed as actions.
-An action is successful only after Slack confirms the save. The visible reactions
+Each accepted mutation saves a short readable thread reply, with the complete
+versioned action record in Slack message metadata (`ops_alert_action_v1`, payload
+field `record`). Request ID, actor/time, target, rule scope and deadline, and
+complete workflow state remain durable without printing JSON in the conversation.
+Existing `OPS_ALERT_ACTION_V1` text records are still read. Only replies from the
+verified writer identity are replayed as actions; malformed metadata, conflicting
+copies, or a dashboard receipt missing its record pause actions rather than
+guessing state. An action is successful only after a targeted readback returns the
+exact saved metadata. Failed or rate-limited confirmation leaves delivery uncertain,
+without repeating the write or sleeping in a confirmation retry loop. The visible reactions
 are decoration; removing one does not undo an action. Use the dashboard's explicit
 Undo/Unsnooze controls. Expired snooze decoration for visible occurrences is
 reconciled on the next scan. Untouched feed messages without status reactions
@@ -265,6 +274,19 @@ If Slack rejects a reaction with `missing_scope`, optional reactions are disable
 until the process restarts; the dashboard feed and workflow actions continue.
 After granting `reactions:write` and reinstalling the Slack app if needed, restart
 the dashboard to resume decoration.
+
+Before deploying metadata writes, verify posting and reading metadata with the
+actual writer and history tokens in an operator-approved test thread. Metadata can
+be ignored with a Slack schema warning even when posting succeeds, so a timestamp
+alone is insufficient. Preserve the existing history/replies permissions and
+`include_all_metadata` reads. A rejected metadata payload does not fall back to a
+visible JSON write. New writes enforce a conservative 3,000-byte application budget
+on the serialized metadata envelope, including string escaping. This is not a claim
+about Slack's undocumented server limit. Oversized records, including a large retained
+investigation, are rejected before posting and leave workflow state unchanged.
+Slack metadata is workspace-readable, not a place for secrets.
+Once metadata records exist, rollback requires a metadata-compatible image; older
+binaries can ignore those records and must not be used while they are retained.
 
 The browser submits the selected revision and a stable request ID. Stale changes
 are rejected; confirmed duplicate requests are reconciled without a second post.
