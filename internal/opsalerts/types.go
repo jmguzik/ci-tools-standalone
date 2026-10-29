@@ -99,6 +99,7 @@ type Message struct {
 	Text             string    `json:"text"`
 	Source           string    `json:"source"`
 	ScheduledTask    string    `json:"scheduled_task,omitempty"`
+	ScheduledRun     string    `json:"scheduled_run,omitempty"`
 	Identifiers      []string  `json:"identifiers"`
 	ReportedAt       time.Time `json:"reported_at"`
 	SlackURL         string    `json:"slack_url"`

@@ -175,7 +175,7 @@ nav button[aria-current=page] {
 }
 
 .report-nav {
-  color: var(--green);
+  color: var(--ink);
   margin-top: 15px;
   border-top: 1px solid var(--line);
   padding-top: 18px;
@@ -439,9 +439,9 @@ main {
   background: light-dark(#fff7d9,#453d27);
 }
 
-.badge.green {
-  color: var(--green);
-  background: light-dark(#eaf6ef,#263e34);
+.badge.report-badge {
+  color: var(--ink);
+  background: var(--selected);
 }
 
 .inspector {
@@ -669,7 +669,7 @@ main {
 
 .report-task[aria-pressed=true] {
   background: var(--selected);
-  box-shadow: inset 3px 0 var(--green);
+  box-shadow: inset 3px 0 var(--ink);
 }
 
 .report-task strong,.report-time,.report-headline {
@@ -698,7 +698,7 @@ main {
 }
 
 .report-detail {
-  border-top: 3px solid var(--green);
+  border-top: 3px solid var(--ink);
   padding: 23px;
 }
 
@@ -708,6 +708,109 @@ main {
   align-items: center;
   gap: 8px;
   margin-bottom: 13px;
+}
+
+.pending-summary {
+  margin-top: 24px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.pending-summary h3 {
+  font-size: 16px;
+  margin: 0 0 6px;
+}
+
+.pending-summary > p {
+  margin: 7px 0;
+}
+
+.report-extraction-note {
+  font-size: 12px;
+  padding: 9px 11px;
+  background: var(--soft);
+  border-left: 3px solid var(--line);
+}
+
+.pending-columns,.pending-row {
+  display: grid;
+  grid-template-columns: minmax(70px,1fr) minmax(85px,2fr) minmax(45px,.6fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.pending-columns {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 14px 8px 5px;
+}
+
+.pending-row {
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: none;
+  border-radius: 3px;
+  width: 100%;
+  padding: 10px 8px;
+  text-align: left;
+  font-size: 12px;
+}
+
+.pending-row:hover,.pending-row[aria-pressed=true] {
+  background: var(--selected);
+}
+
+.pending-context {
+  overflow-wrap: anywhere;
+}
+
+.pending-value {
+  position: relative;
+  display: block;
+  min-height: 23px;
+  padding: 3px 7px;
+}
+
+.pending-track {
+  position: absolute;
+  inset: 0;
+}
+
+.pending-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: light-dark(#c8d4e4,#435872);
+}
+
+.pending-value strong {
+  position: relative;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
+.pending-prior {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.pending-evidence {
+  border-top: 1px solid var(--line);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.pending-evidence h4 {
+  margin: 0 0 7px;
+  font-size: 12px;
+}
+
+.pending-evidence p {
+  margin: 7px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
 }
 
 .report-detail > a,.report-history > a {

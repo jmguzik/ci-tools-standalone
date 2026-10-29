@@ -290,7 +290,11 @@
     }
     if (data.enabled && !(data.prs || []).length) container.append(node('p', 'No matching open bot pull requests.', 'empty'));
   }
-  function badge(o) { const color = isReport(o) ? 'green' : ['red', 'orange', 'yellow'].includes(o.classification.color) ? o.classification.color : 'orange'; return node('span', color === 'green' ? 'Green · Chai report' : color[0].toUpperCase() + color.slice(1), 'badge ' + color); }
+  function badge(o) {
+    if (isReport(o)) return node('span', 'Chai report', 'badge report-badge');
+    const color = ['red', 'orange', 'yellow'].includes(o.classification.color) ? o.classification.color : 'orange';
+    return node('span', color[0].toUpperCase() + color.slice(1), 'badge ' + color);
+  }
   function announce(message) { el('outcome').textContent = message; }
   function error(message) { const shown = state.storageError || message; el('action-error').hidden = !shown; el('action-error').textContent = shown; }
   function pendingKey(user) { return 'ops-alert-dashboard.pending.v1.' + encodeURIComponent(user); }
@@ -945,13 +949,61 @@
   }
   function originalReport(o) {
     const details = reportDisclosure('source:' + id(o), 'report-source');
-    append(details, node('summary', 'Original Slack message'), node('p', o.message.text || 'No message text supplied.', 'evidence'));
+    const parts = o.parts || [o];
+    details.append(node('summary', parts.length > 1 ? 'Original Slack messages · ' + parts.length + ' parts' : 'Original Slack message'));
+    for (const part of parts) {
+      if (parts.length > 1) append(details, link(part.message.slack_url, '↗ Source part · ' + date(part.message.reported_at)));
+      details.append(node('p', part.message.text || 'No message text supplied.', 'evidence'));
+    }
     return details;
   }
+  const pendingSelections = new Map();
+  /** Show only reported pod snapshots; evidence remains available for every extracted value. */
+  function renderPending(container, report, previous) {
+    if (taskName(report) !== 'pending_workloads_scan') return;
+    const parsed = OpsReports.pending(report);
+    const panel = node('section', null, 'pending-summary'); panel.setAttribute('aria-label', 'Pending workload snapshot');
+    append(panel, node('h3', 'Pending pods by cluster'), node('p', 'Reported scan snapshots, including system and overprovisioning pods. Counts do not measure blocked jobs or severity.', 'fine'));
+    if (!parsed.observations.length) {
+      append(panel, node('p', 'No unambiguous cluster counts were found. Read the report below for findings and coverage.', 'report-extraction-note'));
+      container.append(panel); return;
+    }
+    const prior = previous ? OpsReports.pending(previous) : {observations: []};
+    const priorByContext = new Map(prior.observations.map(observation => [observation.context, observation]));
+    const observed = parsed.observations.filter(observation => observation.coverage === 'observed');
+    panel.append(node('p', observed.length + ' clusters with counts · ' + (parsed.observations.length - observed.length) + ' unavailable or conflicting', 'fine'));
+    if (parsed.partial) panel.append(node('p', 'Partial extraction. Some findings need the source text; unlisted clusters have no inferred count.', 'report-extraction-note'));
+    if (previous) panel.append(node('p', 'Previous report: ' + date(previous.message.reported_at) + '. Scan coverage and qualifiers may differ. — means no observed count.', 'fine'));
+    const maximum = Math.max(1, ...observed.map(observation => observation.value));
+    const key = id(report);
+    const selected = parsed.observations.find(observation => observation.context === pendingSelections.get(key)) || parsed.observations[0];
+    const rows = node('div', null, 'pending-rows');
+    append(rows, append(node('div', null, 'pending-columns'), node('span', 'Cluster'), node('span', 'This report'), node('span', previous ? 'Previous' : '')));
+    for (const observation of parsed.observations) {
+      const measured = observation.coverage === 'observed';
+      const label = measured ? String(observation.value) : observation.coverage === 'conflict' ? 'Conflicting' : 'Not observed';
+      const priorObservation = priorByContext.get(observation.context);
+      const priorLabel = priorObservation?.coverage === 'observed' ? String(priorObservation.value) : '—';
+      const row = button('', () => { pendingSelections.set(key, observation.context); render(); }, 'pending-row');
+      row.setAttribute('aria-pressed', String(observation.context === selected.context));
+      row.setAttribute('aria-label', observation.context + ' · ' + label + (measured ? ' Pending pods' : '') + (previous ? ' · previous ' + priorLabel : ''));
+      const track = node('span', null, 'pending-track'); track.setAttribute('aria-hidden', 'true');
+      if (measured) { const bar = node('span', null, 'pending-fill'); bar.style.width = (100 * observation.value / maximum) + '%'; track.append(bar); }
+      append(row, node('span', observation.context, 'pending-context'), append(node('span', null, 'pending-value'), track, node('strong', label)), node('span', previous ? priorLabel : '', 'pending-prior'));
+      rows.append(row);
+    }
+    panel.append(rows);
+    const evidence = node('div', null, 'pending-evidence');
+    append(evidence, node('h4', selected.context + ' · source evidence'));
+    for (const note of selected.notes) evidence.append(node('p', localProse(note, report.message.reported_at), 'fine'));
+    for (const span of selected.evidence) evidence.append(node('p', localProse(span, report.message.reported_at)));
+    if (selected.coverage === 'conflict') evidence.append(node('p', 'The source contains incompatible counts. No numeric bar is shown.'));
+    append(panel, evidence); container.append(panel);
+  }
   function renderReports(container, reports) {
-    container.append(node('p', 'Green identifies scheduled Chai reports, not infrastructure health. Findings and coverage are source text; reports are excluded from alert counts.', 'banner'));
+    container.append(node('p', 'Scheduled Chai reports are separate from alerts. Findings describe the source scan; the report label does not indicate infrastructure health.', 'banner'));
     const groups = new Map();
-    for (const report of reports) {
+    for (const report of OpsReports.runs(reports)) {
       const key = taskName(report);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(report);
@@ -977,15 +1029,18 @@
     const body = reportBody(latest);
     const coverage = reportCoverage(body);
     if (coverage) append(detail, append(node('aside', null, 'report-coverage'), node('h3', 'Source coverage & limits'), node('p', localProse(coverage, latest.message.reported_at))));
+    renderPending(detail, latest, history[1]);
     const readable = node('div', null, 'report-body'); renderReportBody(readable, body, latest.message.reported_at);
     append(detail, readable, originalReport(latest));
     const previous = history.slice(1);
     const archive = reportDisclosure('archive:' + task, 'report-archive');
     archive.append(node('summary', 'Earlier reports · ' + previous.length + ' retained'));
-    for (const report of previous) {
+    for (const [index, report] of previous.entries()) {
       const entry = reportDisclosure('history:' + id(report), 'report-history');
       const content = node('div', null, 'report-body'); renderReportBody(content, reportBody(report), report.message.reported_at);
-      append(entry, node('summary', date(report.message.reported_at)), link(report.message.slack_url, '↗ Open report in Slack'), content, originalReport(report));
+      append(entry, node('summary', date(report.message.reported_at)), link(report.message.slack_url, '↗ Open report in Slack'));
+      renderPending(entry, report, previous[index + 1]);
+      append(entry, content, originalReport(report));
       archive.append(entry);
     }
     if (!previous.length) archive.append(node('p', 'No earlier reports retained for this task.', 'fine'));

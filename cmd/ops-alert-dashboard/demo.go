@@ -188,9 +188,14 @@ Read-only demo scan; no resources were changed.`},
 		body += "\n[Ops Test Platform](Sol:High) AI Generated - Check for accuracy.\nSynthetic demo report; all findings above are illustrative."
 		report := demoMessage(now, time.Duration(90+i)*time.Minute, "U_CHAI", "B_CHAI", body)
 		if i != 1 {
-			report.Metadata = slack.SlackMetadata{EventType: "scheduled_report", EventPayload: map[string]interface{}{"scheduled_task": task.id}}
+			report.Metadata = slack.SlackMetadata{EventType: "scheduled_report", EventPayload: map[string]interface{}{"scheduled_task": task.id, "persona": "synthetic-ops", "req_id": "demo-run-" + task.id}}
 		}
 		roots = append(roots, report)
+		if i == 0 {
+			part := demoMessage(now, 89*time.Minute, "U_CHAI", "B_CHAI", "Other snapshot totals\n• build08: 0 Pending at the scan snapshot.\nSynthetic continuation of the same report run.")
+			part.Metadata = report.Metadata
+			roots = append(roots, part)
+		}
 	}
 	roots = append(roots, demoMessage(now, 10*time.Hour, "U_CHAI", "B_CHAI", "[Scheduled task: pending_workloads_scan | Instructions: earlier/instructions.md]\nPending workload scan: one queue needs follow-up\n\n• build01: 2 Pending at the scan snapshot. Check eligible worker capacity.\n\nCoverage: inspected 16 of 17 contexts.\nCoverage gap: build13 could not be inspected.\nSynthetic demo report; this is earlier task history, not live cluster state."))
 	archive := &demoArchive{roots: roots, threads: map[string][]slack.Message{}, next: now, writer: cfg.Writer}

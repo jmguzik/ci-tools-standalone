@@ -1,6 +1,7 @@
 package opsalerts
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
 )
@@ -45,6 +48,38 @@ func (s *Service) source(m slack.Message) (*Source, error) {
 		found = &s.cfg.Sources[i]
 	}
 	return found, nil
+}
+
+// scheduledRunField bounds scheduler identifiers without accepting invisible controls.
+func scheduledRunField(payload map[string]interface{}, name string) (string, bool) {
+	value, ok := payload[name].(string)
+	if !ok || value == "" || len(value) > 256 || !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return "", false
+	}
+	for _, char := range value {
+		if unicode.IsControl(char) {
+			return "", false
+		}
+	}
+	return value, true
+}
+
+// scheduledRun binds multipart reports to explicit run metadata and the actual producer.
+func (s *Service) scheduledRun(m slack.Message, source Source) string {
+	if source.Kind != "chai" {
+		return ""
+	}
+	task, taskOK := scheduledRunField(m.Metadata.EventPayload, "scheduled_task")
+	persona, personaOK := scheduledRunField(m.Metadata.EventPayload, "persona")
+	request, requestOK := scheduledRunField(m.Metadata.EventPayload, "req_id")
+	if !taskOK || !personaOK || !requestOK {
+		return ""
+	}
+	data, err := json.Marshal([]string{s.cfg.ChannelID, source.Name, task, persona, request, m.User, m.BotID, messageAppID(m)})
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
 // flatten combines readable message surfaces and ignores unsupported block fields.
@@ -352,6 +387,9 @@ func (s *Service) normalize(m slack.Message) (Occurrence, bool, error) {
 	}
 	if classification.Category == "chai_reports" {
 		o.View = "chai_reports"
+		if source != nil {
+			o.Message.ScheduledRun = s.scheduledRun(m, src)
+		}
 		if task, ok := m.Metadata.EventPayload["scheduled_task"].(string); ok {
 			o.Message.ScheduledTask = strings.TrimSpace(task)
 		}

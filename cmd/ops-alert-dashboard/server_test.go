@@ -75,6 +75,8 @@ func TestDashboardAuthorization(t *testing.T) {
 		{name: "proxy invalid UTF8 identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one\xfftwo"}, status: 403},
 		{name: "proxy oversized identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{strings.Repeat("a", 257)}, status: 403},
 		{name: "proxy assets require identity", proxy: true, path: "/app.js", remote: "127.0.0.1:1234", status: 403},
+		{name: "report helpers require identity", proxy: true, path: "/reports.js", remote: "127.0.0.1:1234", status: 403},
+		{name: "report helpers served to trusted operator", path: "/reports.js", remote: "127.0.0.1:1234", users: []string{"operator@example.test"}, status: 200},
 		{name: "trusted operator", path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{" Operator@Example.Test "}, status: 200, user: "operator@example.test"},
 		{name: "untrusted remote", path: "/api/snapshot", remote: "192.0.2.10:1234", users: []string{"operator@example.test"}, status: 403},
 		{name: "missing identity", path: "/api/snapshot", remote: "127.0.0.1:1234", status: 403},
