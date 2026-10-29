@@ -16,10 +16,12 @@ import (
 
 // dashboardTestService records the authenticated boundary without contacting Slack.
 type dashboardTestService struct {
-	actor   string
-	request opsalerts.ActionRequest
-	calls   int
-	err     error
+	actor          string
+	request        opsalerts.ActionRequest
+	calls          int
+	err            error
+	previewRequest opsalerts.PreviewRequest
+	previewCalls   int
 }
 
 // Snapshot supplies a ready cache for HTTP unit tests.
@@ -32,6 +34,13 @@ func (s *dashboardTestService) Act(_ context.Context, actor string, request opsa
 	s.actor, s.request = actor, request
 	s.calls++
 	return opsalerts.Occurrence{}, s.err
+}
+
+// Preview records the read-only request independently of action writes.
+func (s *dashboardTestService) Preview(request opsalerts.PreviewRequest) ([]opsalerts.Occurrence, error) {
+	s.previewRequest = request
+	s.previewCalls++
+	return []opsalerts.Occurrence{}, s.err
 }
 
 // testAccess fixes the external origin and authenticated operator for requests.

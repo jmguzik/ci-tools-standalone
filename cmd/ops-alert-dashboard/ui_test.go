@@ -1,0 +1,109 @@
+package main
+
+import (
+	"os/exec"
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+)
+
+// uiUnitHarness evaluates pure browser helpers with a minimal DOM and in-memory storage.
+const uiUnitHarness = `
+const fs = require('node:fs'), vm = require('node:vm');
+class Element {
+  constructor(tag) { this.tag = tag; this.children = []; this.textContent = ''; this.value = ''; }
+  append(...children) { this.children.push(...children); }
+  setAttribute() {}
+  replaceChildren(...children) { this.children = children; }
+  addEventListener() {}
+}
+const storage = new Map(), session = new Map();
+const context = vm.createContext({URL, Intl, Date, Set, Map, console,
+  document: {createElement: tag => new Element(tag), getElementById: () => new Element('div')},
+  window: {setTimeout, clearTimeout}, navigator: {}, AbortController, crypto: require('node:crypto'),
+  localStorage: {getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value)},
+  sessionStorage: {getItem: key => session.get(key) || null, setItem: (key, value) => session.set(key, value), removeItem: key => session.delete(key)},
+});
+let source = fs.readFileSync('web/app.js', 'utf8');
+source = source.slice(0, source.indexOf("  el('refresh').addEventListener"));
+source += 'render = () => {}; renderStatus = () => {}; globalThis.notificationCalls = 0; notifyArrivals = () => {globalThis.notificationCalls++;}; globalThis.UI = {safeURL, plainSlack, slackBody, displayTitle, identifierSubtitle, feedUnreadBadge, sourceStatus, escapeRegex, date, state, unread, markRead, reconcilePersonal, validPending, validBatch, savePersonal, ready, retainBatch, restorePending, resumeBatch, sendPending, sendNew, refresh, pauseAuthentication};})();';
+vm.runInContext(source, context);
+vm.runInContext("globalThis.fixture = (name, at = '2026-10-29T10:00:00Z', view = 'feed') => ({identity: {id: name, revision: '1', channel: 'C123'}, message: {title: '[FIRING] Raw title [ops_color=red]', text: '', identifiers: ['ParsedAlert'], reported_at: at, source: 'alerts'}, classification: {category: 'ci_platform'}, view}); globalThis.snapshot = (items, phase = 'ready') => ({user: 'operator', status: {phase, last_sync: '2026-10-29T11:00:00Z'}, occurrences: items});", context);
+vm.runInContext("globalThis.setupActions = () => {\n    UI.state.snapshot = snapshot([fixture('one'), fixture('two')]); UI.state.storageUser = 'operator';\n    const plan = {user: 'operator', index: 0, requests: ['one', 'two'].map((id, index) => ({occurrence_id: id, kind: 'close', expected_revision: '1', request_id: '00000000-0000-4000-8000-00000000000' + index, scope: 'occurrence'}))};\n    UI.retainBatch(plan); return plan;\n  };\n  globalThis.respond = (value, status = 200) => ({status, ok: status < 400, redirected: false, headers: {get: () => 'application/json'}, json: async () => value});", context);
+const answer = vm.runInContext(process.argv[1], context);
+Promise.resolve(answer).then(value => process.stdout.write(JSON.stringify(value)), error => {console.error(error); process.exitCode = 1;});
+`
+
+func TestBrowserHelpers(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is unavailable for browser helper unit tests")
+	}
+	for _, tc := range []struct {
+		name       string
+		expression string
+		want       string
+	}{
+		{name: "HTTPS links", expression: `!!UI.safeURL('https://prow.ci.openshift.org/view/123')`, want: `true`},
+		{name: "reject script links", expression: `UI.safeURL('javascript:alert(1)')`, want: `null`},
+		{name: "reject credentials", expression: `UI.safeURL('https://user:password@example.org/')`, want: `null`},
+		{name: "reject disguised whitespace", expression: `UI.safeURL('https://example.org/\npath')`, want: `null`},
+		{name: "reject backslashes", expression: `UI.safeURL('https://example.org\\evil')`, want: `null`},
+		{name: "clean identifier title", expression: `UI.displayTitle(fixture('one'))`, want: `"ParsedAlert"`},
+		{name: "duplicate identifier subtitle omitted", expression: `UI.identifierSubtitle('ParsedAlert', ['ParsedAlert'])`, want: `null`},
+		{name: "different identifier evidence retained", expression: `UI.identifierSubtitle('Readable alert summary', ['ParsedAlert', 'AnotherIdentifier']).textContent`, want: `"ParsedAlert · AnotherIdentifier"`},
+		{name: "empty identifier subtitle omitted", expression: `UI.identifierSubtitle('Readable alert summary', [])`, want: `null`},
+		{name: "zero unread has no red badge", expression: `UI.feedUnreadBadge(0)`, want: `null`},
+		{name: "positive unread shows badge", expression: `UI.feedUnreadBadge(3).textContent`, want: `"3"`},
+		{name: "status separate from title", expression: `UI.sourceStatus(fixture('one'))`, want: `"FIRING"`},
+		{name: "Slack labels and emoji", expression: `UI.plainSlack('*Alert* :rotating_light: <https://example.org|Details>')`, want: `"Alert 🚨 Details"`},
+		{name: "escape regex literal", expression: `UI.escapeRegex('job.name+[x]')`, want: `"job\\.name\\+\\[x\\]"`},
+		{name: "initial history baseline", expression: `UI.state.snapshot = snapshot([fixture('old')]); UI.reconcilePersonal(UI.state.snapshot, null, true); UI.unread(fixture('old'))`, want: `false`},
+		{name: "new occurrence after ready", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); let fresh = fixture('new', '2026-10-29T11:01:00Z'); UI.state.snapshot = snapshot([fixture('old'), fresh]); UI.reconcilePersonal(UI.state.snapshot, old, true); UI.unread(fresh)`, want: `true`},
+		{name: "backfill stays read", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); let backfill = fixture('backfill'); UI.state.snapshot = snapshot([fixture('old'), backfill]); UI.reconcilePersonal(UI.state.snapshot, old, false); UI.unread(backfill)`, want: `false`},
+		{name: "WIP distinct from read", expression: `UI.state.personal = {known: ['new'], read: []}; UI.unread(fixture('new', undefined, 'acknowledged'))`, want: `true`},
+		{name: "Chai excluded from unread", expression: `UI.state.personal = {known: ['new'], read: []}; UI.unread(fixture('new', undefined, 'chai_reports'))`, want: `false`},
+		{name: "reload keeps unread and baselines unseen", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); let fresh = fixture('new', '2026-10-29T11:01:00Z'); UI.state.snapshot = snapshot([fixture('old'), fresh]); UI.reconcilePersonal(UI.state.snapshot, old, true); UI.state.personalUser = ''; UI.reconcilePersonal(snapshot([fixture('old'), fresh, fixture('reload')]), null, true); [UI.unread(fresh), UI.unread(fixture('reload'))]`, want: `[true,false]`},
+		{name: "reload preserves arrivals after saved sync without notifying", expression: `Date.now = () => Date.parse('2026-10-29T11:02:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personal.notifications = true; UI.savePersonal(); UI.state.personalUser = ''; let fresh = fixture('fresh', '2026-10-29T11:01:00Z'); let reloaded = snapshot([fixture('old'), fresh]); reloaded.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = reloaded; UI.reconcilePersonal(reloaded, null, false); [UI.unread(fresh), notificationCalls, UI.state.personal.last_complete_sync]`, want: `[true,0,"2026-10-29T11:02:00Z"]`},
+		{name: "reload backfill remains read", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personalUser = ''; let backfill = fixture('backfill', '2026-10-29T10:30:00Z'); UI.reconcilePersonal(snapshot([fixture('old'), backfill]), null, false); [UI.unread(backfill), notificationCalls]`, want: `[false,0]`},
+		{name: "unchanged reload never repeats notifications", expression: `Date.now = () => Date.parse('2026-10-29T11:02:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personal.notifications = true; UI.savePersonal(); let fresh = fixture('fresh', '2026-10-29T11:01:00Z'); let current = snapshot([fixture('old'), fresh]); current.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = current; UI.reconcilePersonal(current, old, false); UI.state.personalUser = ''; UI.reconcilePersonal(current, null, false); [UI.unread(fresh), notificationCalls]`, want: `[true,1]`},
+		{name: "degraded arrivals defer until complete sync and stay quiet", expression: `Date.now = () => Date.parse('2026-10-29T11:02:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personal.notifications = true; UI.savePersonal(); UI.state.personalUser = ''; let fresh = fixture('fresh', '2026-10-29T11:01:00Z'); let degraded = snapshot([fixture('old'), fresh], 'degraded'); UI.state.snapshot = degraded; UI.reconcilePersonal(degraded, null, false); let before = UI.state.personal.known.includes('fresh'); let complete = snapshot([fixture('old'), fresh]); complete.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = complete; UI.reconcilePersonal(complete, degraded, false); [before, UI.unread(fresh), notificationCalls]`, want: `[false,true,0]`},
+		{name: "empty degraded retains saved unread baseline", expression: `Date.now = () => Date.parse('2026-10-29T11:04:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); let unreadBefore = fixture('unread-before', '2026-10-29T11:01:00Z'); let prior = snapshot([fixture('old'), unreadBefore]); prior.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = prior; UI.reconcilePersonal(prior, old, true); UI.state.personal.notifications = true; UI.savePersonal(); UI.state.personalUser = ''; let incomplete = snapshot([], 'degraded'); UI.state.snapshot = incomplete; UI.reconcilePersonal(incomplete, null, false); let retained = UI.state.personal.known.includes('unread-before'); let after = fixture('after', '2026-10-29T11:03:00Z'); let complete = snapshot([fixture('old'), unreadBefore, after]); complete.status.last_sync = '2026-10-29T11:04:00Z'; UI.state.snapshot = complete; UI.reconcilePersonal(complete, incomplete, false); [retained, UI.unread(unreadBefore), UI.unread(after), notificationCalls]`, want: `[true,true,true,0]`},
+		{name: "empty catching_up retains saved unread baseline", expression: `Date.now = () => Date.parse('2026-10-29T11:04:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); let unreadBefore = fixture('unread-before', '2026-10-29T11:01:00Z'); let prior = snapshot([fixture('old'), unreadBefore]); prior.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = prior; UI.reconcilePersonal(prior, old, true); UI.state.personal.notifications = true; UI.savePersonal(); UI.state.personalUser = ''; let incomplete = snapshot([], 'catching_up'); UI.state.snapshot = incomplete; UI.reconcilePersonal(incomplete, null, false); let retained = UI.state.personal.known.includes('unread-before'); let after = fixture('after', '2026-10-29T11:03:00Z'); let complete = snapshot([fixture('old'), unreadBefore, after]); complete.status.last_sync = '2026-10-29T11:04:00Z'; UI.state.snapshot = complete; UI.reconcilePersonal(complete, incomplete, false); [retained, UI.unread(unreadBefore), UI.unread(after), notificationCalls]`, want: `[true,true,true,0]`},
+		{name: "new WIP occurrence remains unread without notification", expression: `Date.now = () => Date.parse('2026-10-29T11:02:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personal.notifications = true; UI.savePersonal(); let fresh = fixture('fresh', '2026-10-29T11:01:00Z', 'acknowledged'); let current = snapshot([fixture('old'), fresh]); current.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = current; UI.reconcilePersonal(current, old, false); [UI.unread(fresh), notificationCalls]`, want: `[true,0]`},
+		{name: "new snoozed occurrence remains unread without notification", expression: `Date.now = () => Date.parse('2026-10-29T11:02:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personal.notifications = true; UI.savePersonal(); let fresh = fixture('fresh', '2026-10-29T11:01:00Z', 'snoozed'); fresh.snooze = {until: '2026-10-30T06:00:00Z'}; let current = snapshot([fixture('old'), fresh]); current.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = current; UI.reconcilePersonal(current, old, false); [UI.unread(fresh), notificationCalls]`, want: `[true,0]`},
+		{name: "new closed occurrence remains unread without notification", expression: `Date.now = () => Date.parse('2026-10-29T11:02:00Z'); let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.state.personal.notifications = true; UI.savePersonal(); let fresh = fixture('fresh', '2026-10-29T11:01:00Z', 'closed'); let current = snapshot([fixture('old'), fresh]); current.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = current; UI.reconcilePersonal(current, old, false); [UI.unread(fresh), notificationCalls]`, want: `[true,0]`},
+		{name: "stale tab preference save preserves newer baseline unread IDs", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); const stale = JSON.parse(JSON.stringify(UI.state.personal)); let fresh = fixture('fresh', '2026-10-29T11:01:00Z'); let newer = snapshot([fixture('old'), fresh]); newer.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = newer; UI.reconcilePersonal(newer, old, true); localStorage.setItem('ops-alert-dashboard.personal.v1.operator.notified', JSON.stringify(['fresh'])); UI.state.personal = stale; UI.state.personal.preferences = {view: 'snoozed'}; UI.savePersonal(); UI.reconcilePersonal(newer, old, true); [UI.unread(fresh), UI.state.personal.known.includes('fresh'), UI.state.personal.preferences.view, UI.state.personal.last_complete_sync, JSON.parse(localStorage.getItem('ops-alert-dashboard.personal.v1.operator.notified')).includes('fresh')]`, want: `[true,true,"snoozed","2026-10-29T11:02:00Z",true]`},
+		{name: "older ready snapshot cannot prune newer adopted baseline", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); const stale = JSON.parse(JSON.stringify(UI.state.personal)); let fresh = fixture('fresh', '2026-10-29T11:01:00Z'); let newer = snapshot([fixture('old'), fresh]); newer.status.last_sync = '2026-10-29T11:02:00Z'; UI.state.snapshot = newer; UI.reconcilePersonal(newer, old, true); UI.state.personal = stale; UI.savePersonal(); UI.state.snapshot = old; UI.reconcilePersonal(old, newer, true); UI.state.snapshot = newer; UI.reconcilePersonal(newer, old, true); [UI.unread(fresh), UI.state.personal.known.includes('fresh')]`, want: `[true,true]`},
+		{name: "pending identifier is not source status", expression: `let o = fixture('one'); o.message.title = 'ghproxy-too-many-pending-alerts'; UI.sourceStatus(o)`, want: `""`},
+		{name: "arbitrary firing prose is not source status", expression: `let o = fixture('one'); o.message.title = 'Investigate firing alerts after success'; o.message.text = '[RESOLVED] quoted evidence'; UI.sourceStatus(o)`, want: `""`},
+		{name: "recognized firing envelope retains source status", expression: `let o = fixture('one'); o.message.title = '[FIRING:2] AlertName'; UI.sourceStatus(o)`, want: `"FIRING"`},
+		{name: "recognized resolved envelope retains source status", expression: `let o = fixture('one'); o.message.title = '[RESOLVED:1] AlertName'; UI.sourceStatus(o)`, want: `"RESOLVED"`},
+		{name: "retained window prunes IDs", expression: `let old = snapshot([fixture('old')]); UI.state.snapshot = old; UI.reconcilePersonal(old, null, true); UI.reconcilePersonal(snapshot([]), old, true); UI.state.personal.known`, want: `[]`},
+		{name: "unsafe Slack URL is text", expression: `let body = UI.slackBody('<javascript:alert(1)|Click>'); body.children[0].children.some(child => child.tag === 'a')`, want: `false`},
+		{name: "Slack HTML stays text", expression: `let body = UI.slackBody('<img src=x onerror=alert(1)>'); body.children[0].children.some(child => child.tag === 'img')`, want: `false`},
+		{name: "code preserves emoji aliases", expression: `let body = UI.slackBody('` + "`" + `:fire:` + "`" + `'); body.children[0].children.find(child => child.tag === 'code').textContent`, want: `":fire:"`},
+		{name: "usergroup label supplied", expression: `let body = UI.slackBody('<!subteam^S123|@oncall>'); body.children[0].children.find(child => child.textContent === '@oncall').textContent`, want: `"@oncall"`},
+		{name: "personal storage does not bypass action safety", expression: `UI.state.personalUser = 'operator'; UI.state.personal = {known: [], read: []}; localStorage.setItem = () => {throw new Error('blocked')}; UI.savePersonal(); [!!UI.state.personalError, UI.state.storageError]`, want: `[true,""]`},
+		{name: "batch pauses on lost response", expression: `(async () => {setupActions(); let calls = 0; globalThis.fetch = async () => {calls++; throw new Error('lost response')}; await UI.resumeBatch(); return [calls, UI.state.batch.index, UI.state.pending.request_id];})()`, want: `[1,0,"00000000-0000-4000-8000-000000000000"]`},
+		{name: "batch stops on conflict", expression: `(async () => {setupActions(); let calls = 0; globalThis.fetch = async url => {if (url === '/api/snapshot') return respond(UI.state.snapshot); calls++; return respond({code: 'conflict', error: 'changed'}, 409)}; await UI.resumeBatch(); return [calls, UI.state.batch.index, UI.state.pending];})()`, want: `[1,0,null]`},
+		{name: "restoring batch never posts", expression: `setupActions(); UI.state.storageUser = null; let calls = 0; globalThis.fetch = async () => {calls++}; UI.restorePending('operator'); [calls, UI.state.batch.index]`, want: `[0,0]`},
+		{name: "retry confirms exact request without sending rest", expression: `(async () => {setupActions(); let calls = 0; globalThis.fetch = async () => {calls++; throw new Error('lost response')}; await UI.resumeBatch(); const retained = UI.state.pending.request_id; globalThis.fetch = async url => url === '/api/snapshot' ? respond(UI.state.snapshot) : (calls++, respond({occurrence: fixture('one')})); await UI.sendPending(); return [calls, UI.state.batch.index, UI.state.batch.requests[0].request_id === retained, UI.state.pending];})()`, want: `[2,1,true,null]`},
+		{name: "identity change cannot confirm prior actor request", expression: `(async () => {setupActions(); globalThis.fetch = async () => {UI.state.generation++; UI.state.snapshot = {...UI.state.snapshot, user: 'someone-else'}; return respond({occurrence: fixture('one')})}; await UI.resumeBatch(); return [UI.state.batch.index, UI.state.pendingUser, UI.state.pending.request_id];})()`, want: `[0,"operator","00000000-0000-4000-8000-000000000000"]`},
+		{name: "inflight reauthentication cannot undo a newer auth pause", expression: `(async () => {UI.state.snapshot = snapshot([fixture('private')]); globalThis.fetch = async () => {UI.pauseAuthentication('A newer API request denied access.'); return respond(snapshot([fixture('private')]))}; await UI.refresh({reauthenticate: true}); return [UI.state.authPaused, UI.state.snapshot, UI.state.fetchError];})()`, want: `[true,null,"A newer API request denied access."]`},
+		{name: "fresh explicit reauthentication succeeds after pause", expression: `(async () => {UI.pauseAuthentication('Access denied.'); globalThis.fetch = async () => respond(snapshot([fixture('current')])); await UI.refresh({reauthenticate: true, quiet: true}); return [UI.state.authPaused, UI.state.snapshot.user, UI.state.fetchError];})()`, want: `[false,"operator",""]`},
+		{name: "release occurrence preserves matching WIP rule scope", expression: `(async () => {let o = fixture('one'); o.wip_rule = {id: 'rule'}; UI.state.snapshot = snapshot([o]); UI.state.storageUser = 'operator'; let captured; globalThis.fetch = async (url, options) => url === '/api/snapshot' ? respond(UI.state.snapshot) : (captured = JSON.parse(options.body), respond({occurrence: o})); await UI.sendNew('unacknowledge', o, '', 'occurrence'); return captured.scope;})()`, want: `"occurrence"`},
+		{name: "cancel matching WIP rule uses regex scope", expression: `(async () => {let o = fixture('one'); o.wip_rule = {id: 'rule'}; UI.state.snapshot = snapshot([o]); UI.state.storageUser = 'operator'; let captured; globalThis.fetch = async (url, options) => url === '/api/snapshot' ? respond(UI.state.snapshot) : (captured = JSON.parse(options.body), respond({occurrence: o})); await UI.sendNew('unacknowledge', o, '', 'regex'); return captured.scope;})()`, want: `"regex"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := exec.Command(node, "-e", uiUnitHarness, tc.expression).CombinedOutput()
+			if err != nil {
+				t.Fatalf("evaluating browser helper: %v\n%s", err, got)
+			}
+			if diff := cmp.Diff(tc.want, strings.TrimSpace(string(got))); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

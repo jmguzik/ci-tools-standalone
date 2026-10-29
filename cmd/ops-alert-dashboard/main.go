@@ -30,6 +30,14 @@ type options struct {
 	historyWindow time.Duration
 	demo          bool
 	validateOnly  bool
+	views         viewOptions
+}
+
+// viewOptions configures browser labels and the independent public GitHub view.
+type viewOptions struct {
+	channelName     string
+	prAuthors       string
+	githubTokenFile string
 }
 
 // credentialPaths permits a separate history token when a workspace requires it.
@@ -58,6 +66,9 @@ func parseOptions(args []string) (options, error) {
 	flags.DurationVar(&o.historyWindow, "history-window", opsalerts.DefaultHistoryWindow, "Rolling visible Slack history window (positive duration)")
 	flags.BoolVar(&o.demo, "demo", false, "Use synthetic in-memory Slack data on loopback, with no Slack calls")
 	flags.BoolVar(&o.validateOnly, "validate-only", false, "Validate config and classification without connecting to Slack")
+	flags.StringVar(&o.views.channelName, "slack-channel-name", "ops-testplatform", "Human-readable Slack channel name displayed in the dashboard")
+	flags.StringVar(&o.views.prAuthors, "unmerged-pr-authors", "redhat-chai-bot,openshift-bot,openshift-ci-robot", "Exact comma-separated GitHub authors for open openshift/release PRs; empty disables the view")
+	flags.StringVar(&o.views.githubTokenFile, "github-token-file", "", "Optional server-side GitHub token file for the read-only PR cache")
 	if err := flags.Parse(args); err != nil {
 		return o, err
 	}
@@ -67,12 +78,15 @@ func parseOptions(args []string) (options, error) {
 	if o.historyWindow <= 0 {
 		return o, fmt.Errorf("--history-window must be positive")
 	}
+	if err := validateChannelName(o.views.channelName); err != nil {
+		return o, err
+	}
 	if o.demo {
 		host, _, err := net.SplitHostPort(o.listen)
 		if err != nil || !isLoopbackHost(host) {
 			return o, fmt.Errorf("--demo requires a loopback --listen address")
 		}
-		if o.config != "" || o.classes != "" || o.credentials.writer != "" || o.credentials.reader != "" {
+		if o.config != "" || o.classes != "" || o.credentials.writer != "" || o.credentials.reader != "" || o.views.githubTokenFile != "" {
 			return o, fmt.Errorf("--demo cannot be combined with production config or credentials")
 		}
 		return o, nil
@@ -209,10 +223,17 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	if o.validateOnly {
+		if _, err := newPullRequests(splitAuthors(o.views.prAuthors), "", false); err != nil {
+			return err
+		}
 		logrus.Info("dashboard configuration is valid")
 		return nil
 	}
 	provider, err := newMetricsProvider(cfg.Monitoring, o.demo)
+	if err != nil {
+		return err
+	}
+	prs, err := newPullRequests(splitAuthors(o.views.prAuthors), o.views.githubTokenFile, o.demo)
 	if err != nil {
 		return err
 	}
@@ -231,8 +252,11 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	page.metricsProvider = provider
+	page.channelName = strings.TrimPrefix(strings.TrimSpace(o.views.channelName), "#")
+	page.pullRequests = prs
 	server := &http.Server{Handler: page, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: time.Minute, IdleTimeout: time.Minute, MaxHeaderBytes: 16 * 1024}
 	go synchronize(ctx, service, o.syncInterval)
+	go prs.Run(ctx)
 	go shutdownOnCancel(ctx, server)
 	logrus.WithFields(logrus.Fields{"listen": listener.Addr().String(), "demo": o.demo}).Info("ops alert dashboard listening")
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {

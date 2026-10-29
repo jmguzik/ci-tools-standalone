@@ -26,6 +26,11 @@ func (s *sopTestService) Act(context.Context, string, opsalerts.ActionRequest) (
 	return opsalerts.Occurrence{}, nil
 }
 
+// Preview is unused by the SOP and metrics request fixtures.
+func (s *sopTestService) Preview(opsalerts.PreviewRequest) ([]opsalerts.Occurrence, error) {
+	return []opsalerts.Occurrence{}, nil
+}
+
 // sopTestClient records the destination and supplies deterministic upstream failures.
 type sopTestClient struct {
 	status    int

@@ -20,6 +20,9 @@ const ActionMarker = "OPS_ALERT_ACTION_V1 "
 
 // actionRecord carries complete occurrence state plus the associated rule mutation.
 type actionRecord struct {
+	ObservedWIP   string         `json:"observed_wip,omitempty"`
+	WIPRule       *WIPRule       `json:"wip_rule,omitempty"`
+	Unwip         string         `json:"unwip,omitempty"`
 	Version       int            `json:"version"`
 	Request       ActionRequest  `json:"request"`
 	Actor         string         `json:"actor"`
@@ -46,7 +49,14 @@ func validateAction(actor string, req ActionRequest) error {
 	default:
 		return fmt.Errorf("%w: unknown action kind", ErrValidation)
 	}
-	if req.Kind != "snooze" && req.Pattern != "" || req.Kind != "investigate" && req.Question != "" {
+	if req.Scope != "" && req.Scope != "occurrence" && req.Scope != "regex" {
+		return fmt.Errorf("%w: unknown action scope", ErrValidation)
+	}
+	if req.Scope != "" && req.Kind != "acknowledge" && req.Kind != "unacknowledge" && req.Kind != "snooze" {
+		return fmt.Errorf("%w: unexpected action scope", ErrValidation)
+	}
+	patternAllowed := req.Kind == "snooze" && req.Scope != "occurrence" || req.Kind == "acknowledge" && req.Scope == "regex"
+	if !patternAllowed && req.Pattern != "" || req.Kind != "investigate" && req.Question != "" {
 		return fmt.Errorf("%w: unexpected pattern or question", ErrValidation)
 	}
 	if req.Kind == "investigate" && strings.TrimSpace(req.Question) == "" {
@@ -100,13 +110,35 @@ func decodeRecord(text, target string) (actionRecord, bool, error) {
 		if record.Snooze == nil || record.Snooze.ID != record.Request.RequestID || record.Snooze.Actor != record.Actor || record.Snooze.Source == "" || record.Snooze.Channel == "" || !record.Snooze.Until.After(record.At) || !record.Snooze.Until.Equal(nextSixUTC(record.At)) {
 			return record, false, fmt.Errorf("invalid snooze state")
 		}
+		if record.Snooze.Scope != record.Request.Scope || record.Snooze.Scope == "occurrence" && record.Snooze.OccurrenceID != target || record.Snooze.Scope != "occurrence" && record.Snooze.OccurrenceID != "" {
+			return record, false, fmt.Errorf("invalid snooze scope")
+		}
 		rx, err := regexp.Compile(record.Snooze.Pattern)
-		if err != nil || len(record.Snooze.Pattern) > 4096 || rx.MatchString("") {
+		if record.Snooze.Scope != "occurrence" && (err != nil || len(record.Snooze.Pattern) > 4096 || rx.MatchString("")) || record.Snooze.Scope == "occurrence" && record.Snooze.Pattern != "" {
 			return record, false, fmt.Errorf("invalid durable snooze expression")
 		}
 	} else if record.Snooze != nil {
 		return record, false, fmt.Errorf("unexpected snooze rule")
 	}
+	if record.Request.Kind == "acknowledge" && record.Request.Scope == "regex" {
+		rule := record.WIPRule
+		if rule == nil || rule.ID != record.Request.RequestID || rule.Actor != record.Actor || rule.Channel == "" || rule.Source == "" || !rule.Until.Equal(nextSixUTC(record.At)) {
+			return record, false, fmt.Errorf("invalid WIP rule")
+		}
+		rx, err := regexp.Compile(rule.Pattern)
+		if err != nil || len(rule.Pattern) > 4096 || rx.MatchString("") {
+			return record, false, fmt.Errorf("invalid durable WIP expression")
+		}
+	} else if record.WIPRule != nil {
+		return record, false, fmt.Errorf("unexpected WIP rule")
+	}
+	if record.Unwip != "" && record.ObservedWIP != "" && record.Unwip != record.ObservedWIP {
+		return record, false, fmt.Errorf("WIP cancellation differs from observed rule")
+	}
+	if (record.Request.Kind == "unacknowledge" && record.Request.Scope == "regex") != (record.Unwip != "") {
+		return record, false, fmt.Errorf("invalid WIP cancellation")
+	}
+
 	if (record.Request.Kind == "unsnooze") != (record.Unsnooze != "") {
 		return record, false, fmt.Errorf("invalid unsnooze state")
 	}
@@ -157,19 +189,45 @@ func sameTime(a, b *time.Time) bool {
 }
 
 // validateTransition detects inconsistent full-state records during recovery.
-func validateTransition(o Occurrence, r actionRecord, rules map[string]Snooze, historicalRule bool) error {
-	if r.Request.ExpectedRevision != o.Identity.Revision {
+func validateTransition(o Occurrence, r actionRecord, cache serviceCache, historicalRule bool) error {
+	if r.Request.ExpectedRevision != workflowRevision(o.Identity.Revision, r.ObservedWIP) {
 		return fmt.Errorf("stale durable action revision")
+	}
+	if r.ObservedWIP != "" {
+		creation, exists := cache.Records[r.ObservedWIP]
+		rule := creation.WIPRule
+		// A valid observation survives parent edits and cancellation before Slack confirms it.
+		if !exists && !historicalRule || exists && (rule == nil || rule.Channel != o.Identity.Channel || rule.Source != o.Message.Source || r.At.Before(creation.At) || !r.At.Before(rule.Until)) {
+			return fmt.Errorf("observation without matching WIP rule")
+		}
+		for _, previous := range cache.Records {
+			if previous.Unwip == r.ObservedWIP && r.At.After(previous.At) {
+				return fmt.Errorf("observation after WIP cancellation")
+			}
+		}
 	}
 	expected := o.State
 	switch r.Request.Kind {
 	case "acknowledge":
-		if expected.AcknowledgedAt != nil {
+		if r.Request.Scope == "regex" {
+			if r.WIPRule.Source != o.Message.Source || r.WIPRule.Channel != o.Identity.Channel || r.Request.Pattern != "" && r.Request.Pattern != r.WIPRule.Pattern {
+				return fmt.Errorf("invalid durable WIP scope or expression")
+			}
+			break
+		}
+		if expected.AcknowledgedAt != nil && r.ObservedWIP == "" {
 			return fmt.Errorf("duplicate acknowledgement")
 		}
 		expected.AcknowledgedBy, expected.AcknowledgedAt = r.Actor, &r.At
 	case "unacknowledge":
-		if expected.AcknowledgedAt == nil {
+		if r.Request.Scope == "regex" {
+			rule, exists := cache.WIPRules[r.Unwip]
+			if !historicalRule && (!exists && r.ObservedWIP != r.Unwip || exists && (rule.Source != o.Message.Source || rule.Channel != o.Identity.Channel || !r.At.Before(rule.Until))) {
+				return fmt.Errorf("undo without matching WIP rule")
+			}
+			break
+		}
+		if expected.AcknowledgedAt == nil && r.ObservedWIP == "" {
 			return fmt.Errorf("undo without acknowledgement")
 		}
 		expected.AcknowledgedBy, expected.AcknowledgedAt = "", nil
@@ -192,9 +250,9 @@ func validateTransition(o Occurrence, r actionRecord, rules map[string]Snooze, h
 			return fmt.Errorf("inconsistent durable snooze expression")
 		}
 	case "unsnooze":
-		rule, exists := rules[r.Unsnooze]
+		rule, exists := cache.Rules[r.Unsnooze]
 		// Expired historical rules can live on parents outside the bounded replay.
-		if !historicalRule && (!exists || rule.Source != o.Message.Source || rule.Channel != o.Identity.Channel || !r.At.Before(rule.Until)) {
+		if !historicalRule && (!exists || rule.Source != o.Message.Source || rule.Channel != o.Identity.Channel || rule.Scope == "occurrence" && rule.OccurrenceID != o.Identity.ID || !r.At.Before(rule.Until)) {
 			return fmt.Errorf("undo without matching snooze rule")
 		}
 	case "investigate":
@@ -332,14 +390,32 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 func (s *Service) prepareAction(actor string, req ActionRequest, o Occurrence, cache serviceCache) (actionRecord, error) {
 	now := s.clock.Now().UTC()
 	// Delivery failures are transient overlays, never durable workflow state.
-	r := actionRecord{Version: 1, Request: req, Actor: actor, At: now, State: o.State, Investigation: cache.Occurrences[o.Identity.ID].Investigation}
+	r := actionRecord{Version: 1, Request: req, Actor: actor, At: now, State: cache.Occurrences[o.Identity.ID].State, Investigation: cache.Occurrences[o.Identity.ID].Investigation}
+	if o.WIPRule != nil {
+		r.ObservedWIP = o.WIPRule.ID
+	}
 	switch req.Kind {
 	case "acknowledge":
-		if o.State.AcknowledgedAt != nil {
+		if req.Scope == "regex" {
+			pattern, err := actionPattern(req.Pattern, o.Message.Identifiers)
+			if err != nil {
+				return r, err
+			}
+			r.WIPRule = &WIPRule{ID: req.RequestID, Pattern: pattern, Actor: actor, Until: nextSixUTC(now), Channel: o.Identity.Channel, Source: o.Message.Source}
+			break
+		}
+		if o.State.AcknowledgedAt != nil && o.WIPRule == nil {
 			return r, ErrConflict
 		}
 		r.State.AcknowledgedBy, r.State.AcknowledgedAt = actor, &now
 	case "unacknowledge":
+		if req.Scope == "regex" {
+			if o.WIPRule == nil {
+				return r, ErrConflict
+			}
+			r.Unwip = o.WIPRule.ID
+			break
+		}
 		if o.State.AcknowledgedAt == nil {
 			return r, ErrConflict
 		}
@@ -355,30 +431,20 @@ func (s *Service) prepareAction(actor string, req ActionRequest, o Occurrence, c
 		}
 		r.State.ClosedBy, r.State.ClosedAt = "", nil
 	case "snooze":
-		if len(o.Message.Identifiers) == 0 {
-			return r, fmt.Errorf("%w: parsed identifier required for snooze", ErrValidation)
-		}
 		if o.Snooze != nil {
 			return r, ErrConflict
 		}
-		pattern := req.Pattern
-		if pattern == "" {
-			pattern = defaultPattern(o.Message.Identifiers)
-		}
-		rx, err := regexp.Compile(pattern)
-		if err != nil || len(pattern) > 4096 {
-			return r, fmt.Errorf("%w: invalid snooze expression", ErrValidation)
-		}
-		matched := false
-		for _, identifier := range o.Message.Identifiers {
-			if rx.MatchString(identifier) {
-				matched = true
+		rule := &Snooze{ID: req.RequestID, Scope: req.Scope, Source: o.Message.Source, Channel: o.Identity.Channel, Actor: actor, Until: nextSixUTC(now)}
+		if req.Scope == "occurrence" {
+			rule.OccurrenceID = o.Identity.ID
+		} else {
+			pattern, err := actionPattern(req.Pattern, o.Message.Identifiers)
+			if err != nil {
+				return r, err
 			}
+			rule.Pattern = pattern
 		}
-		if !matched {
-			return r, fmt.Errorf("%w: snooze expression must match a selected identifier", ErrValidation)
-		}
-		r.Snooze = &Snooze{ID: req.RequestID, Pattern: pattern, Source: o.Message.Source, Channel: o.Identity.Channel, Actor: actor, Until: nextSixUTC(now)}
+		r.Snooze = rule
 	case "unsnooze":
 		if o.Snooze == nil {
 			return r, ErrConflict
@@ -399,6 +465,26 @@ func (s *Service) prepareAction(actor string, req ActionRequest, o Occurrence, c
 		r.Investigation = &Investigation{RequestID: req.RequestID, Status: "sent", Question: req.Question, RequestedBy: actor, RequestedAt: now}
 	}
 	return r, nil
+}
+
+// actionPattern requires a bounded RE2 expression matching a selected identifier.
+func actionPattern(pattern string, identifiers []string) (string, error) {
+	if len(identifiers) == 0 {
+		return "", fmt.Errorf("%w: parsed identifier required for regex action", ErrValidation)
+	}
+	if pattern == "" {
+		pattern = defaultPattern(identifiers)
+	}
+	rx, err := regexp.Compile(pattern)
+	if err != nil || len(pattern) > 4096 || rx.MatchString("") {
+		return "", fmt.Errorf("%w: invalid action expression", ErrValidation)
+	}
+	for _, identifier := range identifiers {
+		if rx.MatchString(identifier) {
+			return pattern, nil
+		}
+	}
+	return "", fmt.Errorf("%w: expression must match a selected identifier", ErrValidation)
 }
 
 // chaiUser uses an explicitly configured user mention, never a display name or DM.
