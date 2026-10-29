@@ -24,7 +24,12 @@ slack:
 access:
   external_url: https://ops-alerts.example.com
   user_header: X-Forwarded-Email
+  # Default authorization requires an explicit operator allowlist.
   operators: [operator@example.com]
+  # For group access enforced by the trusted SSO proxy, remove operators and use:
+  # authorization: proxy
+  # This requires explicit trusted_proxies and authorization on every proxy route.
+  # See README.md for the core-ci test-platform-ci-admins SAR configuration.
   trusted_proxies: [127.0.0.1/32, "::1/128"]
 monitoring:
   enabled: true

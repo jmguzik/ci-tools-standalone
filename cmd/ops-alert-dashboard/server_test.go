@@ -39,14 +39,33 @@ func testAccess() accessConfig {
 	return accessConfig{ExternalURL: "https://alerts.example.test", Operators: []string{"operator@example.test"}}
 }
 
+// proxyAccess delegates group membership to an explicitly trusted authorizing proxy.
+func proxyAccess() accessConfig {
+	return accessConfig{Authorization: "proxy", ExternalURL: "https://alerts.example.test", TrustedProxies: []string{"127.0.0.1/32", "::1/128"}}
+}
+
 // TestDashboardAuthorization ensures browser identity cannot bypass the proxy boundary.
 func TestDashboardAuthorization(t *testing.T) {
 	cases := []struct {
 		name, path, remote string
 		users              []string
+		proxy              bool
 		status             int
 		user               string
 	}{
+		{name: "proxy authorized identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{" Group.Member@Example.Test "}, status: 200, user: "group.member@example.test"},
+		{name: "proxy IPv6 source", proxy: true, path: "/api/snapshot", remote: "[::1]:1234", users: []string{"group.member@example.test"}, status: 200, user: "group.member@example.test"},
+		{name: "proxy untrusted remote", proxy: true, path: "/api/snapshot", remote: "192.0.2.10:1234", users: []string{"group.member@example.test"}, status: 403},
+		{name: "proxy missing identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", status: 403},
+		{name: "proxy empty identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"  "}, status: 403},
+		{name: "proxy duplicate identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one", "two"}, status: 403},
+		{name: "proxy comma identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one,two"}, status: 403},
+		{name: "proxy whitespace identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one two"}, status: 403},
+		{name: "proxy control identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one\x00two"}, status: 403},
+		{name: "proxy newline identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one\r\n"}, status: 403},
+		{name: "proxy invalid UTF8 identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{"one\xfftwo"}, status: 403},
+		{name: "proxy oversized identity", proxy: true, path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{strings.Repeat("a", 257)}, status: 403},
+		{name: "proxy assets require identity", proxy: true, path: "/app.js", remote: "127.0.0.1:1234", status: 403},
 		{name: "trusted operator", path: "/api/snapshot", remote: "127.0.0.1:1234", users: []string{" Operator@Example.Test "}, status: 200, user: "operator@example.test"},
 		{name: "untrusted remote", path: "/api/snapshot", remote: "192.0.2.10:1234", users: []string{"operator@example.test"}, status: 403},
 		{name: "missing identity", path: "/api/snapshot", remote: "127.0.0.1:1234", status: 403},
@@ -57,7 +76,11 @@ func TestDashboardAuthorization(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d, err := newDashboard(&dashboardTestService{}, testAccess(), false)
+			cfg := testAccess()
+			if tc.proxy {
+				cfg = proxyAccess()
+			}
+			d, err := newDashboard(&dashboardTestService{}, cfg, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -92,11 +115,17 @@ func TestDashboardActions(t *testing.T) {
 	const body = `{"occurrence_id":"C:123.000001","kind":"acknowledge","expected_revision":"123.000001","request_id":"retry-id"}`
 	cases := []struct {
 		name, body, origin, token, media string
+		proxy                            bool
 		serviceError                     error
 		status                           int
 		code                             string
 		calls                            int
 	}{
+		{name: "proxy authenticated actor", proxy: true, body: body, origin: "valid", token: "valid", media: "application/json", status: 200, calls: 1},
+		{name: "proxy missing origin", proxy: true, body: body, token: "valid", media: "application/json", status: 403, code: "forbidden"},
+		{name: "proxy cross origin", proxy: true, body: body, origin: "https://evil.example.test", token: "valid", media: "application/json", status: 403, code: "forbidden"},
+		{name: "proxy missing CSRF", proxy: true, body: body, origin: "valid", media: "application/json", status: 403, code: "forbidden"},
+		{name: "proxy another user CSRF", proxy: true, body: body, origin: "valid", token: "other", media: "application/json", status: 403, code: "forbidden"},
 		{name: "server authenticated actor", body: body, origin: "valid", token: "valid", media: "application/json", status: 200, calls: 1},
 		{name: "missing origin", body: body, token: "valid", media: "application/json", status: 403, code: "forbidden"},
 		{name: "cross origin", body: body, origin: "https://evil.example.test", token: "valid", media: "application/json", status: 403, code: "forbidden"},
@@ -118,13 +147,19 @@ func TestDashboardActions(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			service := &dashboardTestService{err: tc.serviceError}
-			d, err := newDashboard(service, testAccess(), false)
+			cfg := testAccess()
+			actor := "operator@example.test"
+			if tc.proxy {
+				cfg = proxyAccess()
+				actor = "group.member@example.test"
+			}
+			d, err := newDashboard(service, cfg, false)
 			if err != nil {
 				t.Fatal(err)
 			}
 			request := httptest.NewRequest(http.MethodPost, "/api/actions", strings.NewReader(tc.body))
 			request.RemoteAddr = "127.0.0.1:1234"
-			request.Header.Set("X-Forwarded-Email", "operator@example.test")
+			request.Header.Set("X-Forwarded-Email", actor)
 			request.Header.Set("Content-Type", tc.media)
 			origin := tc.origin
 			if origin == "valid" {
@@ -133,7 +168,7 @@ func TestDashboardActions(t *testing.T) {
 			request.Header.Set("Origin", origin)
 			token := tc.token
 			if token == "valid" {
-				token = d.csrfToken("operator@example.test")
+				token = d.csrfToken(actor)
 			}
 			if token == "other" {
 				token = d.csrfToken("other@example.test")
@@ -148,7 +183,7 @@ func TestDashboardActions(t *testing.T) {
 				t.Fatalf("unexpected action count (-want +got):\n%s", diff)
 			}
 			if tc.calls == 1 {
-				if diff := cmp.Diff("operator@example.test", service.actor); diff != "" {
+				if diff := cmp.Diff(actor, service.actor); diff != "" {
 					t.Errorf("unexpected actor (-want +got):\n%s", diff)
 				}
 				want := opsalerts.ActionRequest{OccurrenceID: "C:123.000001", Kind: "acknowledge", ExpectedRevision: "123.000001", RequestID: "retry-id"}

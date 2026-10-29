@@ -68,6 +68,20 @@ checks them for both reads and writes, derives the actor server-side, and requir
 a user-bound CSRF token and matching Origin on mutations. There is no live
 unauthenticated mode. Changing the listen address does not change proxy trust.
 
+By default, live mode requires a nonempty `access.operators` allowlist. To use a
+proxy that also authorizes group access, set `access.authorization: proxy`, omit
+`access.operators`, and explicitly configure `access.trusted_proxies`. The proxy
+must enforce authorization before forwarding any dashboard request, as well as
+replacing identity headers. For core-ci, configure its OAuth proxy to authorize
+`get` on the `ci/ops-alert-dashboard` Service through SubjectAccessReview, with a
+RoleBinding granting the existing `test-platform-ci-admins` group that access.
+This mode accepts any well-formed authenticated identity forwarded by that trusted
+proxy, so keep direct backend access private. It still requires the public HTTPS
+origin and exactly one nonempty identity header; actions retain origin and
+user-bound CSRF checks and record the current SSO identity for audits. Unknown
+authorization values, combining proxy authorization with an operator allowlist,
+and using proxy authorization in demo mode are rejected.
+
 ## Classification and views
 
 - Managed Alertmanager and Prow messages publish
