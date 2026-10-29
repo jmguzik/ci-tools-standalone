@@ -111,7 +111,7 @@ func TestRollingHistory(t *testing.T) {
 				t.Fatal(err)
 			}
 			cache := s.currentCache()
-			if diff := cmp.Diff([]int{0, 0, 0, 0, 0}, []int{len(cache.Threads), len(cache.Occurrences), len(cache.Records), len(cache.Pending), len(cache.Decorations)}); diff != "" {
+			if diff := cmp.Diff([]int{0, 0, 0, 0, 0}, []int{len(cache.Threads), len(cache.Occurrences), len(cache.Records), len(cache.Pending), len(cache.Decorations.Icons)}); diff != "" {
 				t.Errorf("expired caches (-want +got):\n%s", diff)
 			}
 		})

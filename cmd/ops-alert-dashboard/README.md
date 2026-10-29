@@ -253,7 +253,18 @@ state. Only replies from the verified writer identity are replayed as actions.
 An action is successful only after Slack confirms the save. The visible reactions
 are decoration; removing one does not undo an action. Use the dashboard's explicit
 Undo/Unsnooze controls. Expired snooze decoration for visible occurrences is
-reconciled on the next scan.
+reconciled on the next scan. Untouched feed messages without status reactions
+require no reaction writes. Startup reconciliation uses the status reactions
+already returned with channel history; subsequent scans retain successful icon
+changes, including partial transitions. Removal affects only the token owner's
+reaction, preserving other users' reactions.
+
+A reaction rate limit stops the optional reaction batch until Slack's
+`Retry-After` deadline without delaying history reads or durable action writes.
+If Slack rejects a reaction with `missing_scope`, optional reactions are disabled
+until the process restarts; the dashboard feed and workflow actions continue.
+After granting `reactions:write` and reinstalling the Slack app if needed, restart
+the dashboard to resume decoration.
 
 The browser submits the selected revision and a stable request ID. Stale changes
 are rejected; confirmed duplicate requests are reconciled without a second post.
