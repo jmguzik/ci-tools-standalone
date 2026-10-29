@@ -302,7 +302,8 @@ If its occurrence leaves the history window, the browser offers an explicit
 Dismiss expired local retry control. It clears only this browser's retry guard;
 delivery remains unconfirmed and the operator must check the original thread.
 
-Ask Chai previews an editable question, then DPTP-bot posts an explicit mention,
+Ask Chai previews only the bot routing and selected destination thread. The request
+uses the selected alert as its question; DPTP-bot then posts an explicit mention,
 request ID, source context and read-only investigation instructions in that alert's
 thread. It does not acknowledge or close the alert. Only one request may be
 outstanding per occurrence. A later Chai-authored reply is shown as Reply received;

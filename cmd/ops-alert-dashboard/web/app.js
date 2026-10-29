@@ -891,9 +891,9 @@
     el('scope-controls').hidden = kind === 'investigate';
     for (const input of document.querySelectorAll('input[name="scope"]')) { input.checked = input.value === 'occurrence'; input.disabled = input.value === 'regex' && !(occurrence.message.identifiers || []).length; }
     el('draft').maxLength = kind === 'investigate' ? 4000 : 512;
-    el('draft').value = kind === 'investigate' ? 'Please investigate ' + displayTitle(occurrence) + '. Use the source evidence and thread context, explain likely causes and suggest read-only checks. State uncertainties and do not perform remediation.' : '^(?:' + (occurrence.message.identifiers || []).map(escapeRegex).join('|') + ')$';
+    el('draft').value = kind === 'investigate' ? 'Please investigate ' + displayTitle(occurrence) + '.' : '^(?:' + (occurrence.message.identifiers || []).map(escapeRegex).join('|') + ')$';
     el('confirm').textContent = actionLabels[kind]; el('form-error').textContent = '';
-    updatePreview(); el('action-dialog').showModal(); (kind === 'investigate' ? el('draft') : el('confirm')).focus();
+    updatePreview(); el('action-dialog').showModal(); el('confirm').focus();
   }
   /** Invalidate in-flight previews so a closed dialog cannot receive stale targets. */
   function closeDialog() { state.previewVersion++; el('action-dialog').close(); state.dialogOccurrence = null; state.previewTargets = []; state.previewValid = false; state.lastFocus?.focus(); }
@@ -902,12 +902,12 @@
     const o = state.dialogOccurrence; if (!o) return;
     const version = ++state.previewVersion, kind = state.dialogKind, scope = state.dialogScope, draft = el('draft').value.trim();
     const investigate = kind === 'investigate', regex = scope === 'regex' && !investigate;
-    el('draft').hidden = !investigate && !regex; el('draft-label').hidden = !investigate && !regex;
-    el('draft').required = investigate || regex;
+    el('draft').hidden = !regex; el('draft-label').hidden = !regex;
+    el('draft').required = regex;
     el('draft-label').textContent = investigate ? 'Question for Chai' : 'Identifier regular expression (RE2 syntax)';
     state.previewValid = false; state.previewTargets = []; el('confirm').disabled = true;
     if (investigate) {
-      el('preview').textContent = 'DPTP-bot → configured Chai identity\nDestination: the selected source thread in ' + channelName() + '\n\n' + draft + '\n\nThe server includes the source permalink, request ID, and read-only evidence instructions. Sending does not start work or close this occurrence.';
+      el('preview').textContent = 'DPTP-bot → configured Chai identity\nDestination: the selected source thread in ' + channelName();
       state.previewValid = !!draft; el('confirm').disabled = !state.previewValid; return;
     }
     let targets = [o], until = date(nextSix());

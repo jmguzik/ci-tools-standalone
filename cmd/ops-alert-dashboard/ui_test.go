@@ -17,17 +17,19 @@ class Element {
   setAttribute(name, value) { this.attributes[name] = value; }
   replaceChildren(...children) { this.children = children; }
   addEventListener() {}
+  showModal() { this.open = true; }
+  focus() { this.focused = true; }
 }
 const storage = new Map(), session = new Map(), elements = new Map();
 const context = vm.createContext({URL, Intl, Date, Set, Map, console,
-  document: {createElement: tag => new Element(tag), getElementById: id => {if (!elements.has(id)) elements.set(id, new Element('div')); return elements.get(id);}},
+  document: {createElement: tag => new Element(tag), querySelectorAll: () => [], getElementById: id => {if (!elements.has(id)) elements.set(id, new Element('div')); return elements.get(id);}},
   window: {setTimeout, clearTimeout}, navigator: {}, AbortController, crypto: require('node:crypto'),
   localStorage: {getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value)},
   sessionStorage: {getItem: key => session.get(key) || null, setItem: (key, value) => session.set(key, value), removeItem: key => session.delete(key)},
 });
 let source = fs.readFileSync('web/app.js', 'utf8');
 source = source.slice(0, source.indexOf("  el('refresh').addEventListener"));
-source += 'render = () => {}; renderStatus = () => {}; globalThis.notificationCalls = 0; notifyArrivals = () => {globalThis.notificationCalls++;}; globalThis.UI = {safeURL, plainSlack, slackBody, displayTitle, identifierSubtitle, feedUnreadBadge, renderNav, sourceStatus, escapeRegex, date, state, unread, markRead, reconcilePersonal, validPending, validBatch, savePersonal, ready, retainBatch, restorePending, resumeBatch, sendPending, sendNew, refresh, pauseAuthentication};})();';
+source += 'render = () => {}; renderStatus = () => {}; globalThis.notificationCalls = 0; notifyArrivals = () => {globalThis.notificationCalls++;}; globalThis.UI = {safeURL, plainSlack, slackBody, displayTitle, identifierSubtitle, feedUnreadBadge, renderNav, openDialog, sourceStatus, escapeRegex, date, state, unread, markRead, reconcilePersonal, validPending, validBatch, savePersonal, ready, retainBatch, restorePending, resumeBatch, sendPending, sendNew, refresh, pauseAuthentication};})();';
 vm.runInContext(source, context);
 vm.runInContext("globalThis.fixture = (name, at = '2026-10-29T10:00:00Z', view = 'feed') => ({identity: {id: name, revision: '1', channel: 'C123'}, message: {title: '[FIRING] Raw title [ops_color=red]', text: '', identifiers: ['ParsedAlert'], reported_at: at, source: 'alerts'}, classification: {category: 'ci_platform'}, view}); globalThis.snapshot = (items, phase = 'ready') => ({user: 'operator', status: {phase, last_sync: '2026-10-29T11:00:00Z'}, occurrences: items});", context);
 vm.runInContext("globalThis.setupActions = () => {\n    UI.state.snapshot = snapshot([fixture('one'), fixture('two')]); UI.state.storageUser = 'operator';\n    const plan = {user: 'operator', index: 0, requests: ['one', 'two'].map((id, index) => ({occurrence_id: id, kind: 'close', expected_revision: '1', request_id: '00000000-0000-4000-8000-00000000000' + index, scope: 'occurrence'}))};\n    UI.retainBatch(plan); return plan;\n  };\n  globalThis.respond = (value, status = 200) => ({status, ok: status < 400, redirected: false, headers: {get: () => 'application/json'}, json: async () => value});", context);
@@ -58,6 +60,7 @@ func TestBrowserHelpers(t *testing.T) {
 		{name: "positive unread shows badge", expression: `UI.feedUnreadBadge(3).textContent`, want: `"3"`},
 		{name: "feed total and unread stay distinct", expression: `UI.state.snapshot = snapshot([fixture('read'), fixture('new'), fixture('wip', undefined, 'acknowledged'), fixture('report', undefined, 'chai_reports')]); UI.state.personal = {known: ['read', 'new', 'wip', 'report'], read: ['read']}; UI.renderNav(); let feed = document.getElementById('navigation').children[0]; [feed.attributes['aria-label'], feed.children.map(child => child.textContent)]`, want: `["Feed · 2 total · 1 unread",["2","1"]]`},
 		{name: "all read keeps total without red unread badge", expression: `UI.state.snapshot = snapshot([fixture('read')]); UI.state.personal = {known: ['read'], read: ['read']}; UI.renderNav(); let feed = document.getElementById('navigation').children[0]; [feed.attributes['aria-label'], feed.children.map(child => child.textContent)]`, want: `["Feed · 1 total · 0 unread",["1"]]`},
+		{name: "Chai dialog shows only routing and focuses confirmation", expression: `UI.state.snapshot = snapshot([fixture('one')]); UI.state.snapshot.channel_name = 'ops-testplatform'; UI.state.storageUser = 'operator'; UI.openDialog('investigate', fixture('one')); [document.getElementById('preview').textContent, document.getElementById('draft').hidden, document.getElementById('draft').required, document.getElementById('draft-label').hidden, document.getElementById('confirm').focused, document.getElementById('confirm').disabled]`, want: `["DPTP-bot → configured Chai identity\nDestination: the selected source thread in ops-testplatform",true,false,true,true,false]`},
 		{name: "status separate from title", expression: `UI.sourceStatus(fixture('one'))`, want: `"FIRING"`},
 		{name: "Slack labels and emoji", expression: `UI.plainSlack('*Alert* :rotating_light: <https://example.org|Details>')`, want: `"Alert 🚨 Details"`},
 		{name: "escape regex literal", expression: `UI.escapeRegex('job.name+[x]')`, want: `"job\\.name\\+\\[x\\]"`},
