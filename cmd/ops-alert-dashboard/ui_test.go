@@ -12,25 +12,28 @@ import (
 const uiUnitHarness = `
 const fs = require('node:fs'), vm = require('node:vm');
 class Element {
-  constructor(tag) { this.tag = tag; this.children = []; this.textContent = ''; this.value = ''; }
+  constructor(tag) { this.tag = tag; this.children = []; this.textContent = ''; this.value = ''; this.attributes = {}; }
   append(...children) { this.children.push(...children); }
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes[name] = value; }
   replaceChildren(...children) { this.children = children; }
   addEventListener() {}
+  showModal() { this.open = true; }
+  focus() { this.focused = true; }
 }
-const storage = new Map(), session = new Map();
-const context = vm.createContext({URL, Intl, Date, Set, Map, console,
-  document: {createElement: tag => new Element(tag), getElementById: () => new Element('div')},
+const storage = new Map(), session = new Map(), elements = new Map();
+const context = vm.createContext({URL, Intl: {DateTimeFormat: function(locale, options) {if (options.timeZoneName === 'shortOffset') throw new RangeError('shortOffset is unavailable in the CI runtime'); return new Intl.DateTimeFormat('en-GB', {...options, timeZone: process.env.TZ});}}, Date, Set, Map, console,
+  document: {createElement: tag => new Element(tag), querySelectorAll: () => [], getElementById: id => {if (!elements.has(id)) elements.set(id, new Element('div')); return elements.get(id);}},
   window: {setTimeout, clearTimeout}, navigator: {}, AbortController, crypto: require('node:crypto'),
   localStorage: {getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value)},
   sessionStorage: {getItem: key => session.get(key) || null, setItem: (key, value) => session.set(key, value), removeItem: key => session.delete(key)},
 });
 let source = fs.readFileSync('web/app.js', 'utf8');
 source = source.slice(0, source.indexOf("  el('refresh').addEventListener"));
-source += 'render = () => {}; renderStatus = () => {}; globalThis.notificationCalls = 0; notifyArrivals = () => {globalThis.notificationCalls++;}; globalThis.UI = {safeURL, plainSlack, slackBody, displayTitle, identifierSubtitle, feedUnreadBadge, sourceStatus, escapeRegex, date, state, unread, markRead, reconcilePersonal, validPending, validBatch, savePersonal, ready, retainBatch, restorePending, resumeBatch, sendPending, sendNew, refresh, pauseAuthentication};})();';
+source += 'render = () => {}; renderStatus = () => {}; globalThis.notificationCalls = 0; notifyArrivals = () => {globalThis.notificationCalls++;}; globalThis.UI = {localProse, localUTC, reportHeadline, reportCoverage, originalReport, renderReports, slackTime, safeURL, plainSlack, slackBody, renderReportBody, displayTitle, identifierSubtitle, feedUnreadBadge, renderNav, openDialog, sourceStatus, escapeRegex, date, state, unread, markRead, reconcilePersonal, validPending, validBatch, savePersonal, ready, retainBatch, restorePending, resumeBatch, sendPending, sendNew, refresh, pauseAuthentication};})();';
 vm.runInContext(source, context);
 vm.runInContext("globalThis.fixture = (name, at = '2026-10-29T10:00:00Z', view = 'feed') => ({identity: {id: name, revision: '1', channel: 'C123'}, message: {title: '[FIRING] Raw title [ops_color=red]', text: '', identifiers: ['ParsedAlert'], reported_at: at, source: 'alerts'}, classification: {category: 'ci_platform'}, view}); globalThis.snapshot = (items, phase = 'ready') => ({user: 'operator', status: {phase, last_sync: '2026-10-29T11:00:00Z'}, occurrences: items});", context);
 vm.runInContext("globalThis.setupActions = () => {\n    UI.state.snapshot = snapshot([fixture('one'), fixture('two')]); UI.state.storageUser = 'operator';\n    const plan = {user: 'operator', index: 0, requests: ['one', 'two'].map((id, index) => ({occurrence_id: id, kind: 'close', expected_revision: '1', request_id: '00000000-0000-4000-8000-00000000000' + index, scope: 'occurrence'}))};\n    UI.retainBatch(plan); return plan;\n  };\n  globalThis.respond = (value, status = 200) => ({status, ok: status < 400, redirected: false, headers: {get: () => 'application/json'}, json: async () => value});", context);
+vm.runInContext("globalThis.report = (source, reference) => {const root = document.createElement('div'); UI.renderReportBody(root, source, reference); return root;}; globalThis.content = root => root.textContent + root.children.map(content).join(''); globalThis.tags = (root, tag) => [...(root.tag === tag ? [root] : []), ...root.children.flatMap(child => tags(child, tag))];", context);
 const answer = vm.runInContext(process.argv[1], context);
 Promise.resolve(answer).then(value => process.stdout.write(JSON.stringify(value)), error => {console.error(error); process.exitCode = 1;});
 `
@@ -44,7 +47,32 @@ func TestBrowserHelpers(t *testing.T) {
 		name       string
 		expression string
 		want       string
+		timeZone   string
 	}{
+		{name: "UTC ISO prose winter", expression: `UI.localProse('Seen 2026-01-15T12:30:00Z.')`, want: `"Seen 15 Jan 2026, 13:30:00 GMT+1."`},
+		{name: "UTC ISO prose summer and zero offsets", expression: `UI.localProse('2026-07-15T12:30+00:00 / 2026-07-15T12:30+0000')`, want: `"15 Jul 2026, 14:30 GMT+2 / 15 Jul 2026, 14:30 GMT+2"`},
+		{name: "spaced UTC prose", expression: `UI.localProse('2026-07-15 6:30 UTC and 2026-01-15 06:30:45 UTC')`, want: `"15 Jul 2026, 08:30 GMT+2 and 15 Jan 2026, 07:30:45 GMT+1"`},
+		{name: "UTC clock uses source UTC calendar day", expression: `UI.localProse('At 6:00 UTC', '2026-03-29T23:45:00Z')`, want: `"At 29 Mar 2026, 08:00 GMT+2"`},
+		{name: "UTC clock winter and summer", expression: `[UI.localProse('6:00 UTC', '2026-01-15T12:00:00Z'), UI.localProse('6:00:20 UTC', '2026-07-15T12:00:00Z')]`, want: `["15 Jan 2026, 07:00 GMT+1","15 Jul 2026, 08:00:20 GMT+2"]`},
+		{name: "UTC prose DST spring boundary", expression: `UI.localProse('2026-03-29T00:30:00Z then 2026-03-29T01:30:00Z')`, want: `"29 Mar 2026, 01:30:00 GMT+1 then 29 Mar 2026, 03:30:00 GMT+2"`},
+		{name: "UTC prose DST autumn boundary", expression: `UI.localProse('2026-10-25T00:30:00Z then 2026-10-25T01:30:00Z')`, want: `"25 Oct 2026, 02:30:00 GMT+2 then 25 Oct 2026, 02:30:00 GMT+1"`},
+		{name: "UTC offset without shortOffset support", expression: `UI.localProse('2026-01-15T12:30:00Z')`, timeZone: "UTC", want: `"15 Jan 2026, 12:30:00 GMT"`},
+		{name: "negative local offset and previous calendar day", expression: `UI.localProse('2026-01-15T01:30:00Z')`, timeZone: "America/New_York", want: `"14 Jan 2026, 20:30:00 GMT-5"`},
+		{name: "positive quarter-hour local offset", expression: `UI.localProse('2026-01-15T12:30:00Z')`, timeZone: "Asia/Kathmandu", want: `"15 Jan 2026, 18:15:00 GMT+5:45"`},
+		{name: "negative half-hour local offset", expression: `UI.localProse('2026-01-15T12:30:00Z')`, timeZone: "America/St_Johns", want: `"15 Jan 2026, 09:00:00 GMT-3:30"`},
+		{name: "invalid UTC values stay literal", expression: `UI.localProse('2026-02-30T12:00:00Z 2026-01-15T24:00Z 2026-01-15 12:60 UTC 25:00 UTC', '2026-01-15T00:00:00Z')`, want: `"2026-02-30T12:00:00Z 2026-01-15T24:00Z 2026-01-15 12:60 UTC 25:00 UTC"`},
+		{name: "nonzero offsets stay literal", expression: `UI.localProse('6:00 UTC+1 2026-01-15 06:00 UTC-01:00 2026-01-15T12:00+01:00', '2026-01-15T00:00:00Z')`, want: `"6:00 UTC+1 2026-01-15 06:00 UTC-01:00 2026-01-15T12:00+01:00"`},
+		{name: "naive times and unanchored UTC clocks stay literal", expression: `[UI.localProse('2026-01-15 12:00 2026-01-15T12:00 6:00 UTC'), UI.localProse('6:00 UTC', 'invalid')]`, want: `["2026-01-15 12:00 2026-01-15T12:00 6:00 UTC","6:00 UTC"]`},
+		{name: "UTC prose keeps URLs and inline code literal", expression: "UI.localProse('https://example.org/2026-01-15T12:00Z http://example.org/2026-01-15T12:00Z `2026-01-15T12:00Z` [Run](https://example.org/2026-01-15T12:00Z)')", want: "\"https://example.org/2026-01-15T12:00Z http://example.org/2026-01-15T12:00Z `2026-01-15T12:00Z` [Run](https://example.org/2026-01-15T12:00Z)\""},
+		{name: "UTC report preserves code and link destinations", expression: "let root = report('At 6:00 UTC\\n\\n`6:00 UTC` [Run](https://example.org/2026-01-15T12:00Z)\\n\\n```text\\n2026-01-15T12:00Z\\n```', '2026-01-15T12:00:00Z'); [content(root).includes('15 Jan 2026, 07:00 GMT+1'), tags(root, 'code').map(content), tags(root, 'a').map(child => child.href)]", want: `[true,["6:00 UTC","2026-01-15T12:00Z"],["https://example.org/2026-01-15T12:00Z"]]`},
+		{name: "UTC thread clock uses Slack reply instant", expression: `content(UI.slackBody('At 6:00 UTC', UI.slackTime('1768478400.000001')))`, want: `"At 15 Jan 2026, 07:00 GMT+1"`},
+		{name: "UTC Slack timestamps retain seconds across emoji parsing", expression: `content(UI.slackBody('Seen 2026-01-15T12:00:00Z; next 6:00:20 UTC :eyes: :+1:.', '2026-01-15T12:00:00Z'))`, want: `"Seen 15 Jan 2026, 13:00:00 GMT+1; next 15 Jan 2026, 07:00:20 GMT+1 👀 👍."`},
+		{name: "Slack underscore emoji remain whole alongside UTC seconds", expression: `content(UI.slackBody(':rotating_light: :white_check_mark: 2026-01-15T12:00:00Z', '2026-01-15T12:00:00Z'))`, want: `"🚨 ✅ 15 Jan 2026, 13:00:00 GMT+1"`},
+		{name: "report underscore emoji remain whole alongside UTC seconds", expression: `content(report(':rotating_light: :white_check_mark: :+1: 2026-01-15T12:00:00Z', '2026-01-15T12:00:00Z'))`, want: `"🚨 ✅ 👍 15 Jan 2026, 13:00:00 GMT+1"`},
+		{name: "UTC Slack preserves code and URL timestamps", expression: "let root = UI.slackBody('`2026-01-15T12:00:00Z` https://example.org/2026-01-15T12:00:00Z :eyes:'); [tags(root, 'code').map(content), tags(root, 'a').map(child => child.href), content(root).includes('👀')]", want: `[["2026-01-15T12:00:00Z"],["https://example.org/2026-01-15T12:00:00Z"],true]`},
+		{name: "UTC report headline and source fidelity", expression: `let o = fixture('report', '2026-01-15T12:00:00Z', 'chai_reports'); o.message.text = 'At 6:00 UTC\nCoverage: 2026-01-15T12:00Z'; [UI.reportHeadline(o), content(UI.originalReport(o)), o.message.text]`, want: `["At 15 Jan 2026, 07:00 GMT+1","Original Slack messageAt 6:00 UTC\nCoverage: 2026-01-15T12:00Z","At 6:00 UTC\nCoverage: 2026-01-15T12:00Z"]`},
+		{name: "UTC latest and historical reports use own dates", expression: `let latest = fixture('latest', '2026-07-15T12:00:00Z', 'chai_reports'), old = fixture('old', '2026-01-15T12:00:00Z', 'chai_reports'); for (let o of [latest, old]) {o.message.scheduled_task = 'synthetic'; o.message.text = 'At 6:00 UTC\n\nCoverage: 6:00 UTC';} let root = document.createElement('div'); UI.renderReports(root, [latest, old]); [tags(root, 'div').filter(child => child.className === 'report-body').map(content), tags(root, 'aside').map(content)]`, want: `[["At 15 Jul 2026, 08:00 GMT+2Coverage: 15 Jul 2026, 08:00 GMT+2","At 15 Jan 2026, 07:00 GMT+1Coverage: 15 Jan 2026, 07:00 GMT+1"],["Source coverage & limitsCoverage: 15 Jul 2026, 08:00 GMT+2"]]`},
+		{name: "UTC fallback title preserves identifiers", expression: `let o = fixture('one'); o.message.title = 'At 2026-01-15T12:00Z'; let parsed = UI.displayTitle(o); o.message.identifiers = []; [parsed, UI.displayTitle(o)]`, want: `["ParsedAlert","At 15 Jan 2026, 13:00 GMT+1"]`},
 		{name: "HTTPS links", expression: `!!UI.safeURL('https://prow.ci.openshift.org/view/123')`, want: `true`},
 		{name: "reject script links", expression: `UI.safeURL('javascript:alert(1)')`, want: `null`},
 		{name: "reject credentials", expression: `UI.safeURL('https://user:password@example.org/')`, want: `null`},
@@ -56,7 +84,30 @@ func TestBrowserHelpers(t *testing.T) {
 		{name: "empty identifier subtitle omitted", expression: `UI.identifierSubtitle('Readable alert summary', [])`, want: `null`},
 		{name: "zero unread has no red badge", expression: `UI.feedUnreadBadge(0)`, want: `null`},
 		{name: "positive unread shows badge", expression: `UI.feedUnreadBadge(3).textContent`, want: `"3"`},
+		{name: "feed total and unread stay distinct", expression: `UI.state.snapshot = snapshot([fixture('read'), fixture('new'), fixture('wip', undefined, 'acknowledged'), fixture('report', undefined, 'chai_reports')]); UI.state.personal = {known: ['read', 'new', 'wip', 'report'], read: ['read']}; UI.renderNav(); let feed = document.getElementById('navigation').children[0]; [feed.attributes['aria-label'], feed.children.map(child => child.textContent)]`, want: `["Feed · 2 total · 1 unread",["2","1"]]`},
+		{name: "all read keeps total without red unread badge", expression: `UI.state.snapshot = snapshot([fixture('read')]); UI.state.personal = {known: ['read'], read: ['read']}; UI.renderNav(); let feed = document.getElementById('navigation').children[0]; [feed.attributes['aria-label'], feed.children.map(child => child.textContent)]`, want: `["Feed · 1 total · 0 unread",["1"]]`},
+		{name: "Chai dialog shows only routing and focuses confirmation", expression: `UI.state.snapshot = snapshot([fixture('one')]); UI.state.snapshot.channel_name = 'ops-testplatform'; UI.state.storageUser = 'operator'; UI.openDialog('investigate', fixture('one')); [document.getElementById('preview').textContent, document.getElementById('draft').hidden, document.getElementById('draft').required, document.getElementById('draft-label').hidden, document.getElementById('confirm').focused, document.getElementById('confirm').disabled]`, want: `["DPTP-bot → configured Chai identity\nDestination: the selected source thread in ops-testplatform",true,false,true,true,false]`},
 		{name: "status separate from title", expression: `UI.sourceStatus(fixture('one'))`, want: `"FIRING"`},
+		{name: "alias alert prefix survives parsed title", expression: `let o = fixture('one'); o.message.title = ':rotating_light: *Raw* [ops_color=red]'; [UI.displayTitle(o), UI.identifierSubtitle(UI.displayTitle(o), o.message.identifiers)]`, want: `["🚨 ParsedAlert",null]`},
+		{name: "Unicode alert prefix survives parsed title", expression: `let o = fixture('one'); o.message.title = '🚨 Raw'; UI.displayTitle(o)`, want: `"🚨 ParsedAlert"`},
+		{name: "alert prefix is not doubled", expression: `let o = fixture('one'); o.message.title = ':rotating_light: Raw'; o.message.identifiers = ['🚨 ParsedAlert']; UI.displayTitle(o)`, want: `"🚨 ParsedAlert"`},
+		{name: "report paragraphs and headings", expression: `let root = report('# Findings\n\nFirst line\ncontinued.\n\n## Coverage\nSynthetic scope.'); root.children.map(child => [child.tag, content(child)])`, want: `[["h3","Findings"],["p","First line\ncontinued."],["h4","Coverage"],["p","Synthetic scope."]]`},
+		{name: "report ordered nested and continuation lists", expression: `let root = report('3. First\n   continuation\n   - Child\n     more detail\n4. Second\n\nParagraph.'); [root.children.map(child => child.tag), tags(root, 'ol').map(child => child.start), tags(root, 'ul').length, tags(root, 'li').map(content)]`, want: `[["ol","p"],[3],1,["FirstcontinuationChildmore detail","Childmore detail","Second"]]`},
+		{name: "report mixed list types", expression: `let root = report('- One\n- Two\n1. Three'); root.children.map(child => child.tag)`, want: `["ul","ol"]`},
+		{name: "report quotes support inline and nested blocks", expression: `let root = report('> **Finding**\n>\n> > _detail_'); [tags(root, 'blockquote').length, tags(root, 'strong').map(content), tags(root, 'em').map(content)]`, want: `[2,["Finding"],["detail"]]`},
+		{name: "report Slack and Markdown inline formatting", expression: `let root = report('**Markdown** *Slack* _emphasis_ ~~removed~~ ~old~ :rotating_light:'); [tags(root, 'strong').map(content), tags(root, 'em').map(content), tags(root, 's').map(content), content(root)]`, want: `[["Markdown","Slack"],["emphasis"],["removed","old"],"Markdown Slack emphasis removed old 🚨"]`},
+		{name: "report safe Markdown and Slack links", expression: `let root = report('[Run](https://example.org/run) <https://example.org/log|Logs>'); tags(root, 'a').map(child => [content(child), child.href, child.rel])`, want: `[["Run","https://example.org/run","noopener noreferrer"],["Logs","https://example.org/log","noopener noreferrer"]]`},
+		{name: "report unsafe links and HTML stay inert", expression: `let root = report('[Script](javascript:alert) [File](file:///tmp/x) [Creds](https://u:p@example.org) <img src=x onerror=alert(1)> <script>alert(1)</script> ![Remote](https://example.org/image.png)'); [tags(root, 'img').length, tags(root, 'script').length, tags(root, 'a').length, content(root).includes('Script')]`, want: `[0,0,0,true]`},
+		{name: "report fenced code excludes language and preserves markup", expression: "let root = report('```yaml\\n**literal** :fire: [link](https://example.org) <img src=x>\\n```'); [tags(root, 'pre').length, tags(root, 'code').map(content), tags(root, 'strong').length, tags(root, 'a').length]", want: `[1,["**literal** :fire: [link](https://example.org) <img src=x>"],0,0]`},
+		{name: "report inline code preserves markup", expression: "let root = report('Before `*literal* :fire:` after'); [tags(root, 'code').map(content), tags(root, 'strong').length]", want: `[["*literal* :fire:"],0]`},
+		{name: "report tables format cells", expression: `let root = report('| Task | Result |\n| --- | :---: |\n| **Synthetic** | _pending_ |'); [tags(root, 'table').length, tags(root, 'th').map(content), tags(root, 'td').map(content), tags(root, 'strong').map(content)]`, want: `[1,["Task","Result"],["Synthetic","pending"],["Synthetic"]]`},
+		{name: "report table preserves Slack link cell", expression: `let root = report('| Run | State |\n| --- | --- |\n| <https://example.org/run|Run> | pending |'); [tags(root, 'td').map(content), tags(root, 'a').map(child => [content(child), child.href])]`, want: `[["Run","pending"],[["Run","https://example.org/run"]]]`},
+		{name: "report table preserves inline code and escaped pipes", expression: "let root = report('| Detail | State |\\n| --- | --- |\\n| `a|b` and c\\\\|d | pending |'); [tags(root, 'td').map(content), tags(root, 'code').map(content)]", want: `[["a|b and c|d","pending"],["a|b"]]`},
+		{name: "report table escaped trailing pipe is content", expression: `let root = report('Detail | State\n--- | ---\na | b\\|'); tags(root, 'td').map(content)`, want: `["a","b|"]`},
+		{name: "report unclosed code remains literal", expression: "let root = report('~~~text\\n**literal**'); tags(root, 'code').map(content)", want: `["**literal**"]`},
+		{name: "report nesting is bounded", expression: `let root = report('> '.repeat(24) + 'deep'); [tags(root, 'blockquote').length, content(root).includes('deep')]`, want: `[8,true]`},
+		{name: "report list nesting is bounded", expression: `let root = report(Array.from({length: 24}, (_, index) => '  '.repeat(index) + '- item ' + index).join('\n')); [tags(root, 'ul').length, content(root).includes('item 23')]`, want: `[8,true]`},
+		{name: "alert prefix survives without parsed identifiers", expression: `let o = fixture('one'); o.message.identifiers = []; o.message.title = ':rotating_light: *Synthetic alert* [ops_color=red]'; UI.displayTitle(o)`, want: `"🚨 Synthetic alert"`},
 		{name: "Slack labels and emoji", expression: `UI.plainSlack('*Alert* :rotating_light: <https://example.org|Details>')`, want: `"Alert 🚨 Details"`},
 		{name: "escape regex literal", expression: `UI.escapeRegex('job.name+[x]')`, want: `"job\\.name\\+\\[x\\]"`},
 		{name: "initial history baseline", expression: `UI.state.snapshot = snapshot([fixture('old')]); UI.reconcilePersonal(UI.state.snapshot, null, true); UI.unread(fixture('old'))`, want: `false`},
@@ -99,7 +150,13 @@ func TestBrowserHelpers(t *testing.T) {
 		{name: "cancel matching WIP rule uses regex scope", expression: `(async () => {let o = fixture('one'); o.wip_rule = {id: 'rule'}; UI.state.snapshot = snapshot([o]); UI.state.storageUser = 'operator'; let captured; globalThis.fetch = async (url, options) => url === '/api/snapshot' ? respond(UI.state.snapshot) : (captured = JSON.parse(options.body), respond({occurrence: o})); await UI.sendNew('unacknowledge', o, '', 'regex'); return captured.scope;})()`, want: `"regex"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := exec.Command(node, "-e", uiUnitHarness, tc.expression).CombinedOutput()
+			timeZone := "Europe/Warsaw"
+			if tc.timeZone != "" {
+				timeZone = tc.timeZone
+			}
+			command := exec.Command(node, "-e", uiUnitHarness, tc.expression)
+			command.Env = append(command.Environ(), "TZ="+timeZone)
+			got, err := command.CombinedOutput()
 			if err != nil {
 				t.Fatalf("evaluating browser helper: %v\n%s", err, got)
 			}

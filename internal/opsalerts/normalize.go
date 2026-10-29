@@ -291,7 +291,7 @@ func (s *Service) normalize(m slack.Message) (Occurrence, bool, error) {
 	if text == "" {
 		return Occurrence{}, false, nil
 	}
-	if matchesIdentity(m, s.cfg.Writer) && strings.Contains(text, strings.TrimSpace(ActionMarker)) {
+	if matchesIdentity(m, s.cfg.Writer) && (strings.Contains(text, strings.TrimSpace(ActionMarker)) || strings.HasPrefix(m.Text, ActionReceiptPrefix) || m.Metadata.EventType == ActionMetadataEvent) {
 		return Occurrence{}, false, nil
 	}
 	src := Source{Name: "unknown", Kind: "unknown"}

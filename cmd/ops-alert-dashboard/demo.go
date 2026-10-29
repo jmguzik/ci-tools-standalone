@@ -43,7 +43,7 @@ func (a *demoArchive) Replies(_ context.Context, _ string, root string) ([]slack
 }
 
 // Post commits to memory and simulates Chai's reply without contacting any service.
-func (a *demoArchive) Post(ctx context.Context, channel, root, requestID, text string) (string, error) {
+func (a *demoArchive) Post(ctx context.Context, channel, root, requestID string, message slack.Msg) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -65,10 +65,10 @@ func (a *demoArchive) Post(ctx context.Context, channel, root, requestID, text s
 		}
 		a.next = a.next.Add(time.Millisecond)
 		timestamp := protocolTimestamp(a.next)
-		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: text}})
+		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: message.Text, Metadata: message.Metadata}})
 		a.roots[i].ReplyCount++
 		a.roots[i].LatestReply = timestamp
-		if strings.Contains(text, "<@U_CHAI>") {
+		if strings.Contains(message.Text, "<@U_CHAI>") {
 			a.next = a.next.Add(time.Millisecond)
 			reply := slack.Message{Msg: slack.Msg{Type: "message", User: "U_CHAI", BotID: "B_CHAI", ThreadTimestamp: root, Timestamp: protocolTimestamp(a.next), Text: "Demo Chai reply: this is synthetic evidence. Check the affected controller logs, recent deployment changes, and the linked dashboard. No remediation was run."}}
 			a.threads[root] = append(a.threads[root], reply)
@@ -180,7 +180,12 @@ Read-only demo scan; no resources were changed.`},
 	}
 	for i, task := range tasks {
 		header := "[Scheduled task: `" + task.id + "` | Instructions: `config/groups/test-platform/personas/ops_testplatform/scheduled_tasks/" + task.instructions + "`]"
-		body := header + "\n" + task.body + "\n[Ops Test Platform](Sol:High) AI Generated - Check for accuracy.\nSynthetic demo report; all findings above are illustrative."
+		body := header + "\n" + task.body
+		if i == 0 {
+			body += "\n\nObserved snapshot: " + now.Add(-90*time.Minute).UTC().Format(time.RFC3339) + ". Last sampling boundary: 14:30 UTC."
+			body += "\n\n## Read-only checks\n\n1. **Inspect pending pods** and their scheduling events.\n2. Compare the _observed_ requests with eligible capacity.\n\n```sh\noc get pods -n synthetic-demo\n```\n\n| Evidence | Result |\n| --- | --- |\n| <https://example.org/evidence|Synthetic pod evidence> | `Pending` |\n\n> This example is synthetic; do not infer live cluster health from it."
+		}
+		body += "\n[Ops Test Platform](Sol:High) AI Generated - Check for accuracy.\nSynthetic demo report; all findings above are illustrative."
 		report := demoMessage(now, time.Duration(90+i)*time.Minute, "U_CHAI", "B_CHAI", body)
 		if i != 1 {
 			report.Metadata = slack.SlackMetadata{EventType: "scheduled_report", EventPayload: map[string]interface{}{"scheduled_task": task.id}}

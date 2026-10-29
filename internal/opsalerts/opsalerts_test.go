@@ -48,6 +48,7 @@ type memoryArchive struct {
 	repliesError     error
 	replyCalls       int
 	lastText         string
+	lastMessage      slack.Msg
 	reactionError    error
 	reactionErrors   []error
 	cancelOnReaction context.CancelFunc
@@ -78,12 +79,13 @@ func (a *memoryArchive) Replies(_ context.Context, _ string, root string) ([]sla
 }
 
 // Post implements Archive without automatically retrying writes.
-func (a *memoryArchive) Post(_ context.Context, _ string, root, id, text string) (string, error) {
+func (a *memoryArchive) Post(_ context.Context, _ string, root, id string, message slack.Msg) (string, error) {
 	a.posts++
-	a.lastText = text
+	a.lastText = message.Text
+	a.lastMessage = message
 	ts := fmt.Sprintf("%d.%06d", a.clock.Now().Unix(), a.posts)
 	if a.postError == nil || a.storeOnError {
-		a.replies[root] = append(a.replies[root], slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: root, User: "U_WRITER", BotID: "B_WRITER", ClientMsgID: id, Text: text}})
+		a.replies[root] = append(a.replies[root], slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: root, User: "U_WRITER", BotID: "B_WRITER", ClientMsgID: id, Text: message.Text, Metadata: message.Metadata}})
 		for i := range a.roots {
 			if a.roots[i].Timestamp == root {
 				a.roots[i].ReplyCount++
@@ -512,13 +514,16 @@ func TestChaiInvestigation(t *testing.T) {
 			if o.State.AcknowledgedAt != nil || o.State.ClosedAt != nil {
 				t.Fatal("investigation changed workflow")
 			}
-			for _, part := range []string{"<@U_CHAI>", "Request ID: chai-1", o.Message.SlackURL, "read-only evidence", req.Question, ActionMarker} {
+			for _, part := range []string{"<@U_CHAI>", "Request ID: chai-1", o.Message.SlackURL, "read-only evidence", req.Question, ActionReceiptPrefix} {
 				if !strings.Contains(a.lastText, part) {
 					t.Errorf("missing %q in Chai post", part)
 				}
 			}
 			if !strings.Contains(a.lastText, "this thread") {
 				t.Fatal("missing same-thread instructions")
+			}
+			if !strings.HasPrefix(a.lastText, ActionReceiptPrefix) || strings.Contains(a.lastText, ActionMarker) || strings.Contains(a.lastText, `"version"`) || a.lastMessage.Metadata.EventType != ActionMetadataEvent {
+				t.Fatal("Chai request lacks reserved receipt prefix and metadata or exposes durable JSON")
 			}
 			a.postError = nil
 			a.storeOnError = false
@@ -804,7 +809,7 @@ func TestDurableRecordReplay(t *testing.T) {
 				t.Fatal(err)
 			}
 			root := a.roots[0].Timestamp
-			record, _, err := decodeRecord(a.lastText, id)
+			record, _, err := decodeMessageRecord(a.lastMessage, id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -827,11 +832,11 @@ func TestDurableRecordReplay(t *testing.T) {
 				now := c.Now()
 				record.State.ClosedAt = &now
 			}
-			text, err := s.actionText(record, o)
+			message, err := s.actionMessage(record, o)
 			if err != nil {
 				t.Fatal(err)
 			}
-			reply := slack.Message{Msg: slack.Msg{Timestamp: fmt.Sprintf("%d.000100", c.now.Unix()), ThreadTimestamp: root, User: "U_WRITER", BotID: "B_WRITER", Text: text}}
+			reply := slack.Message{Msg: slack.Msg{Timestamp: fmt.Sprintf("%d.000100", c.now.Unix()), ThreadTimestamp: root, User: "U_WRITER", BotID: "B_WRITER", Text: message.Text, Metadata: message.Metadata}}
 			if tc.change == "app" {
 				reply.User = "U_UNTRUSTED"
 				reply.BotID = "B_UNTRUSTED"

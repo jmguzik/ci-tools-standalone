@@ -67,7 +67,7 @@ func parseOptions(args []string) (options, error) {
 	flags.BoolVar(&o.demo, "demo", false, "Use synthetic in-memory Slack data on loopback, with no Slack calls")
 	flags.BoolVar(&o.validateOnly, "validate-only", false, "Validate config and classification without connecting to Slack")
 	flags.StringVar(&o.views.channelName, "slack-channel-name", "ops-testplatform", "Human-readable Slack channel name displayed in the dashboard")
-	flags.StringVar(&o.views.prAuthors, "unmerged-pr-authors", "redhat-chai-bot,openshift-bot,openshift-ci-robot", "Exact comma-separated GitHub authors for open openshift/release PRs; empty disables the view")
+	flags.StringVar(&o.views.prAuthors, "unmerged-pr-authors", "openshift-bot,openshift-ci-robot", "Exact comma-separated GitHub authors for open openshift/release PRs; empty disables the view")
 	flags.StringVar(&o.views.githubTokenFile, "github-token-file", "", "Optional server-side GitHub token file for the read-only PR cache")
 	if err := flags.Parse(args); err != nil {
 		return o, err

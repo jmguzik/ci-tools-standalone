@@ -271,7 +271,7 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 				return cache, err
 			}
 			if matchesIdentity(reply, s.cfg.Writer) {
-				record, exists, err := decodeRecord(reply.Text, o.Identity.ID)
+				record, exists, err := decodeMessageRecord(reply.Msg, o.Identity.ID)
 				if err != nil {
 					return cache, fmt.Errorf("trusted action at %s: %w", reply.Timestamp, err)
 				}

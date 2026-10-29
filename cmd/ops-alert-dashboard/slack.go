@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -108,10 +110,21 @@ func (a *slackArchive) repliesPage(ctx context.Context, params *slack.GetConvers
 	}
 }
 
-// Post makes exactly one write attempt; uncertain delivery must be reconciled first.
-func (a *slackArchive) Post(ctx context.Context, channel, rootTS, requestID, text string) (string, error) {
+// Post confirms persisted metadata after one write; uncertain delivery is never reposted here.
+func (a *slackArchive) Post(ctx context.Context, channel, rootTS, requestID string, message slack.Msg) (string, error) {
+	metadata, err := json.Marshal(message.Metadata)
+	if err != nil {
+		return "", errors.Join(opsalerts.ErrDeliveryFailed, fmt.Errorf("encoding action metadata: %w", err))
+	}
+	if message.Metadata.EventType != opsalerts.ActionMetadataEvent {
+		return "", fmt.Errorf("%w: invalid action metadata", opsalerts.ErrDeliveryFailed)
+	}
+	if len(metadata) > opsalerts.MaxActionMetadataBytes {
+		return "", fmt.Errorf("%w: action metadata exceeds the %d-byte application budget", opsalerts.ErrDeliveryFailed, opsalerts.MaxActionMetadataBytes)
+	}
 	postedChannel, timestamp, err := a.writer.PostMessageContext(ctx, channel,
-		slack.MsgOptionTS(rootTS), slack.MsgOptionText(text, false),
+		slack.MsgOptionTS(rootTS), slack.MsgOptionText(message.Text, false),
+		slack.MsgOptionMetadata(message.Metadata),
 		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl(),
 		slack.MsgOptionParse(false),
 		slack.UnsafeMsgOptionEndpoint(slack.APIURL+"chat.postMessage", clientMessageID(requestID).set),
@@ -128,7 +141,36 @@ func (a *slackArchive) Post(ctx context.Context, channel, rootTS, requestID, tex
 	if postedChannel != channel || timestamp == "" {
 		return "", fmt.Errorf("%w: Slack returned an incomplete write confirmation", opsalerts.ErrDeliveryUncertain)
 	}
+	if err := a.confirmMetadata(ctx, channel, rootTS, timestamp, metadata); err != nil {
+		return "", errors.Join(opsalerts.ErrDeliveryUncertain, err)
+	}
 	return timestamp, nil
+}
+
+// confirmMetadata detects successful-looking posts whose durable payload was omitted.
+func (a *slackArchive) confirmMetadata(ctx context.Context, channel, rootTS, timestamp string, expected []byte) error {
+	params := slack.GetConversationRepliesParameters{ChannelID: channel, Timestamp: rootTS, Oldest: timestamp, Latest: timestamp, Inclusive: true, Limit: 1, IncludeAllMetadata: true}
+	messages, _, _, err := a.reader.GetConversationRepliesContext(ctx, &params)
+	if err != nil {
+		return fmt.Errorf("confirming saved action metadata: %w", err)
+	}
+	for _, message := range messages {
+		if message.Timestamp != timestamp {
+			continue
+		}
+		if message.ThreadTimestamp != "" && message.ThreadTimestamp != rootTS {
+			return fmt.Errorf("saved action appeared outside its thread")
+		}
+		actual, err := json.Marshal(message.Metadata)
+		if err != nil {
+			return fmt.Errorf("reading saved action metadata: %w", err)
+		}
+		if !bytes.Equal(expected, actual) {
+			return fmt.Errorf("saved action metadata is missing or differs; delivery remains unconfirmed")
+		}
+		return nil
+	}
+	return fmt.Errorf("saved action was not returned with its metadata; delivery remains unconfirmed")
 }
 
 // SetReaction maintains decorative status without making reactions durable state.

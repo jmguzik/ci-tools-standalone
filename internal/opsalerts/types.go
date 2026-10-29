@@ -59,10 +59,11 @@ type Source struct {
 }
 
 // Archive is the complete paginated Slack boundary; Post must not retry uncertain writes.
+// Successful Post must confirm the message metadata was retained by Slack.
 type Archive interface {
 	History(context.Context, string, time.Time) ([]slack.Message, error)
 	Replies(context.Context, string, string) ([]slack.Message, error)
-	Post(context.Context, string, string, string, string) (string, error)
+	Post(context.Context, string, string, string, slack.Msg) (string, error)
 	SetReaction(context.Context, string, string, string, bool) error
 }
 

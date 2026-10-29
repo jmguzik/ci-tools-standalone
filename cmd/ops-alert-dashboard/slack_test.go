@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -157,44 +158,193 @@ func TestSlackRateLimitCancellation(t *testing.T) {
 	}
 }
 
-// TestSlackPost keeps thread/request identity and makes only one delivery attempt.
+// TestSlackPost confirms durable metadata with one write and one bounded read.
 func TestSlackPost(t *testing.T) {
+	const record = `{"version":1,"request":{"occurrence_id":"C:100.000001","kind":"acknowledge","expected_revision":"revision-1","request_id":"stable-request-id","pattern":"","question":""},"actor":"unit-test-user","at":"2026-10-28T12:00:00Z","state":{"acknowledged_by":"unit-test-user","acknowledged_at":"2026-10-28T12:00:00Z","closed_by":"","closed_at":null},"snooze":null,"unsnooze":"","investigation":null}`
+	message := slack.Msg{Text: "Ops dashboard: acknowledged", Metadata: slack.SlackMetadata{EventType: opsalerts.ActionMetadataEvent, EventPayload: map[string]interface{}{"record": record}}}
+	metadata, err := json.Marshal(message.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed := slackHTTPResult{body: `{"ok":true,"channel":"C","ts":"200.000001"}`}
+	readback := slackHTTPResult{body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","thread_ts":"100.000001","metadata":%s}]}`, metadata)}
 	cases := []struct {
-		name      string
-		result    slackHTTPResult
-		timestamp string
-		wantError error
+		name          string
+		results       []slackHTTPResult
+		invalidType   bool
+		timestamp     string
+		wantError     error
+		wantErrorText string
 	}{
-		{name: "confirmed", result: slackHTTPResult{body: `{"ok":true,"channel":"C","ts":"200.000001"}`}, timestamp: "200.000001"},
-		{name: "explicit rejection", result: slackHTTPResult{body: `{"ok":false,"error":"not_in_channel"}`}, wantError: opsalerts.ErrDeliveryFailed},
-		{name: "rate limited write is not retried", result: slackHTTPResult{status: 429}, wantError: opsalerts.ErrDeliveryFailed},
-		{name: "transport uncertain", result: slackHTTPResult{err: errors.New("connection lost")}, wantError: opsalerts.ErrDeliveryUncertain},
-		{name: "server uncertain", result: slackHTTPResult{status: 503}, wantError: opsalerts.ErrDeliveryUncertain},
-		{name: "missing confirmation", result: slackHTTPResult{body: `{"ok":true,"channel":"C"}`}, wantError: opsalerts.ErrDeliveryUncertain},
-		{name: "wrong channel confirmation", result: slackHTTPResult{body: `{"ok":true,"channel":"other","ts":"200.000001"}`}, wantError: opsalerts.ErrDeliveryUncertain},
+		{name: "confirmed metadata round trip", results: []slackHTTPResult{confirmed, readback}, timestamp: "200.000001"},
+		{name: "readback without optional thread timestamp", results: []slackHTTPResult{confirmed, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","metadata":%s}]}`, metadata)}}, timestamp: "200.000001"},
+		{name: "invalid metadata type rejected before write", invalidType: true, wantError: opsalerts.ErrDeliveryFailed, wantErrorText: "invalid action metadata"},
+		{name: "explicit rejection", results: []slackHTTPResult{{body: `{"ok":false,"error":"not_in_channel"}`}}, wantError: opsalerts.ErrDeliveryFailed, wantErrorText: "not_in_channel"},
+		{name: "rate limited write is not retried", results: []slackHTTPResult{{status: 429}}, wantError: opsalerts.ErrDeliveryFailed, wantErrorText: "rate limit"},
+		{name: "transport uncertain", results: []slackHTTPResult{{err: errors.New("connection lost")}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "connection lost"},
+		{name: "server uncertain", results: []slackHTTPResult{{status: 503}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "slack server error"},
+		{name: "missing timestamp skips readback", results: []slackHTTPResult{{body: `{"ok":true,"channel":"C"}`}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "incomplete write confirmation"},
+		{name: "wrong channel skips readback", results: []slackHTTPResult{{body: `{"ok":true,"channel":"other","ts":"200.000001"}`}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "incomplete write confirmation"},
+		{name: "schema warning and omitted metadata", results: []slackHTTPResult{{body: `{"ok":true,"channel":"C","ts":"200.000001","warning":"metadata_schema_validation_failed","response_metadata":{"warnings":["metadata_schema_validation_failed"]}}`}, {body: `{"ok":true,"messages":[{"ts":"200.000001","thread_ts":"100.000001"}]}`}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "metadata is missing or differs"},
+		{name: "different payload", results: []slackHTTPResult{confirmed, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","metadata":%s}]}`, strings.Replace(string(metadata), "unit-test-user", "other-user", 1))}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "metadata is missing or differs"},
+		{name: "nonstring payload", results: []slackHTTPResult{confirmed, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","metadata":{"event_type":%q,"event_payload":{"record":%s}}}]}`, opsalerts.ActionMetadataEvent, record)}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "metadata is missing or differs"},
+		{name: "different metadata event type", results: []slackHTTPResult{confirmed, {body: strings.Replace(readback.body, opsalerts.ActionMetadataEvent, "other_event", 1)}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "metadata is missing or differs"},
+		{name: "wrong readback thread", results: []slackHTTPResult{confirmed, {body: strings.Replace(readback.body, `"thread_ts":"100.000001"`, `"thread_ts":"99.000001"`, 1)}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "outside its thread"},
+		{name: "missing posted message", results: []slackHTTPResult{confirmed, {body: `{"ok":true,"messages":[]}`}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "not returned with its metadata"},
+		{name: "another message cannot confirm metadata", results: []slackHTTPResult{confirmed, {body: strings.Replace(readback.body, `"ts":"200.000001"`, `"ts":"199.000001"`, 1)}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "not returned with its metadata"},
+		{name: "rate limited readback is not retried", results: []slackHTTPResult{confirmed, {status: 429}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "rate limit"},
+		{name: "readback API rejection", results: []slackHTTPResult{confirmed, {body: `{"ok":false,"error":"missing_scope"}`}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "missing_scope"},
+		{name: "readback transport error", results: []slackHTTPResult{confirmed, {err: errors.New("read connection lost")}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "read connection lost"},
+		{name: "readback server error", results: []slackHTTPResult{confirmed, {status: 503}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "slack server error"},
+		{name: "readback malformed JSON", results: []slackHTTPResult{confirmed, {body: `{"ok":true`}}, wantError: opsalerts.ErrDeliveryUncertain, wantErrorText: "unexpected EOF"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := &slackHTTPFake{results: []slackHTTPResult{tc.result}}
-			archive := &slackArchive{writer: fakeSlackClient(fake)}
-			got, err := archive.Post(context.Background(), "C", "100.000001", "stable-request-id", "readable action")
+			fake := &slackHTTPFake{results: tc.results}
+			client := fakeSlackClient(fake)
+			archive := &slackArchive{reader: client, writer: client}
+			posted := message
+			if tc.invalidType {
+				posted.Metadata.EventType = "other_event"
+			}
+			got, err := archive.Post(context.Background(), "C", "100.000001", "stable-request-id", posted)
 			if !errors.Is(err, tc.wantError) {
 				t.Fatalf("want error %v, got %v", tc.wantError, err)
+			}
+			if tc.wantErrorText != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErrorText)) {
+				t.Errorf("want error containing %q, got %v", tc.wantErrorText, err)
 			}
 			if diff := cmp.Diff(tc.timestamp, got); diff != "" {
 				t.Errorf("unexpected confirmation (-want +got):\n%s", diff)
 			}
-			if diff := cmp.Diff(1, len(fake.forms)); diff != "" {
-				t.Fatalf("unexpected write attempts (-want +got):\n%s", diff)
+			if diff := cmp.Diff(len(tc.results), len(fake.forms)); diff != "" {
+				t.Fatalf("unexpected request attempts (-want +got):\n%s", diff)
 			}
-			want := url.Values{"channel": {"C"}, "thread_ts": {"100.000001"}, "client_msg_id": {"stable-request-id"}, "text": {"readable action"}}
+			if tc.invalidType {
+				return
+			}
+			want := url.Values{"channel": {"C"}, "thread_ts": {"100.000001"}, "client_msg_id": {"stable-request-id"}, "text": {message.Text}, "metadata": {string(metadata)}}
 			for key, values := range want {
 				if diff := cmp.Diff(values, fake.forms[0][key]); diff != "" {
-					t.Errorf("unexpected %s (-want +got):\n%s", key, diff)
+					t.Errorf("unexpected post field %s (-want +got):\n%s", key, diff)
 				}
 			}
-			if diff := cmp.Diff([]string{"/api/chat.postMessage"}, fake.paths); diff != "" {
-				t.Errorf("unexpected endpoint (-want +got):\n%s", diff)
+			if text := fake.forms[0].Get("text"); strings.Contains(text, `"version"`) || strings.Contains(text, opsalerts.ActionMarker) {
+				t.Errorf("raw action record leaked into readable text: %q", text)
+			}
+			wantPaths := []string{"/api/chat.postMessage"}
+			if len(tc.results) == 2 {
+				wantPaths = append(wantPaths, "/api/conversations.replies")
+				wantRead := url.Values{"channel": {"C"}, "ts": {"100.000001"}, "oldest": {"200.000001"}, "latest": {"200.000001"}, "inclusive": {"1"}, "limit": {"1"}, "include_all_metadata": {"1"}}
+				for key, values := range wantRead {
+					if diff := cmp.Diff(values, fake.forms[1][key]); diff != "" {
+						t.Errorf("unexpected readback field %s (-want +got):\n%s", key, diff)
+					}
+				}
+			}
+			if diff := cmp.Diff(wantPaths, fake.paths); diff != "" {
+				t.Errorf("unexpected endpoints (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// slackSizedMetadata constructs an encoded envelope at an exact byte boundary.
+func slackSizedMetadata(t *testing.T, fill string, target int) slack.Msg {
+	t.Helper()
+	message := slack.Msg{Text: "Ops dashboard: acknowledged", Metadata: slack.SlackMetadata{EventType: opsalerts.ActionMetadataEvent}}
+	record := `{"version":1,"question":""}`
+	message.Metadata.EventPayload = map[string]interface{}{"record": record}
+	empty, err := json.Marshal(message.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedFill, err := json.Marshal(fill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedRecordFill, err := json.Marshal(string(encodedFill[1 : len(encodedFill)-1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	width := len(encodedRecordFill) - 2
+	remaining := target - len(empty)
+	question := strings.Repeat(fill, remaining/width) + strings.Repeat("x", remaining%width)
+	questionJSON, err := json.Marshal(question)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message.Metadata.EventPayload["record"] = `{"version":1,"question":` + string(questionJSON) + `}`
+	return message
+}
+
+// TestSlackPostMetadataBudget bounds the entire serialized envelope before any write.
+func TestSlackPostMetadataBudget(t *testing.T) {
+	cases := []struct {
+		name        string
+		fill        string
+		size        int
+		unsupported bool
+	}{
+		{name: "ASCII exact budget", fill: "x", size: opsalerts.MaxActionMetadataBytes},
+		{name: "ASCII above budget", fill: "x", size: opsalerts.MaxActionMetadataBytes + 1},
+		{name: "multibyte exact budget", fill: "ż", size: opsalerts.MaxActionMetadataBytes},
+		{name: "multibyte above budget", fill: "ż", size: opsalerts.MaxActionMetadataBytes + 1},
+		{name: "escaped quote exact budget", fill: `"`, size: opsalerts.MaxActionMetadataBytes},
+		{name: "escaped quote above budget", fill: `"`, size: opsalerts.MaxActionMetadataBytes + 1},
+		{name: "HTML escaped exact budget", fill: "&", size: opsalerts.MaxActionMetadataBytes},
+		{name: "HTML escaped above budget", fill: "&", size: opsalerts.MaxActionMetadataBytes + 1},
+		{name: "unsupported metadata value", unsupported: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			message := slack.Msg{Text: "Ops dashboard: acknowledged", Metadata: slack.SlackMetadata{EventType: opsalerts.ActionMetadataEvent, EventPayload: map[string]interface{}{"record": make(chan int)}}}
+			var metadata []byte
+			if !tc.unsupported {
+				message = slackSizedMetadata(t, tc.fill, tc.size)
+				var err error
+				metadata, err = json.Marshal(message.Metadata)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diff := cmp.Diff(tc.size, len(metadata)); diff != "" {
+					t.Fatalf("unexpected fixture encoded byte size (-want +got):\n%s", diff)
+				}
+			}
+			var results []slackHTTPResult
+			wantError := opsalerts.ErrDeliveryFailed
+			wantTimestamp := ""
+			if !tc.unsupported && tc.size == opsalerts.MaxActionMetadataBytes {
+				results = []slackHTTPResult{{body: `{"ok":true,"channel":"C","ts":"200.000001"}`}, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","thread_ts":"100.000001","metadata":%s}]}`, metadata)}}
+				wantError = nil
+				wantTimestamp = "200.000001"
+			}
+			fake := &slackHTTPFake{results: results}
+			client := fakeSlackClient(fake)
+			archive := &slackArchive{reader: client, writer: client}
+			got, err := archive.Post(context.Background(), "C", "100.000001", "stable-request-id", message)
+			if !errors.Is(err, wantError) {
+				t.Errorf("want error %v, got %v", wantError, err)
+			}
+			if wantError != nil {
+				wantErrorText := fmt.Sprintf("action metadata exceeds the %d-byte application budget", opsalerts.MaxActionMetadataBytes)
+				if tc.unsupported {
+					wantErrorText = "encoding action metadata: json: unsupported type: chan int"
+				}
+				if err == nil || !strings.Contains(err.Error(), wantErrorText) {
+					t.Errorf("want error containing %q, got %v", wantErrorText, err)
+				}
+			}
+			if diff := cmp.Diff(wantTimestamp, got); diff != "" {
+				t.Errorf("unexpected confirmation (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(len(results), len(fake.forms)); diff != "" {
+				t.Fatalf("unexpected requests (-want +got):\n%s", diff)
+			}
+			if len(results) != 0 {
+				if diff := cmp.Diff(string(metadata), fake.forms[0].Get("metadata")); diff != "" {
+					t.Errorf("unexpected posted metadata (-want +got):\n%s", diff)
+				}
 			}
 		})
 	}

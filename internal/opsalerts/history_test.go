@@ -198,11 +198,11 @@ func TestHistoricalUnsnooze(t *testing.T) {
 			if tc.invalidState {
 				r.State.AcknowledgedAt, r.State.AcknowledgedBy = &at, "operator"
 			}
-			text, err := s.actionText(r, o)
+			message, err := s.actionMessage(r, o)
 			if err != nil {
 				t.Fatal(err)
 			}
-			a.replies[o.Identity.Timestamp] = []slack.Message{{Msg: slack.Msg{Timestamp: historyRoot(at.Add(tc.postDelay)).Timestamp, ThreadTimestamp: o.Identity.Timestamp, User: "U_WRITER", Text: text}}}
+			a.replies[o.Identity.Timestamp] = []slack.Message{{Msg: slack.Msg{Timestamp: historyRoot(at.Add(tc.postDelay)).Timestamp, ThreadTimestamp: o.Identity.Timestamp, User: "U_WRITER", Text: message.Text, Metadata: message.Metadata}}}
 			err = s.Sync(context.Background())
 			if (err != nil) != tc.wantError {
 				t.Fatalf("want error %v, got %v", tc.wantError, err)
