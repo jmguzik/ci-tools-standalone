@@ -13,8 +13,8 @@ _output/ops-alert-dashboard --demo --listen=127.0.0.1:8080
 ```
 
 Open `http://127.0.0.1:8080`. Demo mode uses synthetic Slack messages and the real
-classification, replay and action code. It seeds all five views and simulates a
-Chai reply. It never connects to Slack. Demo state resets when the process stops.
+classification, replay and action code. It seeds the workflow views, a bot PR list and a
+Chai reply. It never connects to Slack or the GitHub PR API. Demo state resets when the process stops.
 
 ## Live configuration
 
@@ -125,6 +125,59 @@ Unreachable or missing documents leave the original source link available.
 Browser memory retains opened documents for the page visit. Demo alerts are
 synthetic, while their SOP previews read the real public documentation on request.
 
+## Browser preferences and presentation
+
+Times use the browser's local timezone, including daylight saving. The channel
+name defaults to `ops-testplatform`; set `--slack-channel-name` when configuring a
+different channel. The UI displays channel names in cards, dialogs and rules.
+Titles prefer parsed identifiers, with source firing/resolved status shown
+separately. Prow run links remain directly accessible. Message evidence supports
+safe Slack formatting and common Unicode emoji aliases; unsupported custom emoji
+remain readable. Raw message HTML is never executed.
+
+Unread IDs and notification preferences are scoped to the authenticated user in
+this browser's local storage. They survive page reloads and SSO renewal but do not
+synchronize across devices. Existing occurrences form the first-visit baseline;
+explicitly opening a card or Mark all read clears personal unread state. Severity
+colors, shared WIP state and personal unread indicators are independent.
+New Feed occurrences since the last complete sync remain unread when returning
+after a reload or sign-in. Incomplete coverage preserves the saved read state.
+
+Desktop notifications are opt-in while the page is open. Enable notifications
+requests browser permission through a button; the browser retains that permission
+separately from the saved dashboard preference. New Feed arrivals are grouped into
+bursts, deduplicated across supported browser tabs, and do not include Chai reports
+or suppressed occurrences. Suspended or closed tabs are not guaranteed to notify;
+there is no push subscription service. Authentication or stale coverage pauses
+notification delivery. Personal storage failures do not weaken action retry guards.
+
+An expired proxy session pauses background requests and provides Sign in again.
+Old data is marked stale and action delivery remains unconfirmed until reconciled.
+No pending mutation is replayed automatically after sign-in. The external proxy
+controls session lifetime; the core-ci deployment configures twelve hours.
+
+## Unmerged bot PRs
+
+The separate **Unmerged PRs** view lists open PRs in `openshift/release` from exact
+configured bot logins, including drafts and older PRs outside the Slack history
+window. Defaults are `redhat-chai-bot`, `openshift-bot` and `openshift-ci-robot`.
+Override with `--unmerged-pr-authors=login1,login2`, or use an empty value to disable
+the view. It is read-only and never merges PRs or posts GitHub comments.
+
+One server cache refreshes every five minutes, independent of browser requests.
+A complete paginated search supplies title, link, author, created/updated time,
+draft and labels. Incomplete or over-1,000-result searches fail explicitly; narrow
+the configured authors rather than treating a partial list as complete. Failures
+retain the last complete list with a stale indicator and last-sync timestamp.
+No per-PR CI or review queries are issued. GitHub rate limits and retry deadlines
+are respected independently of Slack. Implausible header-based delays are capped
+at six hours so a malformed response cannot suspend polling indefinitely.
+
+Public GitHub reads work anonymously. `--github-token-file` optionally supplies a
+server-only token with the access needed to read this public repository when a
+higher API quota is needed. It is not the Slack token and is never returned in
+snapshots or logs. Demo mode supplies synthetic PR data and makes no GitHub calls.
+
 ## Core-ci metrics
 
 The optional `monitoring` configuration targets deployment on core-ci. Its query
@@ -167,17 +220,32 @@ uses synthetic rule/graph data and never reads cluster credentials or metrics.
 
 ## Actions and persistence
 
-Acknowledge and Close investigation affect only the selected occurrence. Undo
-returns it to its previous workflow view. A later parent alert starts fresh.
+The UI calls acknowledgement **WIP** and shows the operator. Reading an alert is
+personal and does not acknowledge it. Each WIP, Snooze and Close dialog offers
+**This occurrence** or **Matching identifiers**. Regex previews use the server's
+Go regexp engine, show up to 200 current matching occurrences, and restrict scope
+to the selected channel and producer. Patterns match parsed source identifiers,
+not arbitrary message text. Regex requires a parsed identifier; individual actions
+do not. A stale revision is rejected before saving.
 
-Snooze creates a Go regexp rule scoped to this channel and producer. Its default
-is the escaped, anchored parsed identifier; the preview lets the operator edit it.
-The server sets expiry to the next **06:00 UTC**. Subsequent matching firings stay
-snoozed without extending the deadline. Expiry or Unsnooze restores each alert's
-prior Feed/Acknowledged view. Closed investigations remain closed. Unsnooze
-cancels the displayed rule for every occurrence it covers. With overlapping
-rules, another active rule may still apply. Snooze affects the dashboard workflow;
-Slack reporting and paging continue.
+Individual WIP stays assigned until released or closed. Regex WIP covers current
+and future matches until the next **06:00 UTC**; unfinished rule-owned occurrences
+then return to Feed. Explicit individual actions override older family assignment.
+The UI can release an individual occurrence or cancel its whole WIP rule.
+
+Individual Snooze covers only that occurrence. Regex Snooze covers current and
+future identifier matches in the same scope. Both expire at the next **06:00 UTC**,
+shown in browser-local time. Repeated firings do not extend the deadline. Unsnooze
+cancels the displayed rule; another overlapping rule may still apply. Expiry
+restores prior workflow, and closed investigations remain closed. Slack reporting
+and paging continue.
+
+Close affects individual occurrences permanently until reopened. Regex Close
+freezes the current preview's IDs and revisions and sends individual close actions
+sequentially. It never creates a rule for future firings. Partial progress remains
+visible and the browser retains the original plan and request IDs. Conflict,
+rejection or uncertain delivery stops the batch; resuming or discarding the
+remaining plan is explicit and never undoes already confirmed actions.
 
 Each accepted mutation saves a readable thread reply with a versioned
 `OPS_ALERT_ACTION_V1` record, request ID, actor/time, target and complete workflow
@@ -204,7 +272,10 @@ Unconfirmed requests are retained in per-user browser session storage across
 reloads, without storing credentials or CSRF tokens. Retry is always explicit.
 On uncertain delivery, check the thread and retry the **same** retained request.
 Do not create a new request to work around uncertainty. Unconfirmed retry guards
-are in memory; after a restart, recovery can prove only records retained by Slack.
+are in memory. An unconfirmed WIP family-rule cancellation pauses new actions
+across occurrences until that cancellation is reconciled, because later actions
+must not rely on a rule that might already be canceled. After a restart, recovery
+can prove only records retained by Slack.
 If its occurrence leaves the history window, the browser offers an explicit
 Dismiss expired local retry control. It clears only this browser's retry guard;
 delivery remains unconfirmed and the operator must check the original thread.
@@ -225,9 +296,9 @@ leave all dashboard views while their original messages remain in Slack.
 `slack.cutover` is optional and can set an earliest go-live date within that window.
 
 Recovery reads up to 24 additional hours of parent messages to preserve active
-snoozes whose original occurrence has left the visible window. With the default,
+daily Snooze and WIP rules whose original occurrence has left the visible window. With the default,
 the scan covers at most 72 hours. Buffer occurrences are hidden and cannot receive
-new actions. Current-day snoozes still expire at the next 06:00 UTC reset.
+new actions. Current-day rules still expire at the next 06:00 UTC reset.
 Reconciliation rescans this bounded history (default every minute), rereading
 threads when reply counts or latest-reply timestamps change. Browser refreshes
 read memory every 15 seconds, not Slack. Config changes require a process restart.
@@ -252,7 +323,14 @@ make lint
 ```
 
 The focused table-driven tests cover producer/classification trust, occurrence
-identity, scoped daily-reset snooze and replay, stale/idempotent/uncertain writes,
-Chai thread binding, HTTP authorization/CSRF, and Slack pagination. They use fixed
-clocks and in-memory Slack transports. There is no integration or browser test
-framework.
+identity, scoped daily-reset WIP/Snooze and replay, stale/idempotent/uncertain
+writes, Chai thread binding, HTTP authorization/CSRF, Slack pagination, and complete
+GitHub search caching. Browser logic unit cases run with Node when available and
+cover personal unread state, notification deduplication, safe formatting, and
+explicit recovery of partial close batches. Tests use fixed clocks and in-memory
+transports. There is no integration or browser test framework.
+
+Scoped workflow fields extend durable v1 records. New versions still read old
+records, but older binaries reject scoped fields during strict replay. Keep a
+compatible image for rollback while scoped records remain in retained history;
+do not delete shared action records to force an older writer to start.

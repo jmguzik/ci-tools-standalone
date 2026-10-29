@@ -128,14 +128,26 @@ type Workflow struct {
 	ClosedAt       *time.Time `json:"closed_at"`
 }
 
-// Snooze is a durable channel/source-scoped regular expression rule.
+// Snooze suppresses an occurrence or a channel/source identifier family.
 type Snooze struct {
+	Scope        string    `json:"scope,omitempty"`
+	OccurrenceID string    `json:"occurrence_id,omitempty"`
+	ID           string    `json:"id"`
+	Pattern      string    `json:"pattern"`
+	Source       string    `json:"source"`
+	Channel      string    `json:"channel"`
+	Actor        string    `json:"actor"`
+	Until        time.Time `json:"until"`
+}
+
+// WIPRule assigns matching current and future occurrences until the daily reset.
+type WIPRule struct {
 	ID      string    `json:"id"`
 	Pattern string    `json:"pattern"`
-	Source  string    `json:"source"`
-	Channel string    `json:"channel"`
 	Actor   string    `json:"actor"`
 	Until   time.Time `json:"until"`
+	Channel string    `json:"channel"`
+	Source  string    `json:"source"`
 }
 
 // Investigation is one same-thread Chai question and its delivery/reply state.
@@ -155,12 +167,14 @@ type Occurrence struct {
 	Classification Classification     `json:"classification"`
 	State          Workflow           `json:"state"`
 	View           string             `json:"view"`
+	WIPRule        *WIPRule           `json:"wip_rule,omitempty"`
 	Snooze         *Snooze            `json:"snooze"`
 	Investigation  *Investigation     `json:"investigation"`
 }
 
 // ActionRequest uses a stable request ID and optimistic revision for safe retries.
 type ActionRequest struct {
+	Scope            string `json:"scope,omitempty"`
 	OccurrenceID     string `json:"occurrence_id"`
 	Kind             string `json:"kind"`
 	ExpectedRevision string `json:"expected_revision"`

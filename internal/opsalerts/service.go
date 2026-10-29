@@ -2,6 +2,7 @@ package opsalerts
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
@@ -40,13 +41,16 @@ type pendingDelivery struct {
 
 // serviceCache is published atomically after a complete replay.
 type serviceCache struct {
-	Coverage    Coverage
-	Threads     map[string]threadCache
-	Occurrences map[string]Occurrence
-	Records     map[string]actionRecord
-	Rules       map[string]Snooze
-	Pending     map[string]pendingDelivery
-	Decorations decorationState
+	Coverage     Coverage
+	Threads      map[string]threadCache
+	Occurrences  map[string]Occurrence
+	Records      map[string]actionRecord
+	Rules        map[string]Snooze
+	WIPRules     map[string]WIPRule
+	WIPRevisions map[string]string
+	WIPOverrides map[string]string
+	Pending      map[string]pendingDelivery
+	Decorations  decorationState
 }
 
 // Service serializes recovery and mutations while keeping snapshots nonblocking.
@@ -75,7 +79,7 @@ func NewService(cfg Config, classifier *Classifier, archive Archive, clock Clock
 		clock = realClock{}
 	}
 	s := &Service{cfg: cfg, classifier: classifier, archive: archive, clock: clock, serial: make(chan struct{}, 1)}
-	s.cache = serviceCache{Coverage: Coverage{Phase: "catching_up", Cutover: s.historyStart(clock.Now(), 0)}, Threads: map[string]threadCache{}, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, Pending: map[string]pendingDelivery{}}
+	s.cache = serviceCache{Coverage: Coverage{Phase: "catching_up", Cutover: s.historyStart(clock.Now(), 0)}, Threads: map[string]threadCache{}, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, WIPRules: map[string]WIPRule{}, WIPRevisions: map[string]string{}, WIPOverrides: map[string]string{}, Pending: map[string]pendingDelivery{}}
 	return s, nil
 }
 
@@ -234,7 +238,7 @@ func (s *Service) Sync(ctx context.Context) error {
 
 // replay treats trusted action records as truth and orders rules across all threads.
 func (s *Service) replay(threads map[string]threadCache, pending map[string]pendingDelivery) (serviceCache, error) {
-	cache := serviceCache{Threads: threads, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, Pending: maps.Clone(pending)}
+	cache := serviceCache{Threads: threads, Occurrences: map[string]Occurrence{}, Records: map[string]actionRecord{}, Rules: map[string]Snooze{}, WIPRules: map[string]WIPRule{}, WIPRevisions: map[string]string{}, WIPOverrides: map[string]string{}, Pending: maps.Clone(pending)}
 	now := s.clock.Now()
 	reset := nextSixUTC(now).Add(-24 * time.Hour)
 	retainedThreads := map[string]threadCache{}
@@ -297,7 +301,7 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		o = enrichInvestigation(o, investigationTimestamps[o.Identity.ID], timed.Timestamp)
 		// Rules expire by action time even when Slack confirms the post after reset.
 		historicalRule := r.At.Before(reset)
-		if err := validateTransition(o, r, cache.Rules, historicalRule); err != nil {
+		if err := validateTransition(o, r, cache, historicalRule); err != nil {
 			return cache, fmt.Errorf("trusted action at %s: %w", timed.Timestamp, err)
 		}
 		o.State, o.Investigation, o.Identity.Revision = r.State, r.Investigation, timed.Timestamp
@@ -312,6 +316,16 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 				}
 			}
 		}
+		if r.WIPRule != nil {
+			cache.WIPRules[r.WIPRule.ID] = *r.WIPRule
+			cache.WIPRevisions[r.WIPRule.ID] = timed.Timestamp
+		}
+		if r.Unwip != "" {
+			delete(cache.WIPRules, r.Unwip)
+		}
+		if (r.Request.Kind == "acknowledge" || r.Request.Kind == "unacknowledge") && r.Request.Scope != "regex" {
+			cache.WIPOverrides[o.Identity.ID] = timed.Timestamp
+		}
 		if r.Snooze != nil && !historicalRule {
 			cache.Rules[r.Snooze.ID] = *r.Snooze
 		}
@@ -321,6 +335,12 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 	}
 	for id, o := range cache.Occurrences {
 		cache.Occurrences[id] = enrichInvestigation(o, investigationTimestamps[o.Identity.ID], "")
+	}
+	for id, rule := range cache.WIPRules {
+		if !now.Before(rule.Until) {
+			delete(cache.WIPRules, id)
+			delete(cache.WIPRevisions, id)
+		}
 	}
 	cache.Threads = retainedThreads
 	for id, attempt := range cache.Pending {
@@ -404,7 +424,22 @@ func effectiveOccurrence(o Occurrence, cache serviceCache, now time.Time) Occurr
 			o.Investigation = &value
 		}
 	}
-	o.View, o.Snooze = "feed", nil
+	o.View, o.Snooze, o.WIPRule = "feed", nil, nil
+	for _, rule := range cache.WIPRules {
+		revision := cache.WIPRevisions[rule.ID]
+		override := cache.WIPOverrides[o.Identity.ID]
+		if !now.Before(rule.Until) || rule.Channel != o.Identity.Channel || rule.Source != o.Message.Source || override != "" && !timestampLess(override, revision) || !matchesPattern(rule.Pattern, o.Message.Identifiers) {
+			continue
+		}
+		if o.WIPRule == nil || timestampLess(cache.WIPRevisions[o.WIPRule.ID], revision) {
+			value := rule
+			o.WIPRule = &value
+		}
+	}
+	if o.WIPRule != nil && o.State.ClosedAt == nil {
+		at := cache.Records[o.WIPRule.ID].At
+		o.State.AcknowledgedBy, o.State.AcknowledgedAt = o.WIPRule.Actor, &at
+	}
 	if o.State.AcknowledgedAt != nil {
 		o.View = "acknowledged"
 	}
@@ -412,16 +447,11 @@ func effectiveOccurrence(o Occurrence, cache serviceCache, now time.Time) Occurr
 		if !now.Before(rule.Until) || rule.Channel != o.Identity.Channel || rule.Source != o.Message.Source {
 			continue
 		}
-		rx, err := regexp.Compile(rule.Pattern)
-		if err != nil {
-			continue
-		} // Durable rules were validated during replay.
-		for _, identifier := range o.Message.Identifiers {
-			if rx.MatchString(identifier) && (o.Snooze == nil || rule.ID > o.Snooze.ID) {
-				value := rule
-				o.Snooze = &value
-				o.View = "snoozed"
-			}
+		matched := rule.Scope == "occurrence" && rule.OccurrenceID == o.Identity.ID || rule.Scope != "occurrence" && matchesPattern(rule.Pattern, o.Message.Identifiers)
+		if matched && (o.Snooze == nil || rule.ID > o.Snooze.ID) {
+			value := rule
+			o.Snooze = &value
+			o.View = "snoozed"
 		}
 	}
 	if o.State.ClosedAt != nil {
@@ -430,7 +460,38 @@ func effectiveOccurrence(o Occurrence, cache serviceCache, now time.Time) Occurr
 	if o.Classification.Category == "chai_reports" {
 		o.View = "chai_reports"
 	}
+	baseRevision := o.Identity.Revision
+	if raw, exists := cache.Occurrences[o.Identity.ID]; exists {
+		baseRevision = raw.Identity.Revision
+	}
+	ruleID := ""
+	if o.WIPRule != nil {
+		ruleID = o.WIPRule.ID
+	}
+	o.Identity.Revision = workflowRevision(baseRevision, ruleID)
 	return o
+}
+
+// workflowRevision binds optimistic concurrency to the displayed family assignment.
+func workflowRevision(baseRevision, ruleID string) string {
+	if ruleID == "" {
+		return baseRevision
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(baseRevision+"\x00"+ruleID)))
+}
+
+// matchesPattern evaluates validated durable rules against stable identifiers.
+func matchesPattern(pattern string, identifiers []string) bool {
+	rx, err := regexp.Compile(pattern)
+	if err != nil {
+		return false
+	}
+	for _, identifier := range identifiers {
+		if rx.MatchString(identifier) {
+			return true
+		}
+	}
+	return false
 }
 
 // reactionPresence distinguishes uncertain startup metadata from confirmed writes.

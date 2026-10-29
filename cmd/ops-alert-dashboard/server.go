@@ -37,6 +37,12 @@ var webFiles embed.FS
 type alertService interface {
 	Snapshot() opsalerts.Snapshot
 	Act(context.Context, string, opsalerts.ActionRequest) (opsalerts.Occurrence, error)
+	Preview(opsalerts.PreviewRequest) ([]opsalerts.Occurrence, error)
+}
+
+// pullRequestSource serves the shared GitHub cache without making request-driven API calls.
+type pullRequestSource interface {
+	Snapshot() pullRequestSnapshot
 }
 
 // accessConfig describes the authenticated reverse proxy, never browser-supplied identity.
@@ -66,15 +72,18 @@ type dashboard struct {
 	csrfKey         []byte
 	sopClient       sopHTTPClient
 	metricsProvider metricsProvider
+	channelName     string
+	pullRequests    pullRequestSource
 }
 
 // snapshotResponse supplies browser identity and CSRF protection alongside cached state.
 type snapshotResponse struct {
 	opsalerts.Snapshot
-	User       string           `json:"user"`
-	CSRFToken  string           `json:"csrf_token"`
-	Demo       bool             `json:"demo"`
-	Monitoring monitoringStatus `json:"monitoring"`
+	User        string           `json:"user"`
+	CSRFToken   string           `json:"csrf_token"`
+	Demo        bool             `json:"demo"`
+	Monitoring  monitoringStatus `json:"monitoring"`
+	ChannelName string           `json:"channel_name"`
 }
 
 // actionResponse returns the committed occurrence after a confirmed Slack write.
@@ -246,13 +255,21 @@ func (d *dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/snapshot":
-		writeJSON(w, http.StatusOK, snapshotResponse{Snapshot: d.service.Snapshot(), User: actor, CSRFToken: d.csrfToken(actor), Demo: d.access.demo, Monitoring: monitoringStatus{Enabled: d.metricsProvider != nil, Source: "core-ci"}})
+		writeJSON(w, http.StatusOK, snapshotResponse{Snapshot: d.service.Snapshot(), User: actor, CSRFToken: d.csrfToken(actor), Demo: d.access.demo, Monitoring: monitoringStatus{Enabled: d.metricsProvider != nil, Source: "core-ci"}, ChannelName: d.channelName})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/unmerged-prs":
+		if d.pullRequests == nil {
+			writeJSON(w, http.StatusOK, pullRequestSnapshot{Phase: "disabled", PRs: []pullRequest{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, d.pullRequests.Snapshot())
 	case r.Method == http.MethodGet && r.URL.Path == "/api/metrics":
 		d.metrics(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/sop":
 		d.sop(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/actions":
 		d.action(w, r, actor)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/action-preview":
+		d.preview(w, r, actor)
 	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/app.js" || r.URL.Path == "/style.css"):
 		d.files.ServeHTTP(w, r)
 	default:
