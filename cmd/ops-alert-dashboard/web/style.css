@@ -746,13 +746,55 @@ main {
   margin-top: 14px;
 }
 
-.report-body ul {
+.report-body ul,.report-body ol {
   margin-bottom: 0;
   padding-left: 22px;
 }
 
 .report-body li + li {
   margin-top: 6px;
+}
+
+.report-body blockquote {
+  border-left: 3px solid var(--line);
+  margin-left: 0;
+  padding-left: 14px;
+  color: var(--muted);
+}
+
+.report-body code {
+  font-family: ui-monospace, monospace;
+  background: var(--soft);
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.report-body pre {
+  overflow-x: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  white-space: pre;
+}
+
+.report-body pre code {
+  padding: 0;
+  background: none;
+}
+
+.report-table {
+  overflow-x: auto;
+}
+
+.report-table table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.report-table th,.report-table td {
+  border: 1px solid var(--line);
+  padding: 7px 10px;
+  text-align: left;
 }
 
 .report-detail details {

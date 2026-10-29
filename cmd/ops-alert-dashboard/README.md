@@ -96,6 +96,14 @@ and using proxy authorization in demo mode are rejected.
   labeled coverage and limits remain visible alongside the findings. Presentation keeps
   the original wording and full source, without inferring health from prose or
   treating Green as a successful scan. Unknown report formats remain readable.
+  Latest and historical reports render a safe Markdown subset: headings,
+  paragraphs, ordered and unordered lists (up to eight nesting levels), indented
+  list continuations, blockquotes, fenced code, inline code, simple pipe tables,
+  HTTPS Markdown links and Slack links/emoji. Double stars render bold; single
+  stars retain Slack bold semantics, underscores render emphasis, and tildes
+  render strikethrough. Fence language markers are omitted from code content.
+  HTML and remote images are never rendered. Original source remains available
+  unchanged; readable coverage excerpts use the same display time conversion.
   Ordinary Chai conversations do not create alerts. Demo examples use the six
   recurring task envelopes with entirely synthetic findings. Healthy scheduled
   scans may deliberately post nothing, so absence of a report does not establish
@@ -127,11 +135,17 @@ synthetic, while their SOP previews read the real public documentation on reques
 
 ## Browser preferences and presentation
 
-Times use the browser's local timezone, including daylight saving. The channel
-name defaults to `ops-testplatform`; set `--slack-channel-name` when configuring a
-different channel. The UI displays channel names in cards, dialogs and rules.
-Titles prefer parsed identifiers, with source firing/resolved status shown
-separately. Prow run links remain directly accessible. Message evidence supports
+Times use the browser's local timezone, including daylight saving. Readable Slack
+and Chai report prose also converts explicit UTC ISO timestamps (`Z`, `+00:00`
+or `+0000`) and `YYYY-MM-DD HH:mm[:ss] UTC` values, showing the local UTC offset.
+Clock-only `H:mm[:ss] UTC` values use that occurrence or report's UTC calendar
+date, including each historical report and Slack reply's own timestamp. Without
+a source date, clock-only values remain literal. Naive times, code and link
+URLs are preserved; Original Slack disclosures retain the exact source text.
+The channel name defaults to `ops-testplatform`; set `--slack-channel-name` when
+configuring a different channel. The UI displays channel names in cards, dialogs and rules.
+Titles prefer parsed identifiers and preserve a leading source 🚨, with source
+firing/resolved status shown separately. Prow run links remain directly accessible. Message evidence supports
 safe Slack formatting and common Unicode emoji aliases; unsupported custom emoji
 remain readable. Raw message HTML is never executed.
 

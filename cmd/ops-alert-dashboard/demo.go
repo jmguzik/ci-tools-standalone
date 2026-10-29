@@ -180,7 +180,12 @@ Read-only demo scan; no resources were changed.`},
 	}
 	for i, task := range tasks {
 		header := "[Scheduled task: `" + task.id + "` | Instructions: `config/groups/test-platform/personas/ops_testplatform/scheduled_tasks/" + task.instructions + "`]"
-		body := header + "\n" + task.body + "\n[Ops Test Platform](Sol:High) AI Generated - Check for accuracy.\nSynthetic demo report; all findings above are illustrative."
+		body := header + "\n" + task.body
+		if i == 0 {
+			body += "\n\nObserved snapshot: " + now.Add(-90*time.Minute).UTC().Format(time.RFC3339) + ". Last sampling boundary: 14:30 UTC."
+			body += "\n\n## Read-only checks\n\n1. **Inspect pending pods** and their scheduling events.\n2. Compare the _observed_ requests with eligible capacity.\n\n```sh\noc get pods -n synthetic-demo\n```\n\n| Evidence | Result |\n| --- | --- |\n| <https://example.org/evidence|Synthetic pod evidence> | `Pending` |\n\n> This example is synthetic; do not infer live cluster health from it."
+		}
+		body += "\n[Ops Test Platform](Sol:High) AI Generated - Check for accuracy.\nSynthetic demo report; all findings above are illustrative."
 		report := demoMessage(now, time.Duration(90+i)*time.Minute, "U_CHAI", "B_CHAI", body)
 		if i != 1 {
 			report.Metadata = slack.SlackMetadata{EventType: "scheduled_report", EventPayload: map[string]interface{}{"scheduled_task": task.id}}

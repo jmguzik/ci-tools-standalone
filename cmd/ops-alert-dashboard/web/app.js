@@ -13,6 +13,27 @@
   const text = value => String(value || '');
   /** Use the browser's timezone rules so daylight-saving changes need no manual offset. */
   const date = value => { const d = new Date(value); return Number.isFinite(d.getTime()) ? new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(d) : 'Not available'; };
+  /** localUTC formats validated explicit UTC timestamps; clock-only values need a source UTC date. */
+  function localUTC(value, reference) {
+    const full = value.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(?:Z|\+00:?00| UTC)$/);
+    const clock = value.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))? UTC$/);
+    let day, hour, minute, second, fraction = '';
+    if (full) [, day, hour, minute, second, fraction = ''] = full;
+    else if (clock && reference !== undefined && reference !== null && reference !== '') {
+      const anchor = new Date(reference);
+      if (!Number.isFinite(anchor.getTime())) return value;
+      day = anchor.toISOString().slice(0, 10); [, hour, minute, second] = clock;
+    } else return value;
+    if (Number(hour) > 23 || Number(minute) > 59 || Number(second || 0) > 59) return value;
+    const instant = new Date(day + 'T' + hour.padStart(2, '0') + ':' + minute + ':' + (second || '00') + fraction + 'Z');
+    if (!Number.isFinite(instant.getTime()) || instant.toISOString().slice(0, 10) !== day) return value;
+    return new Intl.DateTimeFormat(undefined, {year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', ...(second ? {second: '2-digit'} : {}), timeZoneName: 'shortOffset'}).format(instant);
+  }
+  /** localProse converts only UTC prose, leaving URLs, markup links and code literal. */
+  function localProse(source, reference) {
+    const tokens = /```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`+[^`\n]+`+|<[^>\n]+>|!?\[[^\]\n]*\]\([^\s)]+\)|[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>]+|\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|\+00:?00)| \d{1,2}:\d{2}(?::\d{2})? UTC)\b(?![+-])|\b\d{1,2}:\d{2}(?::\d{2})? UTC\b(?![+-])/g;
+    return text(source).replace(tokens, token => localUTC(token, reference));
+  }
   const items = () => state.snapshot?.occurrences || [];
   /** Keep writes disabled until identity, coverage and retained delivery guards agree. */
   const ready = () => !state.authPaused && (!state.batch || state.batch.index === state.batch.requests.length) && state.snapshot?.status?.phase === 'ready' && !state.fetchError && !state.sending && !state.pending && !state.storageError && state.storageUser === state.snapshot?.user;
@@ -21,13 +42,16 @@
   /** Prefer parsed identifiers while retaining the complete source text in the inspector. */
   const displayTitle = occurrence => {
     const identifiers = occurrence.message.identifiers || [];
-    if (identifiers.length) return identifiers.join(' · ');
-    return plainSlack(text(occurrence.message.title).replace(/\[\s*ops_color=[^\]]*\]/gi, '')).replace(/\s+/g, ' ').trim() || 'Untitled occurrence';
+    const sourceTitle = text(occurrence.message.title).replace(/\[\s*ops_color=[^\]]*\]/gi, '');
+    const title = plainSlack(sourceTitle).replace(/\s+/g, ' ').trim();
+    const prefix = title.startsWith('🚨') ? '🚨 ' : '';
+    if (identifiers.length) return prefix + (prefix ? identifiers.join(' · ').replace(/^(?:🚨\s*)+/, '') : identifiers.join(' · '));
+    return plainSlack(localProse(sourceTitle, occurrence.message.reported_at)).replace(/\s+/g, ' ').trim() || 'Untitled occurrence';
   };
   /** Keep useful identifier evidence without repeating a cleaned title. */
   function identifierSubtitle(title, identifiers = []) {
     const label = identifiers.join(' · ');
-    return label && label !== title ? node('span', label, 'identifier') : null;
+    return label && label.replace(/^(?:🚨\s*)+/, '') !== title.replace(/^(?:🚨\s*)+/, '') ? node('span', label, 'identifier') : null;
   }
   /** Reserve the red badge for alerts that still need personal attention. */
   function feedUnreadBadge(count) {
@@ -59,30 +83,30 @@
     return emojify(decodeSlack(value)).replace(/<([^>|]+)\|([^>]+)>/g, '$2').replace(/<(https:\/\/[^>]+)>/g, '$1').replace(/[*_~`]/g, '');
   }
   /** Render only supported Slack tokens as safe DOM nodes with bounded nesting. */
-  function slackInline(container, source, depth = 0) {
-    if (depth > 8) { container.append(node('span', emojify(decodeSlack(source)))); return; }
-    const tokens = /(`)([^`\n]+)`|<([^>\n]+)>|([*_~])([^\n]+?)\4|https:\/\/[^\s<>]+|:[a-z0-9_+-]+:/g;
+  function slackInline(container, source, reference, depth = 0) {
+    if (depth > 8) { container.append(node('span', localProse(emojify(decodeSlack(source)), reference))); return; }
+    const tokens = /(`)([^`\n]+)`|<([^>\n]+)>|([*_~])([^\n]+?)\4|https:\/\/[^\s<>]+|:[a-z_+-][a-z0-9_+-]*:/g;
     let cursor = 0;
     for (const match of source.matchAll(tokens)) {
-      container.append(node('span', emojify(decodeSlack(source.slice(cursor, match.index)))));
+      container.append(node('span', localProse(emojify(decodeSlack(source.slice(cursor, match.index))), reference)));
       if (match[1]) container.append(node('code', decodeSlack(match[2])));
       else if (match[3]) {
         const [target, supplied] = match[3].split('|');
         const group = target.match(/^!subteam\^([A-Z0-9]+)$/);
         const channel = target.match(/^#([A-Z0-9]+)$/);
         const label = group ? supplied || state.snapshot?.usergroups?.[group[1]] || 'User group' : channel ? supplied || channelName() : supplied || target;
-        const anchor = link(decodeSlack(target), emojify(decodeSlack(label)));
-        container.append(anchor || node('span', group ? '@' + label.replace(/^@/, '') : channel ? '#' + label.replace(/^#/, '') : decodeSlack(label)));
+        const anchor = link(decodeSlack(target), localProse(emojify(decodeSlack(label)), reference));
+        container.append(anchor || node('span', group ? '@' + label.replace(/^@/, '') : channel ? '#' + label.replace(/^#/, '') : localProse(decodeSlack(label), reference)));
       } else if (match[4]) {
         const tag = {'*': 'strong', '_': 'em', '~': 's'}[match[4]], wrapper = node(tag);
-        slackInline(wrapper, match[5], depth + 1); container.append(wrapper);
+        slackInline(wrapper, match[5], reference, depth + 1); container.append(wrapper);
       } else container.append(link(decodeSlack(match[0]), decodeSlack(match[0])) || node('span', emojify(match[0])));
       cursor = match.index + match[0].length;
     }
-    container.append(node('span', emojify(decodeSlack(source.slice(cursor)))));
+    container.append(node('span', localProse(emojify(decodeSlack(source.slice(cursor))), reference)));
   }
   /** Preserve readable message structure while keeping code and evidence inert. */
-  function slackBody(source) {
+  function slackBody(source, reference) {
     const body = node('div', null, 'slack-body');
     const parts = text(source).split(/```/);
     parts.forEach((part, index) => {
@@ -92,11 +116,11 @@
         const bullet = line.match(/^\s*(?:[•*-]|\d+[.)])\s+(.+)$/);
         if (bullet) {
           if (!list) { list = node('ul'); body.append(list); }
-          const item = node('li'); slackInline(item, bullet[1]); list.append(item); continue;
+          const item = node('li'); slackInline(item, bullet[1], reference); list.append(item); continue;
         }
         list = null;
         const quote = line.match(/^&gt;\s?(.*)$|^>\s?(.*)$/);
-        const row = node(quote ? 'blockquote' : 'div'); slackInline(row, quote ? quote[1] ?? quote[2] : line);
+        const row = node(quote ? 'blockquote' : 'div'); slackInline(row, quote ? quote[1] ?? quote[2] : line, reference);
         if (!line) row.append(node('br')); body.append(row);
       }
     });
@@ -461,13 +485,13 @@
       const investigation = o.investigation;
       const box = node('div', null, 'investigation');
       append(box, node('h3', '✧ Chai · ' + statusLabel(investigation.status)), node('p', investigation.question, 'evidence'), node('p', 'Requested by ' + investigation.requested_by + ' · ' + date(investigation.requested_at) + ' · ' + investigation.request_id, 'fine'));
-      if (investigation.reply) append(box, node('h3', 'Chai reply'), node('p', investigation.reply, 'evidence'));
+      if (investigation.reply) append(box, node('h3', 'Chai reply'), slackBody(investigation.reply));
       container.append(box);
     }
-    append(container, node('h3', 'Source evidence', 'section-head'), slackBody(o.message.text || 'No message text supplied.'), append(node('details', null, 'original-evidence'), node('summary', 'Original Slack text'), node('pre', o.message.text, 'evidence')), node('p', 'A resolved message does not close an investigation automatically.', 'fine'), node('h3', 'Thread evidence & shared history', 'section-head'));
+    append(container, node('h3', 'Source evidence', 'section-head'), slackBody(o.message.text || 'No message text supplied.', o.message.reported_at), append(node('details', null, 'original-evidence'), node('summary', 'Original Slack text'), node('pre', o.message.text, 'evidence')), node('p', 'A resolved message does not close an investigation automatically.', 'fine'), node('h3', 'Thread evidence & shared history', 'section-head'));
     for (const reply of o.message.replies || []) {
       const box = node('article', null, 'reply');
-      append(box, node('p', (reply.is_chai ? 'Chai · ' : '') + reply.user + ' · ' + slackDate(reply.timestamp), 'fine'), slackBody(reply.text)); container.append(box);
+      append(box, node('p', (reply.is_chai ? 'Chai · ' : '') + reply.user + ' · ' + slackDate(reply.timestamp), 'fine'), slackBody(reply.text, slackTime(reply.timestamp))); container.append(box);
     }
     if (!(o.message.replies || []).length) container.append(node('p', 'No retained thread replies.', 'fine'));
   }
@@ -752,7 +776,9 @@
     });
     container.append(details);
   }
-  function slackDate(value) { return /^\d+\.\d+$/.test(text(value)) ? date(Number(value) * 1000) : date(value); }
+  /** slackTime retains the instant when Slack supplies fractional epoch seconds. */
+  function slackTime(value) { return /^\d+\.\d+$/.test(text(value)) ? Number(value) * 1000 : value; }
+  function slackDate(value) { return date(slackTime(value)); }
   const reportLabels = {
     pending_workloads_scan: 'Pending workloads',
     capacity_autoscale_snapshot: 'Capacity & autoscaling',
@@ -772,36 +798,120 @@
     return text(o.message.text).replace(/^\s*\[Scheduled task:[^\]\n]+\]\s*\n?/i, '').trim();
   }
   function reportHeadline(o) {
-    return reportBody(o).split('\n').find(line => line.trim())?.trim() || 'No report text supplied.';
+    return localProse(reportBody(o).split('\n').find(line => line.trim())?.trim(), o.message.reported_at) || 'No report text supplied.';
   }
-  function renderReportBody(container, source) {
-    const lines = source.split('\n');
+  /** reportInline keeps inline markup inert, with Slack stars treated as bold and bounded nesting. */
+  function reportInline(container, source, reference, depth = 0) {
+    if (depth >= 8) { container.append(node('span', localProse(emojify(decodeSlack(source)), reference))); return; }
+    const tokens = /!\[[^\]\n]*\]\([^\s)]*\)|(`+)([^`\n]+)\1|(?<!!)\[([^\]\n]+)\]\(([^\s)]+)\)|<[^>\n]+>|(\*\*|__|~~|[*_~])([^\n]+?)\5|https:\/\/[^\s<>]+|:[a-z_+-][a-z0-9_+-]*:/g;
+    let cursor = 0;
+    for (const match of source.matchAll(tokens)) {
+      container.append(node('span', localProse(emojify(decodeSlack(source.slice(cursor, match.index))), reference)));
+      if (match[0].startsWith('![')) container.append(node('span', emojify(decodeSlack(match[0]))));
+      else if (match[1]) container.append(node('code', decodeSlack(match[2])));
+      else if (match[3]) {
+        const anchor = link(decodeSlack(match[4]), localProse(emojify(decodeSlack(match[3])), reference));
+        container.append(anchor || node('span', emojify(decodeSlack(match[0]))));
+      } else if (match[5]) {
+        const wrapper = node({'**': 'strong', '__': 'strong', '*': 'strong', '_': 'em', '~~': 's', '~': 's'}[match[5]]);
+        reportInline(wrapper, match[6], reference, depth + 1); container.append(wrapper);
+      } else slackInline(container, match[0], reference);
+      cursor = match.index + match[0].length;
+    }
+    container.append(node('span', localProse(emojify(decodeSlack(source.slice(cursor))), reference)));
+  }
+  /** reportBlock creates blocks with inline formatting without enabling HTML or remote images. */
+  function reportBlock(tag, source, reference) {
+    const block = node(tag); reportInline(block, source, reference); return block;
+  }
+  /** reportCells preserves pipes in balanced Slack tokens, inline code and escaped text. */
+  function reportCells(line) {
+    const source = line.trim(), protectedTokens = new Map();
+    for (const match of source.matchAll(/<[^<>\n]+>|(`+)[^`\n]+\1/g)) protectedTokens.set(match.index, match[0]);
+    const cells = [];
+    let cell = '';
+    for (let index = 0; index < source.length; index++) {
+      const token = protectedTokens.get(index);
+      if (token) { cell += token; index += token.length - 1; continue; }
+      if (source[index] === '\\' && source[index + 1] === '\\') { cell += '\\\\'; index++; continue; }
+      if (source[index] === '\\' && source[index + 1] === '|') { cell += '|'; index++; continue; }
+      if (source[index] === '|') { cells.push(cell.trim()); cell = ''; continue; }
+      cell += source[index];
+    }
+    cells.push(cell.trim());
+    if (source.startsWith('|')) cells.shift();
+    if (!cells[cells.length - 1] && source.endsWith('|')) cells.pop();
+    return cells;
+  }
+  /** renderReportBody parses the report subset with at most eight quote and list levels. Source evidence is separate. */
+  function renderReportBody(container, source, reference, depth = 0) {
+    if (!source) { container.append(node('p', 'No report text supplied.', 'muted')); return; }
+    if (depth >= 8) { container.append(node('p', localProse(source, reference))); return; }
+    const lines = source.replace(/\r\n?/g, '\n').split('\n');
     let paragraph = [];
-    let bullets = null;
+    let lists = [];
     const flush = () => {
-      if (paragraph.length) container.append(node('p', paragraph.join('\n')));
+      if (paragraph.length) container.append(reportBlock('p', paragraph.join('\n'), reference));
       paragraph = [];
     };
     for (let index = 0; index < lines.length; index++) {
       const line = lines[index];
-      const bullet = line.match(/^\s*(?:[•*-]|\d+[.)])\s+(.+)$/);
-      if (!line.trim()) { flush(); bullets = null; continue; }
-      if (bullet) {
+      const opening = sopFence(line);
+      if (opening) {
         flush();
-        if (!bullets) { bullets = node('ul'); container.append(bullets); }
-        bullets.append(node('li', bullet[1]));
+        const command = [];
+        while (++index < lines.length && !closesSOPFence(lines[index], opening[1])) command.push(lines[index]);
+        const destination = lists.length && /^\s/.test(line) ? lists[lists.length - 1].last : container;
+        destination.append(append(node('pre'), node('code', decodeSlack(command.join('\n')))));
+        if (destination === container) lists = [];
         continue;
       }
-      bullets = null;
-      const next = lines[index + 1] || '';
-      const heading = line.match(/^#{1,6}\s+(.+)$/);
-      if (heading || (!paragraph.length && line.length <= 160 && /^\s*[•*-]\s+/.test(next))) {
-        flush(); container.append(node('h3', heading ? heading[1] : line)); continue;
+      if (!line.trim()) { flush(); continue; }
+      const quote = line.match(/^\s*(?:>|&gt;) ?(.*)$/);
+      if (quote) {
+        flush(); lists = [];
+        const quoted = [quote[1]];
+        while (index + 1 < lines.length) {
+          const next = lines[index + 1].match(/^\s*(?:>|&gt;) ?(.*)$/);
+          if (!next) break;
+          quoted.push(next[1]); index++;
+        }
+        const block = node('blockquote'); renderReportBody(block, quoted.join('\n'), reference, depth + 1); container.append(block); continue;
       }
-      paragraph.push(line);
+      const heading = sopHeading(line);
+      if (heading) { flush(); lists = []; container.append(reportBlock('h' + Math.min(6, heading[1].length + 2), heading[2], reference)); continue; }
+      if (line.includes('|') && /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1] || '')) {
+        flush(); lists = [];
+        const table = node('table'), head = node('tr');
+        reportCells(line).forEach(cell => head.append(reportBlock('th', cell, reference)));
+        table.append(append(node('thead'), head));
+        const body = node('tbody'); index++;
+        while (index + 1 < lines.length && lines[index + 1].trim() && lines[index + 1].includes('|')) {
+          const row = node('tr'); reportCells(lines[++index]).forEach(cell => row.append(reportBlock('td', cell, reference))); body.append(row);
+        }
+        table.append(body); container.append(append(node('div', null, 'report-table'), table)); continue;
+      }
+      const bullet = line.match(/^(\s*)([•+*-]|\d+[.)])\s+(.+)$/);
+      if (bullet) {
+        flush(); const indent = bullet[1].replace(/\t/g, '    ').length, type = /^\d/.test(bullet[2]) ? 'ol' : 'ul';
+        while (lists.length && lists[lists.length - 1].indent > indent) lists.pop();
+        if (lists.length && lists[lists.length - 1].indent === indent && lists[lists.length - 1].type !== type) lists.pop();
+        if (!lists.length || lists[lists.length - 1].indent < indent && lists.length < 8) {
+          const list = node(type);
+          if (type === 'ol') list.start = parseInt(bullet[2], 10);
+          (lists.length ? lists[lists.length - 1].last : container).append(list);
+          lists.push({indent, type, list, last: null});
+        }
+        const current = lists[lists.length - 1]; current.last = reportBlock('li', bullet[3], reference); current.list.append(current.last); continue;
+      }
+      if (lists.length && /^\s+/.test(line)) {
+        const indent = line.match(/^\s*/)[0].replace(/\t/g, '    ').length;
+        while (lists.length > 1 && lists[lists.length - 1].indent >= indent) lists.pop();
+        lists[lists.length - 1].last.append(reportBlock('p', line.trim(), reference)); continue;
+      }
+      lists = []; paragraph.push(line);
     }
     flush();
-    if (!source) container.append(node('p', 'No report text supplied.', 'muted'));
   }
   function reportCoverage(source) {
     const lines = source.split('\n');
@@ -864,15 +974,15 @@
     append(detail, append(node('div', null, 'report-detail-meta'), badge(latest), node('time', 'Latest · ' + date(latest.message.reported_at), 'fine')), node('h2', reportLabel(task)), node('p', task, 'identifier'), link(latest.message.slack_url, '↗ Open latest report in Slack'));
     const body = reportBody(latest);
     const coverage = reportCoverage(body);
-    if (coverage) append(detail, append(node('aside', null, 'report-coverage'), node('h3', 'Source coverage & limits'), node('p', coverage)));
-    const readable = node('div', null, 'report-body'); renderReportBody(readable, body);
+    if (coverage) append(detail, append(node('aside', null, 'report-coverage'), node('h3', 'Source coverage & limits'), node('p', localProse(coverage, latest.message.reported_at))));
+    const readable = node('div', null, 'report-body'); renderReportBody(readable, body, latest.message.reported_at);
     append(detail, readable, originalReport(latest));
     const previous = history.slice(1);
     const archive = reportDisclosure('archive:' + task, 'report-archive');
     archive.append(node('summary', 'Earlier reports · ' + previous.length + ' retained'));
     for (const report of previous) {
       const entry = reportDisclosure('history:' + id(report), 'report-history');
-      const content = node('div', null, 'report-body'); renderReportBody(content, reportBody(report));
+      const content = node('div', null, 'report-body'); renderReportBody(content, reportBody(report), report.message.reported_at);
       append(entry, node('summary', date(report.message.reported_at)), link(report.message.slack_url, '↗ Open report in Slack'), content, originalReport(report));
       archive.append(entry);
     }
