@@ -2,14 +2,12 @@
 # pylint: disable=E0401, C0413
 
 import click
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import NotFound, PermissionDenied
 from google.cloud import secretmanager
 from util import (
     PROJECT_ID,
     ensure_authentication,
     get_secret_name,
-    get_secrets_from_index,
-    update_index_secret,
     validate_collection,
     validate_path,
 )
@@ -32,13 +30,7 @@ def delete(collection: str, secret_path: str):
     """
 
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication(client, collection)
-
-    index_secrets = get_secrets_from_index(client, collection)
-    secret_id_normalized = secret_path.replace("/", "__")
-    if secret_id_normalized in index_secrets:
-        index_secrets.remove(secret_id_normalized)
-        update_index_secret(client, collection, index_secrets)
+    ensure_authentication()
 
     try:
         click.echo(f"Deleting secret '{secret_path}'...")
@@ -48,6 +40,10 @@ def delete(collection: str, secret_path: str):
     except NotFound:
         raise click.ClickException(
             f"Secret '{secret_path}' does not exist within the collection."
+        )
+    except PermissionDenied:
+        raise click.ClickException(
+            f"You don't have permission to delete secrets in collection '{collection}'."
         )
     except Exception as e:
         raise click.ClickException(

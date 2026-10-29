@@ -28,7 +28,7 @@ def get_service_account(collection: str):
     """Retrieve the service account associated with a secret collection."""
 
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication(client, collection)
+    ensure_authentication()
     secret_id = get_secret_name(collection, UPDATER_SA_SECRET_NAME)
     name = client.secret_version_path(PROJECT_ID, secret_id, "latest")
 

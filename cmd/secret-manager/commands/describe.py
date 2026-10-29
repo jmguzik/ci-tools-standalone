@@ -50,7 +50,7 @@ def describe(output: str, collection: str, secret_path: str):
     """
 
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication(client, collection)
+    ensure_authentication()
 
     full_secret_path = client.secret_path(
         PROJECT_ID, get_secret_name(collection, secret_path)

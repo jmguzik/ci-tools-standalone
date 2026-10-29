@@ -11,7 +11,6 @@ from util import (
     destroy_previous_versions,
     ensure_authentication,
     get_secret_name,
-    get_secrets_from_index,
     validate_collection,
     validate_path,
     validate_secret_source,
@@ -46,42 +45,20 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
 
     validate_secret_source(from_file, from_literal)
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication(client, collection)
+    ensure_authentication()
 
-    # Check if secret exists in both index and GSM
-    path_normalized = secret_path.replace("/", "__")
-    index_secrets = get_secrets_from_index(client, collection)
-    secret_in_index = path_normalized in index_secrets
     full_secret_path = client.secret_path(PROJECT_ID, get_secret_name(collection, secret_path))
     try:
         client.get_secret(request={"name": full_secret_path})
-        secret_in_gsm = True
     except PermissionDenied as e:
         raise click.ClickException(
             f"You don't have permission to access secrets in collection '{collection}'"
         ) from e
-    except NotFound:
-        secret_in_gsm = False
-
-    # Simple existence checks - tell user to delete/recreate if inconsistent
-    if not secret_in_index and not secret_in_gsm:
+    except NotFound as e:
         raise click.ClickException(
             f"Secret '{secret_path}' does not exist in collection '{collection}'."
-        )
+        ) from e
 
-    if secret_in_index and not secret_in_gsm:
-        raise click.ClickException(
-            f"Secret '{secret_path}' is in inconsistent state. "
-            f"Run 'delete -c {collection} {secret_path}', then 'create' to fix."
-        )
-
-    if not secret_in_index and secret_in_gsm:
-        raise click.ClickException(
-            f"Secret '{secret_path}' is in inconsistent state (GSM only). "
-            f"Run 'delete -c {collection} {secret_path}', then 'create' to fix."
-        )
-
-    # Secret exists in both places - proceed with the update
     try:
         new_version = client.add_secret_version(
             parent=full_secret_path,
