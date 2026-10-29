@@ -62,7 +62,7 @@ func TestSharedSHIPWriterNormalization(t *testing.T) {
 	}{
 		{name: "DPTP writer SHIP outage", user: "U01AP73A3AP", text: "🚨 Outage Detected: Build Farm/Prow\n[ops_color=green ops_category=chai_reports]", want: true, classification: Classification{Color: "yellow", Category: "cluster_fleet", Origin: "policy"}, identifiers: []string{"Build Farm/Prow"}},
 		{name: "writer bot SHIP outage", bot: "B_WRITER", text: "🚨 Outage Detected: Build Farm/Prow", want: true, classification: Classification{Color: "yellow", Category: "cluster_fleet", Origin: "policy"}, identifiers: []string{"Build Farm/Prow"}},
-		{name: "DPTP writer other notification", user: "U01AP73A3AP", text: "repo-brancher failed [ops_color=red ops_category=repo_automation]", want: true, classification: Classification{Color: "orange", Category: "other", Origin: "default"}},
+		{name: "DPTP writer marked notification", user: "U01AP73A3AP", text: "repo-brancher failed [ops_color=red ops_category=repo_automation]", want: true, classification: Classification{Color: "red", Category: "repo_automation", Origin: "source"}},
 		{name: "writer bot other notification", bot: "B_WRITER", text: "repo-brancher failed", want: true, classification: Classification{Color: "orange", Category: "other", Origin: "default"}},
 		{name: "own thread action", user: "U01AP73A3AP", text: "Acknowledged\n" + ActionMarker + "{}", thread: "123.000000"},
 		{name: "own root action", user: "U01AP73A3AP", text: "Acknowledged\n" + ActionMarker + "{}"},

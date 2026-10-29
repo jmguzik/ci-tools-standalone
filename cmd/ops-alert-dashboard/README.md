@@ -86,8 +86,11 @@ and using proxy authorization in demo mode are rejected.
 
 - Managed Alertmanager and Prow messages publish
   `[ops_color=red ops_category=ci_platform]`. Valid pairs from trusted producers
-  are used before narrow platform and legacy fallback rules. Unknown or invalid
-  classifications are Orange / Other.
+  are used before narrow fallback rules. Alertmanager can use platform and legacy
+  rules; markerless Prow jobs use only legacy rules, including historical cleanup
+  jobs. Prow report identifiers also recognize `branch-ci-*` job names.
+  Source-owned markers remain authoritative. Unknown or invalid classifications
+  are Orange / Other.
 - Recognized Chai scheduled reports are always Green / Chai reports. They have
   their own latest-per-task overview, report details and history, and are excluded
   from alert counts. The scheduler's `scheduled_task` Slack metadata identifies
@@ -101,8 +104,12 @@ and using proxy authorization in demo mode are rejected.
   scans may deliberately post nothing, so absence of a report does not establish
   scan success or failure.
 - SHIP root notifications beginning `🚨 Outage Detected: component/subcomponent`
-  are Yellow. Build Farm maps to Cluster fleet and Downstream CI / CI-Config to
-  Repo automation. Description prose does not determine classification.
+  (or Slack's `:rotating_light:` alias) are Yellow. Build Farm maps to Cluster
+  fleet and Downstream CI / CI-Config to Repo automation. Description prose does not determine classification. Other
+  trusted DPTP notifications honor valid producer markers, then use legacy rules
+  only for structured `[FIRING]` / `[NO LONGER FIRING IN ALERTMANAGER]` headers
+  and Repo brancher fast-forward failure summaries or headings. These summaries
+  use the stable identifier `repo-brancher-fast-forward-failures`.
 - A grouped notification remains one occurrence, retaining its parsed alert
   identifiers. It uses the highest alert color and Other if categories differ.
 

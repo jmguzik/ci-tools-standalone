@@ -98,9 +98,13 @@ func validCategory(s string) bool {
 	return false
 }
 
-// fallback returns the first release-owned matching rule.
-func (c *Classifier) fallback(identifier string) Classification {
-	for _, rules := range [][]classificationRule{c.Platform, c.Legacy} {
+// fallback limits platform rules to Alertmanager alert identifiers.
+func (c *Classifier) fallback(identifier string, platform bool) Classification {
+	ruleGroups := [][]classificationRule{c.Legacy}
+	if platform {
+		ruleGroups = [][]classificationRule{c.Platform, c.Legacy}
+	}
+	for _, rules := range ruleGroups {
 		for _, r := range rules {
 			matched := r.Alertname == identifier
 			if r.Glob != "" {
