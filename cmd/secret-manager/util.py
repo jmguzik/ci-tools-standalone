@@ -7,7 +7,7 @@ import re
 import click
 import requests
 import yaml
-from google.auth import default
+from google.api_core.exceptions import RetryError, ServiceUnavailable
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import secretmanager
 
@@ -39,19 +39,15 @@ REQUEST_INFO = "request-information"
 SECRET_NAME_MAX_LENGTH = 200
 
 
-def ensure_authentication():
+def is_login_error(error: Exception) -> bool:
     """
-    ensure_authentication checks that Google Cloud application default credentials exist.
-
-    Raises:
-        click.ClickException: If application default credentials are not found.
+    is_login_error reports whether a Google error means the user's Google login is missing,
+    expired, or revoked: missing credentials, an unavailable-service error (how Google reports
+    an expired login), or a retry timeout whose last error was one.
     """
-    try:
-        _, _ = default()
-    except DefaultCredentialsError as e:
-        raise click.ClickException(
-            "Credentials for authenticating into google cloud not found. Run the `login` command to authenticate."
-        ) from e
+    if isinstance(error, RetryError):
+        error = error.cause
+    return isinstance(error, (DefaultCredentialsError, ServiceUnavailable))
 
 
 def validate_collection(_ctx, _param, value):

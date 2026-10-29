@@ -6,11 +6,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
-from google.api_core.exceptions import NotFound, PermissionDenied
+from google.api_core.exceptions import NotFound, PermissionDenied, RetryError, ServiceUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from commands.create import create as create_command
 from commands.delete import delete as delete_command
+from commands.describe import describe as describe_command
+from commands.get_service_account import get_service_account as get_sa_command
 from commands.update import update as update_command
 
 SECRET_ID = "my-collection__aws__key"
@@ -27,10 +29,8 @@ class CommandsTest(unittest.TestCase):
     """Exercise create, update, and delete without Google credentials."""
 
     def run_command(self, command, module, args, client, **patches):
-        """run_command invokes a command with a fake client and skipped credential check."""
-        with patch(f"commands.{module}.secretmanager.SecretManagerServiceClient", return_value=client), patch(
-            f"commands.{module}.ensure_authentication"
-        ):
+        """run_command invokes a command with a fake Secret Manager client."""
+        with patch(f"commands.{module}.secretmanager.SecretManagerServiceClient", return_value=client):
             for name, value in patches.items():
                 stack = patch(f"commands.{module}.{name}", return_value=value)
                 stack.start()
@@ -100,6 +100,7 @@ class CommandsTest(unittest.TestCase):
             ("existing secret is deleted", None, 0, "successfully deleted"),
             ("missing secret is reported", NotFound("missing"), 1, "does not exist"),
             ("missing permission is reported", PermissionDenied("denied"), 1, "don't have permission to delete"),
+            ("expired login is passed on to main", ServiceUnavailable("expired"), 1, ""),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
@@ -107,10 +108,42 @@ class CommandsTest(unittest.TestCase):
                 result = self.run_command(delete_command, "delete", ["-c", "my-collection", "aws/key"], client)
                 self.assertEqual(result.exit_code, want_exit, result.output)
                 self.assertIn(want_output, result.output)
+                self.assertEqual(isinstance(result.exception, ServiceUnavailable), isinstance(delete_error, ServiceUnavailable))
                 client.delete_secret.assert_called_once_with(
                     name=f"projects/openshift-ci-secrets/secrets/{SECRET_ID}"
                 )
                 self.assert_index_untouched(client)
+
+    def test_describe(self):
+        for name, get_error, want_exit in [
+            ("existing secret is described", None, 0),
+            ("expired login is passed on to main", ServiceUnavailable("expired"), 1),
+        ]:
+            with self.subTest(name=name):
+                client = fake_client()
+                client.get_secret.side_effect = get_error
+                client.get_secret.return_value.labels = {}
+                client.get_secret.return_value.annotations = {}
+                result = self.run_command(describe_command, "describe", ["-c", "my-collection", "aws/key"], client)
+                self.assertEqual(result.exit_code, want_exit, result.output)
+                self.assertEqual(isinstance(result.exception, ServiceUnavailable), get_error is not None)
+
+    def test_get_service_account(self):
+        for name, access_error, want_exit in [
+            ("key is printed", None, 0),
+            ("expired login is passed on to main", ServiceUnavailable("expired"), 1),
+            ("retry timeout after an expired login is passed on", RetryError("timeout", ServiceUnavailable("expired")), 1),
+        ]:
+            with self.subTest(name=name):
+                client = fake_client()
+                client.access_secret_version.side_effect = access_error
+                client.access_secret_version.return_value.payload.data = b'{"type": "service_account"}'
+                result = self.run_command(get_sa_command, "get_service_account", ["-c", "my-collection"], client)
+                self.assertEqual(result.exit_code, want_exit, result.output)
+                if access_error is None:
+                    self.assertIn('"service_account"', result.output)
+                else:
+                    self.assertIs(result.exception, access_error)
 
 
 if __name__ == "__main__":

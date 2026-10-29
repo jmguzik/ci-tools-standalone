@@ -9,7 +9,6 @@ from util import (
     PROJECT_ID,
     create_payload,
     destroy_previous_versions,
-    ensure_authentication,
     get_secret_name,
     validate_collection,
     validate_path,
@@ -45,7 +44,6 @@ def update(collection: str, secret_path: str, from_file: str, from_literal: str)
 
     validate_secret_source(from_file, from_literal)
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication()
 
     full_secret_path = client.secret_path(PROJECT_ID, get_secret_name(collection, secret_path))
     try:

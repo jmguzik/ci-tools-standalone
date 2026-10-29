@@ -9,8 +9,8 @@ from google.cloud import secretmanager
 from util import (
     PROJECT_ID,
     UPDATER_SA_SECRET_NAME,
-    ensure_authentication,
     get_secret_name,
+    is_login_error,
     validate_collection,
 )
 
@@ -28,7 +28,6 @@ def get_service_account(collection: str):
     """Retrieve the service account associated with a secret collection."""
 
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication()
     secret_id = get_secret_name(collection, UPDATER_SA_SECRET_NAME)
     name = client.secret_version_path(PROJECT_ID, secret_id, "latest")
 
@@ -43,6 +42,8 @@ def get_service_account(collection: str):
             f"Service account credentials not found for collection '{collection}'"
         )
     except Exception as e:
+        if is_login_error(e):
+            raise  # reported by main
         raise click.ClickException(
             f"Failed to access service account credentials for collection '{collection}': {e}"
         ) from e

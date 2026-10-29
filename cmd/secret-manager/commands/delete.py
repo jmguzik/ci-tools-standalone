@@ -6,8 +6,8 @@ from google.api_core.exceptions import NotFound, PermissionDenied
 from google.cloud import secretmanager
 from util import (
     PROJECT_ID,
-    ensure_authentication,
     get_secret_name,
+    is_login_error,
     validate_collection,
     validate_path,
 )
@@ -30,7 +30,6 @@ def delete(collection: str, secret_path: str):
     """
 
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication()
 
     try:
         click.echo(f"Deleting secret '{secret_path}'...")
@@ -46,6 +45,8 @@ def delete(collection: str, secret_path: str):
             f"You don't have permission to delete secrets in collection '{collection}'."
         )
     except Exception as e:
+        if is_login_error(e):
+            raise  # reported by main
         raise click.ClickException(
             f"Failed to delete secret '{secret_path}': {e}. Please retry the delete operation."
         )

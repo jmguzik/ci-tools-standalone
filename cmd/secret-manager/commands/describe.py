@@ -11,8 +11,8 @@ from util import (
     PROJECT_ID,
     REQUEST_INFO,
     ROTATION_INSTRUCTIONS,
-    ensure_authentication,
     get_secret_name,
+    is_login_error,
     validate_collection,
     validate_path,
 )
@@ -50,7 +50,6 @@ def describe(output: str, collection: str, secret_path: str):
     """
 
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication()
 
     full_secret_path = client.secret_path(
         PROJECT_ID, get_secret_name(collection, secret_path)
@@ -67,6 +66,8 @@ def describe(output: str, collection: str, secret_path: str):
             f"Secret '{secret_path}' does not exist in collection '{collection}'."
         ) from e
     except Exception as e:
+        if is_login_error(e):
+            raise  # reported by main
         raise click.ClickException(
             f"Failed to describe secret '{secret_path}': {e}."
         ) from e

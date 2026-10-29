@@ -14,7 +14,6 @@ from util import (
     ROTATION_INSTRUCTIONS,
     check_if_collection_exists,
     create_payload,
-    ensure_authentication,
     get_secret_name,
     validate_collection,
     validate_path,
@@ -67,7 +66,6 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
             "See: https://docs.ci.openshift.org/docs/how-tos/adding-a-new-secret-to-ci/"
         )
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication()
 
     secret_id_normalized = get_secret_name(collection, secret_path)
     try:
