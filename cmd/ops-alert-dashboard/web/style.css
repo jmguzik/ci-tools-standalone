@@ -14,6 +14,62 @@
   --green: light-dark(#237151,#8ddab6);
 }
 
+#chai-chat-root {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 40;
+  width: min(420px,calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+  pointer-events: none;
+}
+
+#chai-chat-root > * { pointer-events: auto; }
+.chai-launcher,.chai-send { border: 1px solid var(--ink); border-radius: 24px; background: var(--ink); color: var(--surface); padding: 11px 18px; font-weight: 600; }
+.chai-launcher { box-shadow: 0 5px 20px light-dark(#20304b30,#0006); }
+.chai-panel { position: relative; display: flex; flex-direction: column; width: 100%; height: 630px; max-height: calc(100dvh - 108px); min-height: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: 0 12px 40px light-dark(#20304b30,#0008); overflow: hidden; }
+.chai-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 15px 16px 10px; }
+.chai-heading { display: flex; flex-direction: column; gap: 2px; }
+.chai-heading > strong { font-size: 17px; }
+.chai-subtitle,.chai-counter { color: var(--muted); font-size: 12px; }
+.chai-controls { display: flex; gap: 6px; }
+.chai-controls .chai-new { width: auto; margin: 0; }
+.chai-icon-button,.chai-new,.chai-retry { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 6px 10px; }
+.chai-icon-button { min-width: 32px; font-size: 17px; }
+.chai-picker { display: block; flex-shrink: 0; margin: 0 16px 10px; padding: 8px 10px; text-align: left; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chai-history { position: absolute; top: 112px; left: 12px; right: 12px; z-index: 2; max-height: min(350px,calc(100% - 150px)); overflow-y: auto; overscroll-behavior: contain; background: var(--surface); border: 1px solid var(--line); border-radius: 9px; padding: 10px; box-shadow: 0 8px 24px light-dark(#20304b20,#0008); }
+.chai-new { display: block; width: 100%; margin-bottom: 10px; }
+.chai-history-item { display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 9px; text-align: left; overflow-wrap: anywhere; border: 0; border-radius: 6px; background: var(--surface); }
+.chai-history-item:hover,.chai-history-item[aria-pressed="true"] { background: var(--selected); }
+.chai-history-item small { color: var(--muted); }
+.chai-context { padding: 8px 16px; background: var(--soft); border-block: 1px solid var(--line); font-size: 12px; overflow-wrap: anywhere; }
+.chai-thread { flex: 1; min-height: 60px; padding: 12px 16px; overflow-y: auto; overscroll-behavior: contain; overflow-wrap: anywhere; }
+.chai-thread > .chai-link { display: block; margin-bottom: 12px; font-size: 12px; }
+.chai-message + .chai-message { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.chai-message-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; margin-bottom: 6px; font-size: 12px; }
+.chai-message-meta time { color: var(--muted); }
+.chai-message-body .report-body { font-size: 13px; }
+.chai-message-body pre { max-width: 100%; overflow-x: auto; }
+.chai-empty { padding: 18px 2px; color: var(--muted); }
+.chai-empty h3 { color: var(--text); font-size: 16px; margin-bottom: 7px; }
+.chai-status { flex-shrink: 0; padding: 8px 16px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
+.chai-error { padding: 7px 16px; color: var(--red); font-size: 12px; max-height: 90px; overflow: auto; }
+.chai-pending-preview { padding: 7px 16px; font-size: 12px; max-height: 80px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; }
+.chai-retry { align-self: flex-start; margin: 0 16px 8px; }
+.chai-composer { flex-shrink: 0; display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--line); padding: 12px 16px; background: var(--soft); }
+.chai-composer label { font-size: 12px; }
+.chai-draft { width: 100%; min-height: 74px; max-height: 150px; resize: vertical; padding: 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.chai-composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
+.chai-send { padding: 7px 12px; border-radius: 6px; font-size: 13px; }
+@media(max-width:600px) {
+  #chai-chat-root { right: 12px; bottom: 12px; width: min(420px,calc(100vw - 24px)); }
+  .chai-panel { max-height: calc(100dvh - 92px); }
+  .chai-draft { font-size: 16px; }
+}
+
 * {
   box-sizing: border-box;
 }

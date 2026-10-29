@@ -189,6 +189,25 @@ func synchronize(ctx context.Context, service *opsalerts.Service, interval time.
 	}
 }
 
+// synchronizeConversations refreshes one active thread independently of full channel discovery.
+func synchronizeConversations(ctx context.Context, service *opsalerts.Service) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		readCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		err := service.SyncConversation(readCtx)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			logrus.WithError(err).Debug("Chai conversation refresh incomplete")
+		}
+	}
+}
+
 // shutdownOnCancel lets active requests finish without keeping the process alive forever.
 func shutdownOnCancel(ctx context.Context, server *http.Server) {
 	<-ctx.Done()
@@ -256,6 +275,7 @@ func run(ctx context.Context, args []string) error {
 	page.pullRequests = prs
 	server := &http.Server{Handler: page, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: time.Minute, IdleTimeout: time.Minute, MaxHeaderBytes: 16 * 1024}
 	go synchronize(ctx, service, o.syncInterval)
+	go synchronizeConversations(ctx, service)
 	go prs.Run(ctx)
 	go shutdownOnCancel(ctx, server)
 	logrus.WithFields(logrus.Fields{"listen": listener.Addr().String(), "demo": o.demo}).Info("ops alert dashboard listening")

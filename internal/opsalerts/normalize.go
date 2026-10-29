@@ -338,6 +338,9 @@ func (s *Service) normalize(m slack.Message) (Occurrence, bool, error) {
 	if m.SubType != "" && m.SubType != slack.MsgSubTypeBotMessage {
 		return Occurrence{}, false, nil
 	}
+	if m.Metadata.EventType == ConversationMetadataEvent && matchesIdentity(m, s.cfg.Writer) {
+		return Occurrence{}, false, nil
+	}
 	source, err := s.source(m)
 	if err != nil {
 		return Occurrence{}, false, err
@@ -359,7 +362,7 @@ func (s *Service) normalize(m slack.Message) (Occurrence, bool, error) {
 	if text == "" {
 		return Occurrence{}, false, nil
 	}
-	if matchesIdentity(m, s.cfg.Writer) && (strings.Contains(text, strings.TrimSpace(ActionMarker)) || strings.HasPrefix(m.Text, ActionReceiptPrefix) || m.Metadata.EventType == ActionMetadataEvent) {
+	if matchesIdentity(m, s.cfg.Writer) && (strings.Contains(text, strings.TrimSpace(ActionMarker)) || strings.HasPrefix(m.Text, ActionReceiptPrefix) || strings.HasSuffix(m.Text, "\n\n💬 Dashboard · Chai") || m.Metadata.EventType == ActionMetadataEvent) {
 		return Occurrence{}, false, nil
 	}
 	src := Source{Name: "unknown", Kind: "unknown"}

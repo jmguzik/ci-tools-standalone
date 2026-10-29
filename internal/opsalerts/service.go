@@ -41,16 +41,19 @@ type pendingDelivery struct {
 
 // serviceCache is published atomically after a complete replay.
 type serviceCache struct {
-	Coverage     Coverage
-	Threads      map[string]threadCache
-	Occurrences  map[string]Occurrence
-	Records      map[string]actionRecord
-	Rules        map[string]Snooze
-	WIPRules     map[string]WIPRule
-	WIPRevisions map[string]string
-	WIPOverrides map[string]string
-	Pending      map[string]pendingDelivery
-	Decorations  decorationState
+	Coverage            Coverage
+	Threads             map[string]threadCache
+	Occurrences         map[string]Occurrence
+	Records             map[string]actionRecord
+	Rules               map[string]Snooze
+	WIPRules            map[string]WIPRule
+	WIPRevisions        map[string]string
+	WIPOverrides        map[string]string
+	Pending             map[string]pendingDelivery
+	Decorations         decorationState
+	Conversations       map[string]Conversation
+	ConversationRecords map[string]conversationRecord
+	ConversationPending map[string]conversationAttempt
 }
 
 // Service serializes recovery and mutations while keeping snapshots nonblocking.
@@ -62,6 +65,7 @@ type Service struct {
 	serial     chan struct{}
 	mu         sync.RWMutex
 	cache      serviceCache
+	activity   conversationActivity
 }
 
 // NewService validates trusted identities and starts with incomplete coverage.
@@ -206,7 +210,11 @@ func (s *Service) Sync(ctx context.Context) error {
 		if normalizeErr != nil {
 			return s.degrade(previous, normalizeErr)
 		}
-		if !admitted || !s.retained(occurrence, now, 24*time.Hour) {
+		chatRoot, chatErr := s.conversationRoot(root, now)
+		if chatErr != nil {
+			return s.degrade(previous, chatErr)
+		}
+		if !chatRoot && (!admitted || !s.retained(occurrence, now, 24*time.Hour)) {
 			continue
 		}
 		if existing, exists := threads[root.Timestamp]; exists {
@@ -249,6 +257,14 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		if err != nil {
 			return cache, err
 		}
+		chatRoot, chatErr := s.conversationRoot(thread.Root, now)
+		if chatErr != nil {
+			return cache, chatErr
+		}
+		if chatRoot {
+			retainedThreads[thread.Root.Timestamp] = thread
+			continue
+		}
 		if !admitted || !s.retained(o, now, 24*time.Hour) {
 			continue
 		}
@@ -269,6 +285,9 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 			seen.Insert(reply.Timestamp)
 			if _, err := slackTime(reply.Timestamp); err != nil {
 				return cache, err
+			}
+			if reply.Metadata.EventType == ConversationMetadataEvent && matchesIdentity(reply, s.cfg.Writer) {
+				continue
 			}
 			if matchesIdentity(reply, s.cfg.Writer) {
 				record, exists, err := decodeMessageRecord(reply.Msg, o.Identity.ID)
@@ -347,6 +366,9 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		if _, exists := cache.Occurrences[attempt.Request.OccurrenceID]; !exists {
 			delete(cache.Pending, id)
 		}
+	}
+	if err := s.replayConversations(&cache); err != nil {
+		return cache, err
 	}
 	return cache, nil
 }

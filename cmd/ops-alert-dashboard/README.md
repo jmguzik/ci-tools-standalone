@@ -339,13 +339,50 @@ If its occurrence leaves the history window, the browser offers an explicit
 Dismiss expired local retry control. It clears only this browser's retry guard;
 delivery remains unconfirmed and the operator must check the original thread.
 
-Ask Chai previews only the bot routing and selected destination thread. The request
-uses the selected alert as its question; DPTP-bot then posts an explicit mention,
-request ID, source context and read-only investigation instructions in that alert's
-thread. It does not acknowledge or close the alert. Only one request may be
-outstanding per occurrence. A later Chai-authored reply is shown as Reply received;
-delivery does not prove that an investigation executed. This shared-thread flow
-does not use Chai's private-DM shortcut.
+Ask Chai opens a floating, non-modal conversation window. The dashboard remains
+interactive behind it. Minimize and reopen the window to retain its selected
+conversation and draft, or choose another conversation from the last 48 hours.
+New starts a shared Slack parent in the configured operations channel; asking
+about an alert uses that alert's existing thread. These conversations are visible
+to channel members, not private chats. They do not acknowledge, snooze or close
+alerts and standalone conversation parents do not contribute to alert counts.
+
+The question is editable, with the short default "Analyze this alert: likely
+cause, evidence, and next read-only checks." for an alert. Only pressing Send
+posts a message. Blank questions cannot be sent. The input limit is 4,000 UTF-8
+bytes, matching server validation. Every operator message begins with the
+configured Chai Slack user mention, displayed as `@chai-bot` in the composer.
+The server uses the configured user ID, never a browser-supplied identity or
+display-name lookup. DPTP-bot remains the posting identity. Chai is requested to
+investigate; delivery alone does not prove it executed, and this UI does not grant
+Chai new capabilities.
+
+Slack messages contain only the mention and operator's question. A standalone
+parent additionally ends with the small `💬 Dashboard · Chai` label. Request IDs,
+operator attribution, timestamps and thread associations stay in versioned Slack
+message metadata (`ops_dashboard_conversation_v1`), never serialized into message
+text. The question remains in the message text; its hash in metadata verifies the
+saved record. Metadata is workspace-readable and must not contain credentials.
+The popup reconstructs confirmed dashboard requests, Chai replies and human
+thread replies after restart, including earlier alert investigation requests.
+Supported Markdown is rendered safely and timestamps use the browser's local time.
+
+While the popup is open in a visible tab, it checks the shared conversation cache
+every five seconds. A bounded background worker refreshes interested threads at
+most once per ten seconds each, with one Slack thread read at a time. Interest
+expires after 30 seconds and is limited to eight threads; rate limits postpone
+reads. Full channel discovery continues at `--sync-interval` (one minute by
+default). This is polling with a short delay, not a streaming connection or a
+guarantee of a fixed response time. Minimized and hidden tabs stop chat polling.
+
+An immutable request ID is retained in per-operator session storage before a
+write. An ambiguous response preserves that request for explicit reconciliation
+and retry; it never automatically sends a replacement. Identity changes clear
+private display state. Writes require authenticated proxy identity, same-origin
+CSRF protection, complete archive coverage and an explicitly configured Chai user.
+Failed or missing metadata confirmation remains unconfirmed rather than falling
+back to a visible JSON record. Older clients' `/api/actions` investigation requests
+remain compatible with their existing workflow receipts.
 
 ## Recovery and operation
 

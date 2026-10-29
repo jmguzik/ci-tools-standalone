@@ -167,6 +167,9 @@ func decodeRecord(text, target string) (actionRecord, bool, error) {
 // decodeMessageRecord accepts legacy records and strictly validated metadata copies.
 // Callers must verify the writer identity before trusting either surface.
 func decodeMessageRecord(message slack.Msg, target string) (actionRecord, bool, error) {
+	if message.Metadata.EventType == ConversationMetadataEvent {
+		return actionRecord{}, false, nil
+	}
 	legacy, hasLegacy, err := decodeRecord(message.Text, target)
 	if err != nil {
 		return actionRecord{}, false, err
@@ -346,6 +349,12 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 	cache := s.currentCache()
 	if cache.Coverage.Phase != "ready" {
 		return Occurrence{}, ErrNotReady
+	}
+	if _, exists := cache.ConversationRecords[req.RequestID]; exists {
+		return Occurrence{}, ErrConflict
+	}
+	if _, exists := cache.ConversationPending[req.RequestID]; exists {
+		return Occurrence{}, ErrConflict
 	}
 	target, exists := cache.Occurrences[req.OccurrenceID]
 	if !exists || !s.retained(target, s.clock.Now(), 0) {

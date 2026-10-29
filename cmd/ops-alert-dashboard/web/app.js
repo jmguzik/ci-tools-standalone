@@ -13,6 +13,23 @@
   const text = value => String(value || '');
   /** Use the browser's timezone rules so daylight-saving changes need no manual offset. */
   const date = value => { const d = new Date(value); return Number.isFinite(d.getTime()) ? new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(d) : 'Not available'; };
+  const chaiChat = window.OpsChaiChat?.create({root: el('chai-chat-root'), renderBody: chatBody, formatDate: date, request: chatRequest, onAuthError: chatAuthenticationError});
+  /** Reuse the safe report renderer for conversational Markdown without interpreting HTML. */
+  function chatBody(source, reference) { const body = node('div', null, 'report-body'); renderReportBody(body, source, reference); return body; }
+  /** Keep chat writes on the same authenticated origin and server-derived actor as actions. */
+  async function chatRequest(method, body, signal) {
+    const generation = state.generation;
+    const headers = {Accept: 'application/json'};
+    const options = {method, credentials: 'same-origin', cache: 'no-store', signal, headers};
+    if (method === 'POST') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.snapshot?.csrf_token || ''; options.body = JSON.stringify(body); }
+    const active = method === 'GET' && body?.conversation_id ? '?active=' + encodeURIComponent(body.conversation_id) : '';
+    const response = await fetch('/api/conversations' + active, options);
+    const json = (response.headers.get('content-type') || '').includes('application/json');
+    if (generation !== state.generation || response.redirected || !json || response.status === 401 || response.status === 403) return {ok: false, status: 401, body: {error: 'Your authenticated session could not be verified.'}};
+    return {ok: response.ok, status: response.status, body: await response.json(), retryAfter: response.headers.get('retry-after')};
+  }
+  /** Remove private chat content when the authorizing proxy no longer confirms the session. */
+  function chatAuthenticationError() { pauseAuthentication('Your authenticated session could not be verified. Sign in again, then refresh.'); render(); }
   /** localUTC formats validated explicit UTC timestamps; clock-only values need a source UTC date. */
   function localUTC(value, reference) {
     const full = value.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{1,2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(?:Z|\+00:?00| UTC)$/);
@@ -255,6 +272,7 @@
     sopCache.clear(); metricsCache.clear(); sopDisclosures.clear(); metricsDisclosures.clear(); metricsSelections.clear(); state.reportDisclosures.clear();
     if (el('action-dialog').open) closeDialog(); state.fetchError = message;
     document.title = 'Sign in · Test Platform Operations';
+    chaiChat?.update(null);
   }
   /** Recognize proxy sign-in responses before treating their HTML as dashboard data. */
   async function responseJSON(response) {
@@ -478,7 +496,7 @@
       else actions.append(action('◷ Snooze', 'snooze', o));
       actions.append(action('☑ Close investigation', 'close', o));
     }
-    const ask = action('✧ Ask Chai', 'investigate', o); ask.disabled ||= outstandingInvestigation(o); actions.append(ask); container.append(actions);
+    const ask = button('✧ Ask Chai', () => chaiChat ? chaiChat.open({occurrenceID: id(o), title: displayTitle(o)}) : openDialog('investigate', o)); ask.disabled = !state.snapshot || state.authPaused; actions.append(ask); container.append(actions);
     container.append(node('p', ready() ? 'Actions are saved in this Slack thread before the dashboard confirms them.' : state.pending ? 'Resolve the unconfirmed request before creating another action.' : 'Actions are available when coverage is ready and the snapshot is current.', 'fine'));
     renderSOPs(container, o);
     renderMetrics(container, o);
@@ -1058,24 +1076,30 @@
     el('scope-controls').hidden = kind === 'investigate';
     for (const input of document.querySelectorAll('input[name="scope"]')) { input.checked = input.value === 'occurrence'; input.disabled = input.value === 'regex' && !(occurrence.message.identifiers || []).length; }
     el('draft').maxLength = kind === 'investigate' ? 4000 : 512;
-    el('draft').value = kind === 'investigate' ? 'Please investigate ' + displayTitle(occurrence) + '.' : '^(?:' + (occurrence.message.identifiers || []).map(escapeRegex).join('|') + ')$';
+    el('draft').value = kind === 'investigate' ? 'Analyze this alert: likely cause, evidence, and next read-only checks.' : '^(?:' + (occurrence.message.identifiers || []).map(escapeRegex).join('|') + ')$';
     el('confirm').textContent = actionLabels[kind]; el('form-error').textContent = '';
-    updatePreview(); el('action-dialog').showModal(); el('confirm').focus();
+    updatePreview(); el('action-dialog').showModal(); el(kind === 'investigate' ? 'draft' : 'confirm').focus();
   }
   /** Invalidate in-flight previews so a closed dialog cannot receive stale targets. */
   function closeDialog() { state.previewVersion++; el('action-dialog').close(); state.dialogOccurrence = null; state.previewTargets = []; state.previewValid = false; state.lastFocus?.focus(); }
+  /** Match the server's UTF-8 input limit before retaining a new request. */
+  function chaiQuestionError(question) {
+    if (!question) return 'Enter a question for Chai before sending.';
+    return new TextEncoder().encode(question).length > 4000 ? 'This question is too long. Shorten it before sending.' : '';
+  }
   /** Use server regex semantics and reject previews superseded by a newer scope or session. */
   async function updatePreview() {
     const o = state.dialogOccurrence; if (!o) return;
     const version = ++state.previewVersion, kind = state.dialogKind, scope = state.dialogScope, draft = el('draft').value.trim();
     const investigate = kind === 'investigate', regex = scope === 'regex' && !investigate;
-    el('draft').hidden = !regex; el('draft-label').hidden = !regex;
-    el('draft').required = regex;
+    el('draft').hidden = !(investigate || regex); el('draft-label').hidden = !(investigate || regex);
+    el('draft').required = investigate || regex;
     el('draft-label').textContent = investigate ? 'Question for Chai' : 'Identifier regular expression (RE2 syntax)';
     state.previewValid = false; state.previewTargets = []; el('confirm').disabled = true;
     if (investigate) {
       el('preview').textContent = 'DPTP-bot → configured Chai identity\nDestination: the selected source thread in ' + channelName();
-      state.previewValid = !!draft; el('confirm').disabled = !state.previewValid; return;
+      el('form-error').textContent = chaiQuestionError(draft);
+      state.previewValid = !el('form-error').textContent; el('confirm').disabled = !state.previewValid; return;
     }
     let targets = [o], until = date(nextSix());
     if (regex) {
@@ -1184,6 +1208,7 @@
         if (el('action-dialog').open) closeDialog();
       }
       state.authPaused = false; state.snapshot = snapshot; state.fetchError = '';
+      chaiChat?.update(snapshot);
       reconcilePersonal(snapshot, previous, options.quiet || !previous || options.reauthenticate); restorePending(snapshot.user);
       if (state.view === 'unmerged_prs') refreshPRs();
     } catch (err) { state.wasReady = false; state.fetchError = err.name === 'AbortError' ? 'Snapshot timed out after 12 seconds. Actions are paused; refresh to retry.' : err.message || 'Snapshot unavailable. Actions are paused.'; }
@@ -1239,6 +1264,20 @@
     finally { window.clearTimeout(timeout); state.sending = false; render(); }
     if (refreshAfter) await refresh();
   }
+  /** Validate the editable draft before creating an explicitly confirmed request. */
+  function submitAction(event) {
+    event.preventDefault(); const o = state.dialogOccurrence; const draft = el('draft').value.trim();
+    const questionError = state.dialogKind === 'investigate' ? chaiQuestionError(draft) : '';
+    if (questionError) { el('form-error').textContent = questionError; el('draft').focus(); return; }
+    if (state.dialogScope === 'regex' && !draft) { el('form-error').textContent = 'Enter an identifier regex before sending.'; el('draft').focus(); return; }
+    if (!ready()) { el('form-error').textContent = 'Coverage or session is unavailable. Close this preview and refresh before sending.'; return; }
+    if (items().find(current => id(current) === id(o))?.identity.revision !== o.identity.revision) { el('form-error').textContent = 'This occurrence changed while the preview was open. Close the preview and review the current state.'; return; }
+    if (!state.previewValid) { el('form-error').textContent = 'Wait for a valid server scope preview before sending.'; return; }
+    const kind = state.dialogKind, scope = state.dialogScope, targets = [...state.previewTargets];
+    closeDialog();
+    if (kind === 'close' && scope === 'regex') { startCloseBatch(targets); return; }
+    return sendNew(kind, o, draft, scope);
+  }
   el('refresh').addEventListener('click', () => refresh({quiet: true, reauthenticate: true}));
   el('mark-read').addEventListener('click', () => { for (const o of items()) markRead(o); render(); });
   el('notifications').addEventListener('click', toggleNotifications);
@@ -1251,17 +1290,7 @@
   el('draft').addEventListener('input', updatePreview);
   el('cancel').addEventListener('click', closeDialog); el('dialog-close').addEventListener('click', closeDialog);
   el('action-dialog').addEventListener('cancel', event => { event.preventDefault(); closeDialog(); });
-  el('action-form').addEventListener('submit', event => {
-    event.preventDefault(); const o = state.dialogOccurrence; const draft = el('draft').value.trim();
-    if ((state.dialogKind === 'investigate' || state.dialogScope === 'regex') && !draft) { el('form-error').textContent = 'Enter a value before sending.'; el('draft').focus(); return; }
-    if (!ready()) { el('form-error').textContent = 'Coverage or session is unavailable. Close this preview and refresh before sending.'; return; }
-    if (items().find(current => id(current) === id(o))?.identity.revision !== o.identity.revision) { el('form-error').textContent = 'This occurrence changed while the preview was open. Close the preview and review the current state.'; return; }
-    if (!state.previewValid) { el('form-error').textContent = 'Wait for a valid server scope preview before sending.'; return; }
-    const kind = state.dialogKind, scope = state.dialogScope, targets = [...state.previewTargets];
-    closeDialog();
-    if (kind === 'close' && scope === 'regex') { startCloseBatch(targets); return; }
-    sendNew(kind, o, draft, scope);
-  });
+  el('action-form').addEventListener('submit', submitAction);
   window.addEventListener('focus', () => refresh({quiet: true, reauthenticate: true}));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh({quiet: true, reauthenticate: true}); });
   window.addEventListener('storage', event => {
