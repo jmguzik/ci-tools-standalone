@@ -38,20 +38,22 @@ func (c *fixedClock) Now() time.Time { return c.now }
 
 // memoryArchive models confirmed, rejected and ambiguously delivered thread writes.
 type memoryArchive struct {
-	roots          []slack.Message
-	replies        map[string][]slack.Message
-	clock          *fixedClock
-	posts          int
-	postError      error
-	storeOnError   bool
-	historyError   error
-	repliesError   error
-	replyCalls     int
-	lastText       string
-	reactionError  error
-	reactions      []reactionCall
-	cancelOnReply  context.CancelFunc
-	advanceOnReply time.Duration
+	roots            []slack.Message
+	replies          map[string][]slack.Message
+	clock            *fixedClock
+	posts            int
+	postError        error
+	storeOnError     bool
+	historyError     error
+	repliesError     error
+	replyCalls       int
+	lastText         string
+	reactionError    error
+	reactionErrors   []error
+	cancelOnReaction context.CancelFunc
+	reactions        []reactionCall
+	cancelOnReply    context.CancelFunc
+	advanceOnReply   time.Duration
 }
 
 // reactionCall captures only optional presentation writes.
@@ -95,6 +97,14 @@ func (a *memoryArchive) Post(_ context.Context, _ string, root, id, text string)
 // SetReaction implements decoration independently of state.
 func (a *memoryArchive) SetReaction(_ context.Context, _ string, root, emoji string, present bool) error {
 	a.reactions = append(a.reactions, reactionCall{Root: root, Emoji: emoji, Present: present})
+	if a.cancelOnReaction != nil {
+		a.cancelOnReaction()
+	}
+	if len(a.reactionErrors) > 0 {
+		err := a.reactionErrors[0]
+		a.reactionErrors = a.reactionErrors[1:]
+		return err
+	}
 	return a.reactionError
 }
 

@@ -2,10 +2,12 @@ package opsalerts
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -44,7 +46,7 @@ type serviceCache struct {
 	Records     map[string]actionRecord
 	Rules       map[string]Snooze
 	Pending     map[string]pendingDelivery
-	Decorations map[string]string
+	Decorations decorationState
 }
 
 // Service serializes recovery and mutations while keeping snapshots nonblocking.
@@ -431,11 +433,61 @@ func effectiveOccurrence(o Occurrence, cache serviceCache, now time.Time) Occurr
 	return o
 }
 
+// reactionPresence distinguishes uncertain startup metadata from confirmed writes.
+type reactionPresence uint8
+
+// Reaction states retain successful writes even when another icon fails.
+const (
+	reactionUnknown reactionPresence = iota
+	reactionAbsent
+	reactionPresent
+)
+
+// decorationState bounds optional writes independently of durable workflow actions.
+type decorationState struct {
+	Icons    map[string][3]reactionPresence
+	RetryAt  time.Time
+	Disabled bool
+}
+
+// initialReactions uses names as removal candidates, since Slack can truncate users.
+func initialReactions(root slack.Message, writer string) [3]reactionPresence {
+	states := [3]reactionPresence{reactionAbsent, reactionAbsent, reactionAbsent}
+	for i, emoji := range []string{"eyes", "zzz", "white_check_mark"} {
+		for _, reaction := range root.Reactions {
+			if reaction.Name != emoji {
+				continue
+			}
+			states[i] = reactionUnknown
+			if writer != "" && slices.Contains(reaction.Users, writer) {
+				states[i] = reactionPresent
+			}
+		}
+	}
+	return states
+}
+
 // decorate reconciles only this writer's optional icons, never durable state.
 func (s *Service) decorate(ctx context.Context, cache serviceCache) serviceCache {
-	decorations := map[string]string{}
+	state := cache.Decorations
+	state.Icons = maps.Clone(state.Icons)
+	if state.Icons == nil {
+		state.Icons = map[string][3]reactionPresence{}
+	}
+	for id := range state.Icons {
+		if o, exists := cache.Occurrences[id]; !exists || !s.retained(o, s.clock.Now(), 0) {
+			delete(state.Icons, id)
+		}
+	}
+	cache.Decorations = state
+	if state.Disabled || s.clock.Now().Before(state.RetryAt) {
+		return cache
+	}
 	now := s.clock.Now()
 	for id, occurrence := range cache.Occurrences {
+		if ctx.Err() != nil {
+			return cache
+		}
 		if !s.retained(occurrence, now, 0) {
 			continue
 		}
@@ -452,27 +504,42 @@ func (s *Service) decorate(ctx context.Context, cache serviceCache) serviceCache
 		case "closed":
 			desired = "white_check_mark"
 		}
-		previous, known := cache.Decorations[id]
-		if known {
-			decorations[id] = previous
+		icons, known := state.Icons[id]
+		if !known {
+			icons = initialReactions(cache.Threads[o.Identity.Timestamp].Root, s.cfg.Writer.UserID)
 		}
-		if known && previous == desired {
-			continue
-		}
-		complete := true
-		for _, emoji := range []string{"eyes", "zzz", "white_check_mark"} {
-			if known && emoji != previous && emoji != desired {
+		state.Icons[id] = icons
+		for i, emoji := range []string{"eyes", "zzz", "white_check_mark"} {
+			want := reactionAbsent
+			if emoji == desired {
+				want = reactionPresent
+			}
+			if icons[i] == want {
 				continue
 			}
-			if err := s.archive.SetReaction(ctx, o.Identity.Channel, o.Identity.Timestamp, emoji, emoji == desired); err != nil {
-				complete = false
-				logrus.WithError(err).WithFields(logrus.Fields{"channel": o.Identity.Channel, "timestamp": o.Identity.Timestamp, "emoji": emoji, "present": emoji == desired}).Warn("could not reconcile dashboard reaction")
+			if ctx.Err() != nil {
+				return cache
 			}
-		}
-		if complete {
-			decorations[id] = desired
+			if err := s.archive.SetReaction(ctx, o.Identity.Channel, o.Identity.Timestamp, emoji, emoji == desired); err != nil {
+				var limited *slack.RateLimitedError
+				if errors.As(err, &limited) {
+					cache.Decorations.RetryAt = s.clock.Now().Add(limited.RetryAfter)
+				}
+				message := "could not reconcile dashboard reaction"
+				var response slack.SlackErrorResponse
+				if errors.As(err, &response) && response.Err == "missing_scope" {
+					cache.Decorations.Disabled = true
+					message = "dashboard reaction updates disabled until restart: missing reactions:write scope"
+				}
+				logrus.WithError(err).WithFields(logrus.Fields{"channel": o.Identity.Channel, "timestamp": o.Identity.Timestamp, "emoji": emoji, "present": emoji == desired}).Warn(message)
+				if limited != nil || cache.Decorations.Disabled || ctx.Err() != nil {
+					return cache
+				}
+				continue
+			}
+			icons[i] = want
+			state.Icons[id] = icons
 		}
 	}
-	cache.Decorations = decorations
 	return cache
 }
