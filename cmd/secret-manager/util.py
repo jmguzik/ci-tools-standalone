@@ -42,12 +42,15 @@ SECRET_NAME_MAX_LENGTH = 200
 def is_login_error(error: Exception) -> bool:
     """
     is_login_error reports whether a Google error means the user's Google login is missing,
-    expired, or revoked: missing credentials, an unavailable-service error (how Google reports
-    an expired login), or a retry timeout whose last error was one.
+    expired, or revoked: missing credentials, an unavailable-service error carrying Google's
+    invalid_grant OAuth error (how an expired or revoked login is reported), or a retry
+    timeout whose last error was one. Other unavailable-service errors are not login errors.
     """
     if isinstance(error, RetryError):
         error = error.cause
-    return isinstance(error, (DefaultCredentialsError, ServiceUnavailable))
+    if isinstance(error, ServiceUnavailable):
+        return "invalid_grant" in str(error)
+    return isinstance(error, DefaultCredentialsError)
 
 
 def validate_collection(_ctx, _param, value):

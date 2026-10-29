@@ -16,6 +16,8 @@ from commands.get_service_account import get_service_account as get_sa_command
 from commands.update import update as update_command
 
 SECRET_ID = "my-collection__aws__key"
+# EXPIRED_LOGIN is the text Google reports for an expired or revoked login.
+EXPIRED_LOGIN = "Getting metadata from plugin failed with error: ('invalid_grant: Token has been expired or revoked.')"
 
 
 def fake_client():
@@ -75,7 +77,8 @@ class CommandsTest(unittest.TestCase):
             ("missing secret is reported", NotFound("missing"), 1, "does not exist in collection"),
             ("missing permission is reported", PermissionDenied("denied"), 1, "don't have permission"),
             ("other Google error is reported", DeadlineExceeded("slow"), 1, "Failed to access secret 'aws/key'"),
-            ("expired login is passed on to main", ServiceUnavailable("expired"), 1, ""),
+            ("Google outage is not reported as a login problem", ServiceUnavailable("backend unavailable"), 1, "Failed to access secret 'aws/key'"),
+            ("expired login is passed on to main", ServiceUnavailable(EXPIRED_LOGIN), 1, ""),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
@@ -90,7 +93,7 @@ class CommandsTest(unittest.TestCase):
                 self.assertEqual(result.exit_code, want_exit, result.output)
                 self.assertIn(want_output, result.output)
                 self.assertEqual(client.add_secret_version.called, want_exit == 0)
-                self.assertEqual(isinstance(result.exception, ServiceUnavailable), isinstance(get_error, ServiceUnavailable))
+                self.assertEqual(isinstance(result.exception, ServiceUnavailable), want_output == "")
                 if want_exit == 0:
                     self.assertEqual(
                         client.add_secret_version.call_args.kwargs["parent"],
@@ -103,7 +106,7 @@ class CommandsTest(unittest.TestCase):
             ("existing secret is deleted", None, 0, "successfully deleted"),
             ("missing secret is reported", NotFound("missing"), 1, "does not exist"),
             ("missing permission is reported", PermissionDenied("denied"), 1, "don't have permission to delete"),
-            ("expired login is passed on to main", ServiceUnavailable("expired"), 1, ""),
+            ("expired login is passed on to main", ServiceUnavailable(EXPIRED_LOGIN), 1, ""),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
@@ -120,7 +123,7 @@ class CommandsTest(unittest.TestCase):
     def test_describe(self):
         for name, get_error, want_exit in [
             ("existing secret is described", None, 0),
-            ("expired login is passed on to main", ServiceUnavailable("expired"), 1),
+            ("expired login is passed on to main", ServiceUnavailable(EXPIRED_LOGIN), 1),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
@@ -134,8 +137,8 @@ class CommandsTest(unittest.TestCase):
     def test_get_service_account(self):
         for name, access_error, want_exit in [
             ("key is printed", None, 0),
-            ("expired login is passed on to main", ServiceUnavailable("expired"), 1),
-            ("retry timeout after an expired login is passed on", RetryError("timeout", ServiceUnavailable("expired")), 1),
+            ("expired login is passed on to main", ServiceUnavailable(EXPIRED_LOGIN), 1),
+            ("retry timeout after an expired login is passed on", RetryError("timeout", ServiceUnavailable(EXPIRED_LOGIN)), 1),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
