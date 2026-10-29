@@ -270,7 +270,7 @@ func (d *dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.action(w, r, actor)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/action-preview":
 		d.preview(w, r, actor)
-	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/app.js" || r.URL.Path == "/style.css"):
+	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/app.js" || r.URL.Path == "/reports.js" || r.URL.Path == "/style.css"):
 		d.files.ServeHTTP(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, apiError{Error: "endpoint not found", Code: "not_found"})

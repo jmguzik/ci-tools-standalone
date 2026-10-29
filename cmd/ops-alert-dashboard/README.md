@@ -91,14 +91,27 @@ and using proxy authorization in demo mode are rejected.
   jobs. Prow report identifiers also recognize `branch-ci-*` job names.
   Source-owned markers remain authoritative. Unknown or invalid classifications
   are Orange / Other.
-- Recognized Chai scheduled reports are always Green / Chai reports. They have
+- Recognized Chai scheduled reports have a neutral Chai report label. They have
   their own latest-per-task overview, report details and history, and are excluded
   from alert counts. The scheduler's `scheduled_task` Slack metadata identifies
-  each group, falling back to the task ID before `| Instructions:` in the visible
+  each task, falling back to the task ID before `| Instructions:` in the visible
   header. Instruction paths are source context, not separate task names. Clearly
   labeled coverage and limits remain visible alongside the findings. Presentation keeps
-  the original wording and full source, without inferring health from prose or
-  treating Green as a successful scan. Unknown report formats remain readable.
+  the original wording and full source, without inferring health from prose.
+  The catalog's legacy Green classification remains an internal report type,
+  not a displayed priority or health status. Unknown report formats remain readable.
+  Multiple parent messages combine only when trusted scheduler metadata supplies
+  the same bounded task, persona and request ID, scoped to the actual producer
+  and channel. Missing run metadata leaves each parent separate; adjacency never
+  establishes a run. Original parts and their permalinks remain available.
+  Pending workload reports show explicitly reported Pending pod counts by cluster,
+  including zero, with source evidence available by selecting a bar. Unavailable
+  or conflicting counts have no numeric bar. Counts include system and
+  overprovisioning pods and do not measure blocked jobs or severity. The previous
+  retained report supplies a comparison column; coverage and qualifiers can differ.
+  Extraction is bounded and conservative; unsupported findings stay in the source
+  text and missing clusters are never assigned zero. Other report types keep their
+  readable findings and coverage without inferred numeric charts.
   Latest and historical reports render a safe Markdown subset: headings,
   paragraphs, ordered and unordered lists (up to eight nesting levels), indented
   list continuations, blockquotes, fenced code, inline code, simple pipe tables,
