@@ -27,7 +27,9 @@
     if (Number(hour) > 23 || Number(minute) > 59 || Number(second || 0) > 59) return value;
     const instant = new Date(day + 'T' + hour.padStart(2, '0') + ':' + minute + ':' + (second || '00') + fraction + 'Z');
     if (!Number.isFinite(instant.getTime()) || instant.toISOString().slice(0, 10) !== day) return value;
-    return new Intl.DateTimeFormat(undefined, {year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', ...(second ? {second: '2-digit'} : {}), timeZoneName: 'shortOffset'}).format(instant);
+    const minutes = -instant.getTimezoneOffset(), absolute = Math.abs(minutes);
+    const offset = minutes ? 'GMT' + (minutes > 0 ? '+' : '-') + Math.floor(absolute / 60) + (absolute % 60 ? ':' + String(absolute % 60).padStart(2, '0') : '') : 'GMT';
+    return new Intl.DateTimeFormat(undefined, {year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', ...(second ? {second: '2-digit'} : {})}).format(instant) + ' ' + offset;
   }
   /** localProse converts only UTC prose, leaving URLs, markup links and code literal. */
   function localProse(source, reference) {

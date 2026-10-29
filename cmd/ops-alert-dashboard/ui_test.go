@@ -21,7 +21,7 @@ class Element {
   focus() { this.focused = true; }
 }
 const storage = new Map(), session = new Map(), elements = new Map();
-const context = vm.createContext({URL, Intl: {DateTimeFormat: function(locale, options) {return new Intl.DateTimeFormat('en-GB', {...options, timeZone: 'Europe/Warsaw'});}}, Date, Set, Map, console,
+const context = vm.createContext({URL, Intl: {DateTimeFormat: function(locale, options) {if (options.timeZoneName === 'shortOffset') throw new RangeError('shortOffset is unavailable in the CI runtime'); return new Intl.DateTimeFormat('en-GB', {...options, timeZone: process.env.TZ});}}, Date, Set, Map, console,
   document: {createElement: tag => new Element(tag), querySelectorAll: () => [], getElementById: id => {if (!elements.has(id)) elements.set(id, new Element('div')); return elements.get(id);}},
   window: {setTimeout, clearTimeout}, navigator: {}, AbortController, crypto: require('node:crypto'),
   localStorage: {getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value)},
@@ -47,6 +47,7 @@ func TestBrowserHelpers(t *testing.T) {
 		name       string
 		expression string
 		want       string
+		timeZone   string
 	}{
 		{name: "UTC ISO prose winter", expression: `UI.localProse('Seen 2026-01-15T12:30:00Z.')`, want: `"Seen 15 Jan 2026, 13:30:00 GMT+1."`},
 		{name: "UTC ISO prose summer and zero offsets", expression: `UI.localProse('2026-07-15T12:30+00:00 / 2026-07-15T12:30+0000')`, want: `"15 Jul 2026, 14:30 GMT+2 / 15 Jul 2026, 14:30 GMT+2"`},
@@ -55,6 +56,10 @@ func TestBrowserHelpers(t *testing.T) {
 		{name: "UTC clock winter and summer", expression: `[UI.localProse('6:00 UTC', '2026-01-15T12:00:00Z'), UI.localProse('6:00:20 UTC', '2026-07-15T12:00:00Z')]`, want: `["15 Jan 2026, 07:00 GMT+1","15 Jul 2026, 08:00:20 GMT+2"]`},
 		{name: "UTC prose DST spring boundary", expression: `UI.localProse('2026-03-29T00:30:00Z then 2026-03-29T01:30:00Z')`, want: `"29 Mar 2026, 01:30:00 GMT+1 then 29 Mar 2026, 03:30:00 GMT+2"`},
 		{name: "UTC prose DST autumn boundary", expression: `UI.localProse('2026-10-25T00:30:00Z then 2026-10-25T01:30:00Z')`, want: `"25 Oct 2026, 02:30:00 GMT+2 then 25 Oct 2026, 02:30:00 GMT+1"`},
+		{name: "UTC offset without shortOffset support", expression: `UI.localProse('2026-01-15T12:30:00Z')`, timeZone: "UTC", want: `"15 Jan 2026, 12:30:00 GMT"`},
+		{name: "negative local offset and previous calendar day", expression: `UI.localProse('2026-01-15T01:30:00Z')`, timeZone: "America/New_York", want: `"14 Jan 2026, 20:30:00 GMT-5"`},
+		{name: "positive quarter-hour local offset", expression: `UI.localProse('2026-01-15T12:30:00Z')`, timeZone: "Asia/Kathmandu", want: `"15 Jan 2026, 18:15:00 GMT+5:45"`},
+		{name: "negative half-hour local offset", expression: `UI.localProse('2026-01-15T12:30:00Z')`, timeZone: "America/St_Johns", want: `"15 Jan 2026, 09:00:00 GMT-3:30"`},
 		{name: "invalid UTC values stay literal", expression: `UI.localProse('2026-02-30T12:00:00Z 2026-01-15T24:00Z 2026-01-15 12:60 UTC 25:00 UTC', '2026-01-15T00:00:00Z')`, want: `"2026-02-30T12:00:00Z 2026-01-15T24:00Z 2026-01-15 12:60 UTC 25:00 UTC"`},
 		{name: "nonzero offsets stay literal", expression: `UI.localProse('6:00 UTC+1 2026-01-15 06:00 UTC-01:00 2026-01-15T12:00+01:00', '2026-01-15T00:00:00Z')`, want: `"6:00 UTC+1 2026-01-15 06:00 UTC-01:00 2026-01-15T12:00+01:00"`},
 		{name: "naive times and unanchored UTC clocks stay literal", expression: `[UI.localProse('2026-01-15 12:00 2026-01-15T12:00 6:00 UTC'), UI.localProse('6:00 UTC', 'invalid')]`, want: `["2026-01-15 12:00 2026-01-15T12:00 6:00 UTC","6:00 UTC"]`},
@@ -145,7 +150,13 @@ func TestBrowserHelpers(t *testing.T) {
 		{name: "cancel matching WIP rule uses regex scope", expression: `(async () => {let o = fixture('one'); o.wip_rule = {id: 'rule'}; UI.state.snapshot = snapshot([o]); UI.state.storageUser = 'operator'; let captured; globalThis.fetch = async (url, options) => url === '/api/snapshot' ? respond(UI.state.snapshot) : (captured = JSON.parse(options.body), respond({occurrence: o})); await UI.sendNew('unacknowledge', o, '', 'regex'); return captured.scope;})()`, want: `"regex"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := exec.Command(node, "-e", uiUnitHarness, tc.expression).CombinedOutput()
+			timeZone := "Europe/Warsaw"
+			if tc.timeZone != "" {
+				timeZone = tc.timeZone
+			}
+			command := exec.Command(node, "-e", uiUnitHarness, tc.expression)
+			command.Env = append(command.Environ(), "TZ="+timeZone)
+			got, err := command.CombinedOutput()
 			if err != nil {
 				t.Fatalf("evaluating browser helper: %v\n%s", err, got)
 			}

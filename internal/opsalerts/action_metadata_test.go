@@ -322,10 +322,87 @@ func TestLargeLegacyMetadataRecovery(t *testing.T) {
 			}
 			_, err = s.Act(context.Background(), "operator", ActionRequest{OccurrenceID: o.Identity.ID, ExpectedRevision: o.Identity.Revision, Kind: "close", RequestID: "retain-large"})
 			if !errors.Is(err, ErrValidation) || a.posts != 0 || len(s.currentCache().Pending) != 0 {
-				t.Fatalf("oversized retained investigation: posts=%d error=%v", a.posts, err)
+				t.Fatalf("oversized retained investigation question: posts=%d error=%v", a.posts, err)
 			}
 			if got := findOccurrence(t, s, o.Identity.ID); got.State.ClosedAt != nil {
 				t.Fatal("failed oversized write closed the occurrence")
+			}
+		})
+	}
+}
+
+// TestLongChaiReplyActions keeps derived response text outside subsequent durable records.
+func TestLongChaiReplyActions(t *testing.T) {
+	cases := []struct {
+		name, kind, scope, wantView string
+	}{
+		{name: "occurrence WIP", kind: "acknowledge", wantView: "acknowledged"},
+		{name: "family WIP", kind: "acknowledge", scope: "regex", wantView: "acknowledged"},
+		{name: "close", kind: "close", wantView: "closed"},
+		{name: "occurrence snooze", kind: "snooze", scope: "occurrence", wantView: "snoozed"},
+		{name: "family snooze", kind: "snooze", scope: "regex", wantView: "snoozed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, a, clock := fixture(t)
+			ctx := context.Background()
+			if err := s.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			o := findOccurrence(t, s, "C_TEST:"+a.roots[0].Timestamp)
+			question := ActionRequest{OccurrenceID: o.Identity.ID, ExpectedRevision: o.Identity.Revision, Kind: "investigate", RequestID: "question", Question: "Why did this alert fire?"}
+			if _, err := s.Act(ctx, "operator", question); err != nil {
+				t.Fatal(err)
+			}
+			clock.now = clock.now.Add(time.Minute)
+			response := "Evidence: " + strings.TrimSpace(strings.Repeat("long Chai response 界\n", 500))
+			replyTS := historyRoot(clock.now).Timestamp
+			a.replies[o.Identity.Timestamp] = append(a.replies[o.Identity.Timestamp], slack.Message{Msg: slack.Msg{Timestamp: replyTS, ThreadTimestamp: o.Identity.Timestamp, User: "U_CHAI", Text: response}})
+			a.roots[0].ReplyCount++
+			a.roots[0].LatestReply = replyTS
+			if err := s.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			o = findOccurrence(t, s, o.Identity.ID)
+			if o.Investigation == nil || o.Investigation.Status != "reply_received" || o.Investigation.Reply != response {
+				t.Fatal("long Chai response missing before action")
+			}
+			clock.now = clock.now.Add(time.Minute)
+			req := ActionRequest{OccurrenceID: o.Identity.ID, ExpectedRevision: o.Identity.Revision, Kind: tc.kind, Scope: tc.scope, RequestID: "after-response"}
+			cache := s.currentCache()
+			record, err := s.prepareAction("owner", req, o, cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.Investigation == cache.Occurrences[o.Identity.ID].Investigation || record.Investigation.Reply != "" {
+				t.Fatal("prepared action reused the cached investigation or retained response text")
+			}
+			if got := cache.Occurrences[o.Identity.ID].Investigation.Reply; got != response {
+				t.Fatal("preparing an action erased cached response text")
+			}
+			wantInvestigation := *o.Investigation
+			wantInvestigation.Reply = ""
+			if diff := cmp.Diff(&wantInvestigation, record.Investigation); diff != "" {
+				t.Fatalf("prepared investigation (-want +got):\n%s", diff)
+			}
+			got, err := s.Act(ctx, "owner", req)
+			if err != nil || a.posts != 2 {
+				t.Fatalf("action after long response: posts=%d error=%v", a.posts, err)
+			}
+			if got.View != tc.wantView || got.Investigation.Reply != response || got.Investigation.Question != question.Question || got.Investigation.Status != "reply_received" {
+				t.Fatalf("action lost workflow or displayed investigation: %+v", got)
+			}
+			persisted, exists, err := decodeMessageRecord(a.lastMessage, o.Identity.ID)
+			if err != nil || !exists || persisted.Investigation == nil || persisted.Investigation.Reply != "" || persisted.Investigation.Question != question.Question {
+				t.Fatalf("unexpected durable investigation: %+v, error=%v", persisted.Investigation, err)
+			}
+			envelope, err := json.Marshal(a.lastMessage.Metadata)
+			if err != nil || len(envelope) > MaxActionMetadataBytes || strings.Contains(string(envelope), "long Chai response") {
+				t.Fatalf("response leaked into metadata: bytes=%d error=%v", len(envelope), err)
+			}
+			s = restartScopedService(t, s, a, clock)
+			if restored := findOccurrence(t, s, o.Identity.ID); restored.Investigation.Reply != response || restored.Investigation.Status != "reply_received" {
+				t.Fatal("restart failed to reconstruct the full response")
 			}
 		})
 	}

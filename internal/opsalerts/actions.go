@@ -438,7 +438,13 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 func (s *Service) prepareAction(actor string, req ActionRequest, o Occurrence, cache serviceCache) (actionRecord, error) {
 	now := s.clock.Now().UTC()
 	// Delivery failures are transient overlays, never durable workflow state.
-	r := actionRecord{Version: 1, Request: req, Actor: actor, At: now, State: cache.Occurrences[o.Identity.ID].State, Investigation: cache.Occurrences[o.Identity.ID].Investigation}
+	r := actionRecord{Version: 1, Request: req, Actor: actor, At: now, State: cache.Occurrences[o.Identity.ID].State}
+	if cached := cache.Occurrences[o.Identity.ID].Investigation; cached != nil {
+		investigation := *cached
+		// Reply is reconstructed from trusted thread evidence, not durable action state.
+		investigation.Reply = ""
+		r.Investigation = &investigation
+	}
 	if o.WIPRule != nil {
 		r.ObservedWIP = o.WIPRule.ID
 	}

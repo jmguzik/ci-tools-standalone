@@ -296,8 +296,11 @@ alone is insufficient. Preserve the existing history/replies permissions and
 `include_all_metadata` reads. A rejected metadata payload does not fall back to a
 visible JSON write. New writes enforce a conservative 3,000-byte application budget
 on the serialized metadata envelope, including string escaping. This is not a claim
-about Slack's undocumented server limit. Oversized records, including a large retained
-investigation, are rejected before posting and leave workflow state unchanged.
+about Slack's undocumented server limit. Oversized durable records, including a large
+retained investigation question, are rejected before posting and leave workflow state
+unchanged. Shorten oversized questions or records; there is no visible-JSON fallback.
+Chai response text is reconstructed from trusted thread replies for display and is
+not copied into action metadata, so long responses do not block workflow actions.
 Slack metadata is workspace-readable, not a place for secrets.
 Once metadata records exist, rollback requires a metadata-compatible image; older
 binaries can ignore those records and must not be used while they are retained.
