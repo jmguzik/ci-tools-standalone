@@ -203,6 +203,11 @@ func TestPullRequestsBackoff(t *testing.T) {
 		{name: "primary rate limit", status: 403, headers: http.Header{"X-Ratelimit-Remaining": []string{"0"}, "X-Ratelimit-Reset": []string{fmt.Sprint(now.Add(2 * time.Hour).Unix())}}, wantRetry: now.Add(2*time.Hour + time.Second)},
 		{name: "retry HTTP date", status: 429, headers: http.Header{"Retry-After": []string{now.Add(time.Hour).Format(http.TimeFormat)}}, wantRetry: now.Add(time.Hour)},
 		{name: "ordinary outage", status: 502, wantRetry: now.Add(pullRequestPoll)},
+		{name: "huge retry seconds bounded", status: 429, headers: http.Header{"Retry-After": []string{"2147483647"}}, wantRetry: now.Add(6 * time.Hour)},
+		{name: "far retry HTTP date bounded", status: 429, headers: http.Header{"Retry-After": []string{now.AddDate(100, 0, 0).Format(http.TimeFormat)}}, wantRetry: now.Add(6 * time.Hour)},
+		{name: "far reset bounded", status: 403, headers: http.Header{"X-Ratelimit-Remaining": []string{"0"}, "X-Ratelimit-Reset": []string{fmt.Sprint(now.AddDate(100, 0, 0).Unix())}}, wantRetry: now.Add(6 * time.Hour)},
+		{name: "both headers bounded after latest selected", status: 429, headers: http.Header{"Retry-After": []string{"2147483647"}, "X-Ratelimit-Remaining": []string{"0"}, "X-Ratelimit-Reset": []string{fmt.Sprint(now.AddDate(100, 0, 0).Unix())}}, wantRetry: now.Add(6 * time.Hour)},
+		{name: "both headers preserve legitimate later reset", status: 429, headers: http.Header{"Retry-After": []string{"3600"}, "X-Ratelimit-Remaining": []string{"0"}, "X-Ratelimit-Reset": []string{fmt.Sprint(now.Add(2 * time.Hour).Unix())}}, wantRetry: now.Add(2*time.Hour + time.Second)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -250,6 +255,13 @@ func TestPullRequestsBackoff(t *testing.T) {
 			}
 			if diff := cmp.Diff("Bearer unit-test-secret", fake.requests[0].Header.Get("Authorization")); diff != "" {
 				t.Errorf("unexpected auth (-want +got):\n%s", diff)
+			}
+			clock.at = tc.wantRetry.Add(-time.Nanosecond)
+			if err := p.Sync(context.Background()); err == nil {
+				t.Fatal("expected backoff before retry boundary")
+			}
+			if diff := cmp.Diff(2, len(fake.requests)); diff != "" {
+				t.Errorf("unexpected early retry traffic (-want +got):\n%s", diff)
 			}
 			clock.at = tc.wantRetry
 			if err := p.Sync(context.Background()); err != nil {

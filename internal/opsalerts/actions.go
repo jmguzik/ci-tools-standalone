@@ -336,7 +336,14 @@ func (s *Service) Act(ctx context.Context, actor string, req ActionRequest) (Occ
 		}
 	}
 	for _, pending := range cache.Pending {
-		if pending.Request.OccurrenceID == req.OccurrenceID && pending.Status == "delivery_uncertain" {
+		if pending.Status != "delivery_uncertain" {
+			continue
+		}
+		// A cancellation can affect every parent before its trusted reply is confirmed.
+		if pending.Request.Kind == "unacknowledge" && pending.Request.Scope == "regex" {
+			return target, fmt.Errorf("%w: family cancellation awaiting archive confirmation", ErrNotReady)
+		}
+		if pending.Request.OccurrenceID == req.OccurrenceID {
 			return target, ErrDeliveryUncertain
 		}
 	}

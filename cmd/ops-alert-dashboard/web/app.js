@@ -11,20 +11,25 @@
   const append = (parent, ...children) => { children.filter(Boolean).forEach(child => parent.append(child)); return parent; };
   const button = (label, handler, className = 'btn') => { const b = node('button', label, className); b.type = 'button'; b.addEventListener('click', handler); return b; };
   const text = value => String(value || '');
+  /** Use the browser's timezone rules so daylight-saving changes need no manual offset. */
   const date = value => { const d = new Date(value); return Number.isFinite(d.getTime()) ? new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(d) : 'Not available'; };
   const items = () => state.snapshot?.occurrences || [];
+  /** Keep writes disabled until identity, coverage and retained delivery guards agree. */
   const ready = () => !state.authPaused && (!state.batch || state.batch.index === state.batch.requests.length) && state.snapshot?.status?.phase === 'ready' && !state.fetchError && !state.sending && !state.pending && !state.storageError && state.storageUser === state.snapshot?.user;
   const id = occurrence => occurrence.identity.id;
   const workflow = occurrence => occurrence.state || {};
+  /** Prefer parsed identifiers while retaining the complete source text in the inspector. */
   const displayTitle = occurrence => {
     const identifiers = occurrence.message.identifiers || [];
     if (identifiers.length) return identifiers.join(' · ');
     return plainSlack(text(occurrence.message.title).replace(/\[\s*ops_color=[^\]]*\]/gi, '')).replace(/\s+/g, ' ').trim() || 'Untitled occurrence';
   };
+  /** Keep useful identifier evidence without repeating a cleaned title. */
   function identifierSubtitle(title, identifiers = []) {
     const label = identifiers.join(' · ');
     return label && label !== title ? node('span', label, 'identifier') : null;
   }
+  /** Reserve the red badge for alerts that still need personal attention. */
   function feedUnreadBadge(count) {
     if (!count) return null;
     const counter = node('span', count, 'count unread-count');
@@ -35,10 +40,12 @@
   const isReport = occurrence => occurrence.view === 'chai_reports' || occurrence.classification.category === 'chai_reports';
   const matchesSearch = occurrence => !state.query || [occurrence.message.title, occurrence.message.text, occurrence.message.source, ...(occurrence.message.identifiers || [])].join(' ').toLowerCase().includes(state.query.toLowerCase());
   const visible = () => sorted(items().filter(o => (state.view === 'chai_reports' ? isReport(o) : !isReport(o) && o.view === state.view) && (state.view === 'chai_reports' || ((!state.category || o.classification.category === state.category) && (!state.color || o.classification.color === state.color))) && matchesSearch(o)));
+  /** Reject unsafe source links before they can become interactive DOM nodes. */
   function safeURL(value) {
     if (typeof value !== 'string' || /[\u0000-\u0020\\]/.test(value)) return null;
     try { const parsed = new URL(value); return parsed.protocol === 'https:' && !parsed.username && !parsed.password ? parsed : null; } catch { return null; }
   }
+  /** Keep external evidence links isolated from the dashboard window. */
   function link(url, label) {
     const parsed = safeURL(url); if (!parsed) return null;
     const a = node('a', label); a.href = parsed.href; a.target = '_blank'; a.rel = 'noopener noreferrer'; return a;
@@ -47,9 +54,11 @@
   const decodeSlack = value => text(value).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   const emojify = value => value.replace(/:([a-z0-9_+-]+):/g, (match, name) => emoji[name] || match);
   const channelName = () => state.snapshot?.channel_name || 'Operations channel';
+  /** Produce readable title text without interpreting source markup as HTML. */
   function plainSlack(value) {
     return emojify(decodeSlack(value)).replace(/<([^>|]+)\|([^>]+)>/g, '$2').replace(/<(https:\/\/[^>]+)>/g, '$1').replace(/[*_~`]/g, '');
   }
+  /** Render only supported Slack tokens as safe DOM nodes with bounded nesting. */
   function slackInline(container, source, depth = 0) {
     if (depth > 8) { container.append(node('span', emojify(decodeSlack(source)))); return; }
     const tokens = /(`)([^`\n]+)`|<([^>\n]+)>|([*_~])([^\n]+?)\4|https:\/\/[^\s<>]+|:[a-z0-9_+-]+:/g;
@@ -72,6 +81,7 @@
     }
     container.append(node('span', emojify(decodeSlack(source.slice(cursor)))));
   }
+  /** Preserve readable message structure while keeping code and evidence inert. */
   function slackBody(source) {
     const body = node('div', null, 'slack-body');
     const parts = text(source).split(/```/);
@@ -92,10 +102,12 @@
     });
     return body;
   }
+  /** Require an explicit source envelope rather than inferring health from prose. */
   function sourceStatus(o) {
     const match = text(o.message.title).trim().match(/^\[(FIRING|RESOLVED)(?::\d+)?\](?:\s|$)/i);
     return match ? match[1].toUpperCase() : '';
   }
+  /** Expose recognized job links without trusting arbitrary source-provided hosts. */
   function prowLink(o) {
     if (!(o.message.identifiers || []).some(value => /^(periodic|pull|postsubmit|rehearse)-/.test(value))) return null;
     for (const match of text(o.message.text).matchAll(/https:\/\/[^\s<>|]+/g)) {
@@ -106,6 +118,7 @@
   }
   function personalKey(user) { return 'ops-alert-dashboard.personal.v1.' + encodeURIComponent(user); }
   function defaultPersonal() { return {known: [], read: [], notifications: false, preferences: {}, last_complete_sync: ''}; }
+  /** Merge newer tab baselines before pruning so stale tabs cannot erase unread arrivals. */
   function savePersonal(prune = false) {
     if (!state.personalUser || !state.personal) return;
     try {
@@ -126,6 +139,7 @@
     }
     catch { state.personalError = 'Personal settings cannot be saved in this browser. Shared actions still use their separate safety storage.'; }
   }
+  /** Restore preferences only for the current authenticated identity. */
   function loadPersonal(user) {
     state.personalUser = user; state.personalError = ''; state.personal = defaultPersonal(); state.wasReady = false;
     try {
@@ -141,12 +155,16 @@
     state.query = typeof prefs.query === 'string' ? prefs.query : '';
     el('search').value = state.query; el('color').value = state.color;
   }
+  /** Keep presentation choices across reloads without changing shared workflow state. */
   function rememberPreferences() {
     if (!state.personal) return;
     state.personal.preferences = {view: state.view, category: state.category, color: state.color, query: state.query}; savePersonal();
   }
+  /** Keep personal reading independent of another operator changing workflow state. */
   function unread(o) { return !isReport(o) && state.personal && state.personal.known.includes(id(o)) && !state.personal.read.includes(id(o)); }
+  /** Record an explicit reading action without acknowledging the shared alert. */
   function markRead(o) { if (!state.personal || !unread(o)) return; state.personal.read.push(id(o)); savePersonal(); }
+  /** Preserve unread history through incomplete coverage and suppress recovery notification bursts. */
   function reconcilePersonal(snapshot, previous, quiet) {
     if (state.personalUser !== snapshot.user) loadPersonal(snapshot.user);
     const known = new Set(state.personal.known), read = new Set(state.personal.read), current = new Set(snapshot.occurrences.map(id));
@@ -171,6 +189,7 @@
     state.wasReady = healthy; savePersonal(canPrune);
     if (!quiet && mayNotify && healthy && !state.authPaused && !state.fetchError && !state.personalError && Date.now() - Date.parse(snapshot.status.last_sync) < 120000 && state.personal.notifications && arrivals.length) notifyArrivals(arrivals, snapshot.user);
   }
+  /** Serialize notification delivery across tabs and recheck identity after waiting for the lock. */
   async function notifyArrivals(arrivals, user) {
     if (!('Notification' in window) || Notification.permission !== 'granted' || !navigator.locks) return;
     await navigator.locks.request('ops-alert-dashboard-notifications', async () => {
@@ -189,6 +208,7 @@
       } catch { state.personalError = 'Desktop notification delivery or storage is unavailable.'; }
     });
   }
+  /** Request browser permission only through an explicit operator gesture. */
   async function toggleNotifications() {
     if (!state.personal || state.authPaused) return;
     if (!('Notification' in window) || !navigator.locks) { announce('Desktop notifications are unavailable in this browser.'); return; }
@@ -200,7 +220,9 @@
     state.personal.notifications = permission === 'granted'; savePersonal(); render();
     if (permission === 'denied') announce('Notifications are blocked. Change this site’s notification permission in browser settings to enable them.');
   }
+  /** Remove notifications from the previous session when its identity is no longer verified. */
   function closeDesktopNotifications() { for (const notification of desktopNotifications) notification.close(); desktopNotifications.clear(); }
+  /** Clear private display caches while preserving guarded requests for explicit recovery. */
   function pauseAuthentication(message) {
     closeDesktopNotifications();
     state.authPaused = true; state.wasReady = false; state.generation++; state.snapshot = null; state.prs = null; state.selected = ''; state.selectedReport = '';
@@ -208,6 +230,7 @@
     if (el('action-dialog').open) closeDialog(); state.fetchError = message;
     document.title = 'Sign in · Test Platform Operations';
   }
+  /** Recognize proxy sign-in responses before treating their HTML as dashboard data. */
   async function responseJSON(response) {
     const json = (response.headers.get('content-type') || '').includes('application/json');
     if (response.redirected || !json || response.status === 401 || response.status === 403) {
@@ -217,6 +240,7 @@
     }
     return response.json();
   }
+  /** Read the shared server cache without creating browser-driven GitHub polling. */
   async function refreshPRs() {
     if (state.authPaused || !state.snapshot || state.prsLoading) return;
     state.prsLoading = true; const generation = state.generation;
@@ -228,6 +252,7 @@
     } catch (err) { if (!state.authPaused && generation === state.generation) state.prs = {phase: 'degraded', error: err.message, prs: []}; }
     finally { state.prsLoading = false; render(); }
   }
+  /** Keep list freshness visible alongside the cached public pull-request evidence. */
   function renderPRs(container) {
     const data = state.prs;
     if (!data) { container.append(node('p', state.prsLoading ? 'Loading pull requests…' : 'Pull requests have not been loaded.', 'empty')); return; }
@@ -243,6 +268,7 @@
   function announce(message) { el('outcome').textContent = message; }
   function error(message) { const shown = state.storageError || message; el('action-error').hidden = !shown; el('action-error').textContent = shown; }
   function pendingKey(user) { return 'ops-alert-dashboard.pending.v1.' + encodeURIComponent(user); }
+  /** Identify local retry guards whose original occurrence has left retained coverage. */
   function pendingExpired() {
     const timestamp = state.pending?.occurrence_id?.match(/^[^:]+:(\d+)\.(\d{1,6})$/);
     const start = Date.parse(state.snapshot?.status?.cutover);
@@ -250,10 +276,12 @@
     const reported = Number(timestamp[1]) * 1000 + Number((timestamp[2] + '000').slice(0, 3));
     return Number.isSafeInteger(reported) && reported < start && !items().some(o => id(o) === state.pending.occurrence_id);
   }
+  /** Accept only the supported immutable request shape when recovering browser storage. */
   function validPending(request) {
     const fields = ['scope', 'occurrence_id', 'kind', 'expected_revision', 'request_id', 'pattern', 'question'];
     return request && typeof request === 'object' && !Array.isArray(request) && Object.keys(request).every(key => fields.includes(key) && typeof request[key] === 'string') && (!request.scope || ['occurrence', 'regex'].includes(request.scope)) && ['acknowledge', 'unacknowledge', 'close', 'reopen', 'snooze', 'unsnooze', 'investigate'].includes(request.kind) && !!request.occurrence_id && !!request.expected_revision && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.request_id);
   }
+  /** Recover user-bound delivery guards without silently sending any stored request. */
   function restorePending(user) {
     if (state.sending || (state.storageUser === user && !state.storageError)) return;
     try {
@@ -274,6 +302,7 @@
     }
     error('');
   }
+  /** Persist a request before its first write so uncertain delivery can reuse the same identity. */
   function retainPending(user, request) {
     try {
       const saved = JSON.stringify({user, request});
@@ -285,6 +314,7 @@
       error(''); render(); return false;
     }
   }
+  /** Keep actions paused if browser storage cannot remove a completed or explicitly dismissed guard. */
   function clearPending(user, request) {
     try {
       sessionStorage.removeItem(pendingKey(user));
@@ -295,6 +325,7 @@
       error('');
     }
   }
+  /** Make abandoning an expired local guard explicit without asserting remote delivery. */
   function dismissExpired() {
     if (!pendingExpired() || state.sending || state.snapshot?.status?.phase !== 'ready' || state.fetchError || state.storageError || state.pendingUser !== state.snapshot?.user || state.storageUser !== state.snapshot?.user) return;
     clearPending(state.pendingUser, state.pending);
@@ -302,6 +333,7 @@
     render();
   }
   function fact(list, label, value) { append(list, append(node('div'), node('dt', label), node('dd', value))); }
+  /** Separate archive coverage and authentication failures from shared workflow outcomes. */
   function renderStatus() {
     const coverage = state.snapshot?.status;
     const box = el('coverage');
@@ -327,6 +359,7 @@
     el('dismiss-expired').disabled = blocked;
     if (state.storageError) error('');
   }
+  /** Keep personal unread counts distinct from shared workflow totals. */
   function renderNav() {
     el('navigation').replaceChildren();
     for (const [key, view] of Object.entries(views)) {
@@ -337,6 +370,7 @@
       el('navigation').append(b);
     }
   }
+  /** Show category counts within the current workflow view rather than across unrelated queues. */
   function renderFilters() {
     el('filters').replaceChildren();
     el('filters').hidden = ['chai_reports', 'unmerged_prs'].includes(state.view);
@@ -349,6 +383,7 @@
       el('filters').append(b);
     }
   }
+  /** Refresh the visible snapshot without marking an automatically selected alert as read. */
   function render() {
     renderStatus(); renderBatch(); renderNav(); renderFilters();
     if (!state.authPaused) { const count = items().filter(o => o.view === 'feed' && unread(o)).length; document.title = (count ? '(' + count + ') ' : '') + 'Test Platform · Operations'; }
@@ -379,11 +414,13 @@
     if (selected) renderDetail(detail, selected); else detail.append(node('p', 'Choose another view or clear the filters to inspect an occurrence.', 'empty'));
     append(workspace, listBox, detail); content.append(workspace);
   }
+  /** Bind each explicit action control to its displayed occurrence and selected scope. */
   function action(label, kind, occurrence, scope = 'occurrence') {
     const b = button(label, () => ['snooze', 'investigate', 'acknowledge', 'close'].includes(kind) ? openDialog(kind, occurrence) : sendNew(kind, occurrence, '', scope));
     b.disabled = !ready(); return b;
   }
   function statusLabel(status) { return ({sent: 'Sent · awaiting reply', reply_received: 'Reply received', delivery_uncertain: 'Delivery uncertain', failed: 'Delivery failed'})[status] || status; }
+  /** Keep source evidence, operator workflow and family-rule ownership separately visible. */
   function renderDetail(container, o) {
     const s = workflow(o);
     append(container, node('p', 'Occurrence inspector · ' + (categories[o.classification.category] || 'Other'), 'eyebrow'), node('h2', displayTitle(o)), identifierSubtitle(displayTitle(o), o.message.identifiers), append(node('div', null, 'states'), badge(o), node('span', views[o.view]?.[1] || o.view, 'workflow'), sourceStatus(o) ? node('span', 'Source · ' + sourceStatus(o), 'source-status') : null));
@@ -548,6 +585,7 @@
     }
     flush();
   }
+  /** Ignore delayed evidence responses after the authenticated session changes. */
   async function loadSOP(occurrence, url) {
     if (state.authPaused || !state.snapshot || sopCache.get(url)?.loading || typeof sopCache.get(url)?.markdown === 'string') return;
     const generation = state.generation;
@@ -602,6 +640,7 @@
   const metricAlerts = o => Array.isArray(o.message.prometheus_alerts) ? [...new Set(o.message.prometheus_alerts.filter(a => typeof a === 'string' && a.length))] : [];
   const metricKey = (o, alert) => JSON.stringify([id(o), alert]);
   const metricsEnabled = () => state.snapshot?.monitoring?.enabled === true && state.snapshot.monitoring.source === 'core-ci';
+  /** Keep on-demand metrics bound to the occurrence and authenticated session that requested them. */
   async function loadMetrics(o, alert, refresh = false) {
     if (state.authPaused || !metricsEnabled() || !metricAlerts(o).includes(alert)) return;
     const key = metricKey(o, alert);
@@ -839,6 +878,7 @@
   function nextSix() { const until = new Date(); until.setUTCHours(6, 0, 0, 0); if (until <= new Date()) until.setUTCDate(until.getUTCDate() + 1); return until; }
   const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const actionLabels = {acknowledge: 'Start work', snooze: 'Snooze', close: 'Close investigations', investigate: 'Ask Chai'};
+  /** Require a visible confirmation scope before creating a workflow request. */
   function openDialog(kind, occurrence) {
     if (!ready() || (kind === 'investigate' && outstandingInvestigation(occurrence))) return;
     state.dialogKind = kind; state.dialogOccurrence = occurrence; state.dialogScope = 'occurrence'; state.lastFocus = document.activeElement;
@@ -851,7 +891,9 @@
     el('confirm').textContent = actionLabels[kind]; el('form-error').textContent = '';
     updatePreview(); el('action-dialog').showModal(); (kind === 'investigate' ? el('draft') : el('confirm')).focus();
   }
+  /** Invalidate in-flight previews so a closed dialog cannot receive stale targets. */
   function closeDialog() { state.previewVersion++; el('action-dialog').close(); state.dialogOccurrence = null; state.previewTargets = []; state.previewValid = false; state.lastFocus?.focus(); }
+  /** Use server regex semantics and reject previews superseded by a newer scope or session. */
   async function updatePreview() {
     const o = state.dialogOccurrence; if (!o) return;
     const version = ++state.previewVersion, kind = state.dialogKind, scope = state.dialogScope, draft = el('draft').value.trim();
@@ -887,9 +929,11 @@
     el('confirm').disabled = !state.previewValid;
   }
   function batchKey(user) { return 'ops-alert-dashboard.close-plan.v1.' + encodeURIComponent(user); }
+  /** Recover only a frozen sequence of supported per-occurrence close requests. */
   function validBatch(plan, user) {
     return plan && plan.user === user && Array.isArray(plan.requests) && plan.requests.length > 0 && plan.requests.length <= 10000 && Number.isInteger(plan.index) && plan.index >= 0 && plan.index <= plan.requests.length && plan.requests.every(request => validPending(request) && request.kind === 'close' && (!request.scope || request.scope === 'occurrence')) && new Set(plan.requests.map(request => request.request_id)).size === plan.requests.length;
   }
+  /** Save batch progress before further writes so interruption cannot silently recreate requests. */
   function retainBatch(plan) {
     try {
       const saved = JSON.stringify(plan); sessionStorage.setItem(batchKey(plan.user), saved);
@@ -897,11 +941,13 @@
       state.batch = plan; return true;
     } catch { state.storageError = 'The frozen close plan could not be saved. Actions are paused to prevent duplicate writes.'; error(''); return false; }
   }
+  /** Advance the frozen plan only after its exact request is confirmed. */
   function finishBatchRequest(request) {
     const plan = state.batch;
     if (!plan || plan.requests[plan.index]?.request_id !== request.request_id) return;
     retainBatch({...plan, index: plan.index + 1});
   }
+  /** Discard only unissued batch intent without undoing already confirmed closes. */
   function discardBatch() {
     if (!state.batch || state.sending || state.pending || state.batch.user !== state.snapshot?.user) return;
     try {
@@ -910,6 +956,7 @@
       state.batch = null; render();
     } catch { state.storageError = 'The close plan could not be removed. Restore session storage before creating actions.'; error(''); }
   }
+  /** Keep interrupted bulk progress and explicit recovery controls visible. */
   function renderBatch() {
     const plan = state.batch, authorized = plan?.user === state.snapshot?.user;
     const unavailable = plan && plan.index < plan.requests.length && !items().some(o => id(o) === plan.requests[plan.index].occurrence_id);
@@ -919,6 +966,7 @@
     el('resume-batch').disabled = state.authPaused || state.sending || !!state.fetchError || !!state.storageError || state.snapshot?.status?.phase !== 'ready' || plan.index >= plan.requests.length || unavailable;
     el('cancel-batch').disabled = state.sending || !!state.pending; el('cancel-batch').textContent = plan.index === plan.requests.length ? 'Dismiss completed plan' : 'Discard remaining close plan';
   }
+  /** Issue closes sequentially and stop immediately when confirmation or concurrency is uncertain. */
   async function resumeBatch() {
     const plan = state.batch;
     if (!plan || plan.user !== state.snapshot?.user || state.authPaused || state.sending || state.storageError || state.fetchError || state.snapshot?.status?.phase !== 'ready') return;
@@ -937,11 +985,13 @@
     }
     render();
   }
+  /** Freeze preview identities and revisions so future alerts never join an existing close plan. */
   function startCloseBatch(targets) {
     if (!ready() || !globalThis.crypto?.randomUUID) return;
     const plan = {user: state.snapshot.user, index: 0, requests: targets.map(target => ({occurrence_id: id(target), kind: 'close', expected_revision: target.identity.revision, request_id: crypto.randomUUID()}))};
     if (retainBatch(plan)) resumeBatch();
   }
+  /** Reject superseded responses before they can restore an old authenticated identity. */
   async function refresh(options = {}) {
     if (state.fetching || (state.authPaused && !options.reauthenticate)) return;
     state.fetching = true; renderStatus();
@@ -968,6 +1018,7 @@
     } catch (err) { state.wasReady = false; state.fetchError = err.name === 'AbortError' ? 'Snapshot timed out after 12 seconds. Actions are paused; refresh to retry.' : err.message || 'Snapshot unavailable. Actions are paused.'; }
     finally { window.clearTimeout(timeout); state.fetching = false; render(); }
   }
+  /** Retain an immutable request identity before its first network attempt. */
   async function sendNew(kind, occurrence, draft = '', scope = 'occurrence') {
     if (!ready()) return;
     if (!globalThis.crypto?.randomUUID) { error('A secure browser context with crypto.randomUUID is required for actions.'); return; }
@@ -980,6 +1031,7 @@
     state.pending = request; state.pendingUser = user; state.pendingUnconfirmed = false;
     await sendPending();
   }
+  /** Retain uncertain requests while allowing definite pre-write rejections to release a fresh guard. */
   async function sendPending() {
     if (!state.pending || pendingExpired() || state.sending || state.snapshot?.status?.phase !== 'ready' || state.fetchError || state.storageError || state.pendingUser !== state.snapshot.user) return;
     const request = state.pending;

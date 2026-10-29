@@ -170,7 +170,8 @@ draft and labels. Incomplete or over-1,000-result searches fail explicitly; narr
 the configured authors rather than treating a partial list as complete. Failures
 retain the last complete list with a stale indicator and last-sync timestamp.
 No per-PR CI or review queries are issued. GitHub rate limits and retry deadlines
-are respected independently of Slack.
+are respected independently of Slack. Implausible header-based delays are capped
+at six hours so a malformed response cannot suspend polling indefinitely.
 
 Public GitHub reads work anonymously. `--github-token-file` optionally supplies a
 server-only token with the access needed to read this public repository when a
@@ -260,7 +261,10 @@ Unconfirmed requests are retained in per-user browser session storage across
 reloads, without storing credentials or CSRF tokens. Retry is always explicit.
 On uncertain delivery, check the thread and retry the **same** retained request.
 Do not create a new request to work around uncertainty. Unconfirmed retry guards
-are in memory; after a restart, recovery can prove only records retained by Slack.
+are in memory. An unconfirmed WIP family-rule cancellation pauses new actions
+across occurrences until that cancellation is reconciled, because later actions
+must not rely on a rule that might already be canceled. After a restart, recovery
+can prove only records retained by Slack.
 If its occurrence leaves the history window, the browser offers an explicit
 Dismiss expired local retry control. It clears only this browser's retry guard;
 delivery remains unconfirmed and the operator must check the original thread.

@@ -505,3 +505,99 @@ func TestWIPDelayedConfirmation(t *testing.T) {
 		})
 	}
 }
+
+// TestUncertainFamilyCancellation blocks new parent actions until cancellation delivery is reconciled.
+func TestUncertainFamilyCancellation(t *testing.T) {
+	cases := []struct {
+		name, kind, recovery string
+		stored, sameParent   bool
+	}{
+		{name: "stored cancel confirmed by sync", kind: "close", recovery: "sync", stored: true},
+		{name: "stored cancel confirmed by exact retry", kind: "acknowledge", recovery: "retry", stored: true},
+		{name: "late cancel confirmed by sync", kind: "unacknowledge", recovery: "sync"},
+		{name: "late cancel confirmed by exact retry", kind: "snooze", recovery: "retry"},
+		{name: "same parent new request awaits late cancel", kind: "close", recovery: "retry", sameParent: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, a, clock := fixture(t)
+			ctx := context.Background()
+			if err := s.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			applyScopedAction(t, s, a, scopedAction{kind: "acknowledge", scope: "regex", actor: "family"})
+			confirmed := s.currentCache().Records["action_1"].Request
+			cancelTarget := findOccurrence(t, s, "C_TEST:"+a.roots[2].Timestamp)
+			cancel := ActionRequest{OccurrenceID: cancelTarget.Identity.ID, Kind: "unacknowledge", Scope: "regex", ExpectedRevision: cancelTarget.Identity.Revision, RequestID: "uncertain_cancel"}
+			clock.now = clock.now.Add(time.Minute)
+			a.postError = errors.New("transport timeout")
+			a.storeOnError = tc.stored
+			if _, err := s.Act(ctx, "cancel", cancel); !errors.Is(err, ErrDeliveryUncertain) {
+				t.Fatalf("cancel uncertainty=%v", err)
+			}
+			cancelText := a.lastText
+			a.postError = nil
+			a.storeOnError = false
+			clock.now = clock.now.Add(time.Minute)
+			targetIndex := 1
+			if tc.sameParent {
+				targetIndex = 2
+			}
+			target := findOccurrence(t, s, "C_TEST:"+a.roots[targetIndex].Timestamp)
+			req := ActionRequest{OccurrenceID: target.Identity.ID, Kind: tc.kind, ExpectedRevision: target.Identity.Revision, RequestID: "new_action"}
+			if tc.kind != "close" {
+				req.Scope = "occurrence"
+			}
+			posts := a.posts
+			if _, err := s.Act(ctx, "operator", req); !errors.Is(err, ErrNotReady) {
+				t.Fatalf("sibling action error=%v, want archive not ready", err)
+			}
+			if a.posts != posts {
+				t.Fatal("sibling action wrote while family cancellation was uncertain")
+			}
+			if _, err := s.Act(ctx, "family", confirmed); err != nil || a.posts != posts {
+				t.Fatalf("confirmed request retry lost priority: posts=%d error=%v", a.posts, err)
+			}
+			if !tc.stored {
+				if _, err := s.Act(ctx, "cancel", cancel); !errors.Is(err, ErrDeliveryUncertain) || a.posts != posts {
+					t.Fatalf("unconfirmed exact retry: posts=%d error=%v", a.posts, err)
+				}
+				if err := s.Sync(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.Act(ctx, "operator", req); !errors.Is(err, ErrNotReady) || a.posts != posts {
+					t.Fatalf("absent cancellation stopped guarding: posts=%d error=%v", a.posts, err)
+				}
+				// Slack eventually reveals the original delivery; this is archive evidence, not a retry post.
+				ts := fmt.Sprintf("%d.000001", clock.now.Unix())
+				a.replies[cancelTarget.Identity.Timestamp] = append(a.replies[cancelTarget.Identity.Timestamp], slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: cancelTarget.Identity.Timestamp, User: "U_WRITER", BotID: "B_WRITER", Text: cancelText}})
+				a.roots[2].ReplyCount++
+				a.roots[2].LatestReply = ts
+			}
+			if tc.recovery == "sync" {
+				if err := s.Sync(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := s.Act(ctx, "cancel", cancel); err != nil {
+				t.Fatalf("cancel reconciliation: %v", err)
+			}
+			if a.posts != posts || len(s.currentCache().Pending) != 0 || len(s.currentCache().WIPRules) != 0 {
+				t.Fatal("confirmation reposted or retained cancellation uncertainty")
+			}
+			target = findOccurrence(t, s, target.Identity.ID)
+			req.ExpectedRevision = target.Identity.Revision
+			req.Kind = "close"
+			req.Scope = ""
+			if _, err := s.Act(ctx, "operator", req); err != nil {
+				t.Fatalf("actions did not resume: %v", err)
+			}
+			if a.posts != posts+1 {
+				t.Fatalf("resumed posts=%d want %d", a.posts, posts+1)
+			}
+			restarted := restartScopedService(t, s, a, clock)
+			if restarted.Snapshot().Status.Phase != "ready" {
+				t.Fatal("restarted archive degraded")
+			}
+		})
+	}
+}

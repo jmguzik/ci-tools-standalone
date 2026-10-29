@@ -149,6 +149,7 @@ func TestDashboardActions(t *testing.T) {
 		{name: "missing occurrence", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: opsalerts.ErrNotFound, status: 404, code: "not_found", calls: 1},
 		{name: "stale revision", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: fmt.Errorf("wrapped: %w", opsalerts.ErrConflict), status: 409, code: "conflict", calls: 1},
 		{name: "incomplete coverage", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: opsalerts.ErrNotReady, status: 503, code: "not_ready", calls: 1},
+		{name: "unconfirmed family cancellation rejects new write", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: fmt.Errorf("%w: family cancellation awaiting archive confirmation", opsalerts.ErrNotReady), status: 503, code: "not_ready", calls: 1},
 		{name: "rejected delivery", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: opsalerts.ErrDeliveryFailed, status: 502, code: "delivery_failed", calls: 1},
 		{name: "uncertain delivery", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: opsalerts.ErrDeliveryUncertain, status: 502, code: "delivery_uncertain", calls: 1},
 		{name: "internal error", body: body, origin: "valid", token: "valid", media: "application/json", serviceError: errors.New("unexpected"), status: 500, code: "internal", calls: 1},

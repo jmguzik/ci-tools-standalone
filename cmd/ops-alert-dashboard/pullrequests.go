@@ -21,9 +21,10 @@ import (
 
 // pullRequestLimits bound GitHub traffic and keep polling independent of browser requests.
 const (
-	pullRequestPoll    = 5 * time.Minute
-	pullRequestTimeout = 20 * time.Second
-	pullRequestMaxBody = 8 * 1024 * 1024
+	pullRequestPoll       = 5 * time.Minute
+	pullRequestTimeout    = 20 * time.Second
+	pullRequestMaxBody    = 8 * 1024 * 1024
+	pullRequestMaxBackoff = 6 * time.Hour
 )
 
 // pullRequest contains only public search evidence, without extra per-PR requests.
@@ -291,7 +292,7 @@ func (p *pullRequests) scan(ctx context.Context, now time.Time) ([]pullRequest, 
 	return nil, retry, fmt.Errorf("GitHub pull request search exceeds the 1000-result limit")
 }
 
-// pullRequestRetry honors both primary and secondary GitHub rate limit boundaries.
+// pullRequestRetry honors rate limits while bounding erroneous headers so the cache can recover.
 func pullRequestRetry(response *http.Response, now time.Time) time.Time {
 	var retry time.Time
 	value := response.Header.Get("Retry-After")
@@ -311,6 +312,9 @@ func pullRequestRetry(response *http.Response, now time.Time) time.Time {
 	}
 	if (response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests) && !retry.After(now) {
 		retry = now.Add(pullRequestPoll)
+	}
+	if latest := now.Add(pullRequestMaxBackoff); retry.After(latest) {
+		retry = latest
 	}
 	return retry
 }
