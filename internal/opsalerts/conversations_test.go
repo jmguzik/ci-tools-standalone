@@ -1,15 +1,18 @@
 package opsalerts
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
 )
 
@@ -221,9 +224,9 @@ func TestConversationTrustAndWindow(t *testing.T) {
 	cases := []struct {
 		name              string
 		mutation          string
-		wantError         bool
+		wantDegraded      bool
 		wantConversations int
-	}{{name: "valid", wantConversations: 1}, {name: "forged author", mutation: "forged"}, {name: "tampered text", mutation: "text", wantError: true}, {name: "unknown record field", mutation: "unknown", wantError: true}, {name: "missing metadata", mutation: "missing", wantError: true}, {name: "expired", mutation: "expired"}}
+	}{{name: "valid", wantConversations: 1}, {name: "forged author", mutation: "forged"}, {name: "tampered text", mutation: "text", wantDegraded: true}, {name: "unknown record field", mutation: "unknown", wantDegraded: true}, {name: "missing metadata", mutation: "missing", wantDegraded: true}, {name: "expired", mutation: "expired"}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -253,14 +256,19 @@ func TestConversationTrustAndWindow(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = restarted.Sync(ctx)
-			if (err != nil) != tc.wantError {
-				t.Fatalf("sync error %v want %v", err, tc.wantError)
+			if err := restarted.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := restarted.Conversations().Status.Phase == "degraded"; got != tc.wantDegraded {
+				t.Fatalf("chat degraded %v want %v", got, tc.wantDegraded)
+			}
+			if restarted.Snapshot().Status.Phase != "ready" {
+				t.Fatal("chat recovery disabled workflow actions")
 			}
 			if len(restarted.Conversations().Conversations) != tc.wantConversations {
 				t.Fatalf("unexpected conversations %#v", restarted.Conversations())
 			}
-			if !tc.wantError && tc.mutation != "forged" && len(restarted.Snapshot().Occurrences) > 3 {
+			if tc.mutation != "forged" && len(restarted.Snapshot().Occurrences) > 3 {
 				t.Fatal("standalone counted as alert")
 			}
 		})
@@ -579,6 +587,330 @@ func TestConversationUncertaintyScope(t *testing.T) {
 			_, err := service.Converse(ctx, tc.actor, next)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("error %v want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// corruptConversation simulates archive changes without mutating an already published cache.
+func corruptConversation(message slack.Message, mutation string) slack.Message {
+	message.Metadata.EventPayload = maps.Clone(message.Metadata.EventPayload)
+	switch mutation {
+	case "text":
+		message.Text += " changed"
+	case "unknown":
+		raw := message.Metadata.EventPayload["record"].(string)
+		message.Metadata.EventPayload["record"] = "{\"unknown\":true," + strings.TrimPrefix(raw, "{")
+	case "missing":
+		message.Metadata = slack.SlackMetadata{}
+	}
+	return message
+}
+
+// TestConversationQuarantine isolates unreadable chat recovery across every cache rebuild.
+func TestConversationQuarantine(t *testing.T) {
+	cases := []struct {
+		name, mutation string
+		linked         bool
+	}{
+		{name: "standalone tampered text", mutation: "text"},
+		{name: "standalone unknown metadata", mutation: "unknown"},
+		{name: "standalone missing metadata", mutation: "missing"},
+		{name: "linked tampered text", mutation: "text", linked: true},
+		{name: "linked unknown metadata", mutation: "unknown", linked: true},
+		{name: "linked missing metadata", mutation: "missing", linked: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			service, archive, clock := chatFixture(t)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			known := ConversationRequest{RequestID: "known", Text: "Readable history?"}
+			readable, err := service.Converse(ctx, "operator", known)
+			if err != nil {
+				t.Fatal(err)
+			}
+			occurrence := service.Snapshot().Occurrences[0]
+			unknown := ConversationRequest{RequestID: "unknown", Text: "Question with uncertain delivery?"}
+			if tc.linked {
+				unknown.OccurrenceID = occurrence.Identity.ID
+			}
+			archive.postError = errors.New("lost acknowledgement")
+			archive.storeOnError = true
+			if _, err := service.Converse(ctx, "operator", unknown); !errors.Is(err, ErrDeliveryUncertain) {
+				t.Fatalf("unknown delivery: %v", err)
+			}
+			archive.postError = nil
+			original := archive.roots[len(archive.roots)-1]
+			if tc.linked {
+				original = archive.replies[occurrence.Identity.Timestamp][0]
+				archive.replies[occurrence.Identity.Timestamp][0] = corruptConversation(original, tc.mutation)
+			} else {
+				archive.roots[len(archive.roots)-1] = corruptConversation(original, tc.mutation)
+			}
+			if err := service.Sync(ctx); err != nil {
+				t.Fatalf("chat corruption failed complete workflow sync: %v", err)
+			}
+			if service.Snapshot().Status.Phase != "ready" || len(service.Snapshot().Occurrences) != 3 || service.Conversations().Status.Phase != "degraded" {
+				t.Fatal("chat quarantine changed workflow coverage or alert admission")
+			}
+			if diff := cmp.Diff([]Conversation{readable}, service.Conversations().Conversations); diff != "" {
+				t.Fatalf("unreadable chat displaced valid history (-want +got):\n%s", diff)
+			}
+			if _, err := service.Converse(ctx, "operator", known); err != nil {
+				t.Fatalf("confirmed retry during quarantine: %v", err)
+			}
+			if _, err := service.Converse(ctx, "operator", unknown); !errors.Is(err, ErrDeliveryUncertain) {
+				t.Fatalf("unknown retry lost delivery guard: %v", err)
+			}
+			if _, err := service.Converse(ctx, "another operator", ConversationRequest{RequestID: "fresh", Text: "Fresh question?"}); !errors.Is(err, ErrNotReady) {
+				t.Fatalf("fresh request during quarantine: %v", err)
+			}
+			if archive.posts != 2 {
+				t.Fatal("quarantined request was posted")
+			}
+			if _, err := service.Act(ctx, "operator", ActionRequest{OccurrenceID: occurrence.Identity.ID, RequestID: "ack", Kind: "acknowledge", ExpectedRevision: occurrence.Identity.Revision}); err != nil {
+				t.Fatalf("workflow action during chat quarantine: %v", err)
+			}
+			if !service.TouchConversation(readable.ID) {
+				t.Fatal("valid history cannot be refreshed")
+			}
+			if err := service.SyncConversation(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if service.Conversations().Status.Phase != "degraded" {
+				t.Fatal("action or active refresh cleared chat quarantine")
+			}
+			if _, err := service.Converse(ctx, "operator", unknown); !errors.Is(err, ErrDeliveryUncertain) {
+				t.Fatalf("action or active refresh cleared pending request: %v", err)
+			}
+			restarted, err := NewService(service.cfg, service.classifier, archive, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Mention-only recovery must survive a configured Chai user change.
+			restarted.cfg.Sources = append([]Source(nil), restarted.cfg.Sources...)
+			restarted.cfg.Sources[len(restarted.cfg.Sources)-1].UserIDs = []string{"U_NEW_CHAI"}
+			if err := restarted.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if restarted.Snapshot().Status.Phase != "ready" || restarted.Conversations().Status.Phase != "degraded" {
+				t.Fatal("restart did not rebuild independent chat quarantine")
+			}
+			if _, err := restarted.Converse(ctx, "operator", unknown); !errors.Is(err, ErrNotReady) {
+				t.Fatalf("restart retried unreadable delivery: %v", err)
+			}
+			if archive.posts != 3 {
+				t.Fatal("unknown delivery was reposted after restart")
+			}
+			if tc.linked {
+				archive.replies[occurrence.Identity.Timestamp][0] = original
+			} else {
+				archive.roots[len(archive.roots)-1] = original
+			}
+			if err := restarted.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if restarted.Conversations().Status.Phase != "ready" {
+				t.Fatal("repaired archive retained chat quarantine")
+			}
+			if _, err := restarted.Converse(ctx, "operator", unknown); err != nil {
+				t.Fatalf("repaired request was not recovered: %v", err)
+			}
+			if archive.posts != 3 {
+				t.Fatal("repaired request was posted twice")
+			}
+		})
+	}
+}
+
+// TestConversationQuarantineExpiry releases only chat evidence outside the retention window.
+func TestConversationQuarantineExpiry(t *testing.T) {
+	cases := []struct {
+		name   string
+		linked bool
+	}{{name: "standalone"}, {name: "linked", linked: true}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			service, archive, clock := chatFixture(t)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			req := ConversationRequest{RequestID: "old", Text: "Old question?"}
+			occurrence := service.Snapshot().Occurrences[0]
+			if tc.linked {
+				req.OccurrenceID = occurrence.Identity.ID
+			}
+			conversation, err := service.Converse(ctx, "operator", req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.linked {
+				archive.replies[occurrence.Identity.Timestamp][0] = corruptConversation(archive.replies[occurrence.Identity.Timestamp][0], "missing")
+				service.TouchConversation(conversation.ID)
+				if err := service.SyncConversation(ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				archive.roots[len(archive.roots)-1] = corruptConversation(archive.roots[len(archive.roots)-1], "missing")
+			}
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if service.Conversations().Status.Phase != "degraded" {
+				t.Fatal("missing chat quarantine")
+			}
+			clock.now = clock.now.Add(49 * time.Hour)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if service.Conversations().Status.Phase != "ready" || len(service.currentCache().ConversationIssues) != 0 {
+				t.Fatal("expired candidate retained chat quarantine")
+			}
+			if _, err := service.Converse(ctx, "operator", ConversationRequest{RequestID: "new", Text: "New question?"}); err != nil {
+				t.Fatalf("fresh chat after expiry: %v", err)
+			}
+		})
+	}
+}
+
+// TestChatCandidatesPreserveWorkflowCorruption keeps trusted receipt decoding fail-closed.
+func TestChatCandidatesPreserveWorkflowCorruption(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  slack.Msg
+	}{
+		{name: "action metadata with mention", msg: slack.Msg{Text: "<@U_CHAI> damaged receipt", Metadata: slack.SlackMetadata{EventType: ActionMetadataEvent}}},
+		{name: "receipt with chat metadata", msg: slack.Msg{Text: ActionReceiptPrefix + "damaged", Metadata: slack.SlackMetadata{EventType: ConversationMetadataEvent}}},
+		{name: "receipt missing metadata", msg: slack.Msg{Text: ActionReceiptPrefix + "<@U_CHAI> damaged"}},
+		{name: "legacy receipt", msg: slack.Msg{Text: ActionMarker + "damaged"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			service, archive, clock := chatFixture(t)
+			root := archive.roots[0].Timestamp
+			msg := tc.msg
+			msg.Timestamp = fmt.Sprintf("%d.000000", clock.now.Add(-time.Minute).Unix())
+			msg.ThreadTimestamp = root
+			msg.User = service.cfg.Writer.UserID
+			archive.replies[root] = []slack.Message{{Msg: msg}}
+			if err := service.Sync(context.Background()); err == nil || service.Snapshot().Status.Phase == "ready" {
+				t.Fatal("workflow corruption was silently skipped as chat")
+			}
+		})
+	}
+}
+
+// TestConversationQuarantineLogs reports aggregate transitions without archived content.
+func TestConversationQuarantineLogs(t *testing.T) {
+	cases := []struct {
+		name, mutation string
+	}{{name: "tampered text", mutation: "text"}, {name: "invalid metadata", mutation: "unknown"}, {name: "missing metadata", mutation: "missing"}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			previousOutput := logrus.StandardLogger().Out
+			logrus.SetOutput(&output)
+			defer logrus.SetOutput(previousOutput)
+			ctx := context.Background()
+			service, archive, _ := chatFixture(t)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.Converse(ctx, "private-operator", ConversationRequest{RequestID: "private-request", Text: "private-question xoxb-private-token"}); err != nil {
+				t.Fatal(err)
+			}
+			original := archive.roots[len(archive.roots)-1]
+			archive.roots[len(archive.roots)-1] = corruptConversation(original, tc.mutation)
+			for range 2 {
+				if err := service.Sync(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			logged := output.String()
+			if strings.Count(logged, "chat recovery incomplete") != 1 || !strings.Contains(logged, "affected_threads=1") {
+				t.Fatalf("expected one aggregate transition warning, got %s", logged)
+			}
+			for _, private := range []string{"private-operator", "private-request", "private-question", "xoxb-", original.Timestamp, "unknown", "decoding conversation", "text does not match"} {
+				if strings.Contains(logged, private) || strings.Contains(service.Conversations().Status.Error, private) {
+					t.Fatalf("chat recovery exposed private content %q", private)
+				}
+			}
+			archive.roots[len(archive.roots)-1] = original
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(output.String(), "chat recovery complete;") != 1 {
+				t.Fatalf("expected one aggregate recovery log, got %s", output.String())
+			}
+		})
+	}
+}
+
+// TestConversationConflictExpiry keeps ambiguous IDs blocked until complete archive replay.
+func TestConversationConflictExpiry(t *testing.T) {
+	cases := []struct {
+		name string
+		gap  time.Duration
+	}{{name: "one hour apart", gap: time.Hour}, {name: "twelve hours apart", gap: 12 * time.Hour}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			service, archive, clock := chatFixture(t)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			started := clock.now
+			if _, err := service.Converse(ctx, "operator", ConversationRequest{RequestID: "duplicate", Text: "Older question?"}); err != nil {
+				t.Fatal(err)
+			}
+			oldRoot := archive.roots[len(archive.roots)-1].Timestamp
+			clock.now = clock.now.Add(tc.gap)
+			newRequest := ConversationRequest{RequestID: "newer", Text: "Newer question?"}
+			if _, err := service.Converse(ctx, "operator", newRequest); err != nil {
+				t.Fatal(err)
+			}
+			newRoot := &archive.roots[len(archive.roots)-1]
+			record, err := service.decodeConversation(*newRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record.Request.RequestID = "duplicate"
+			message, err := service.conversationMessage(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newRoot.Metadata = message.Metadata
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			newAt, err := slackTime(newRoot.Timestamp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantIssues := map[string]time.Time{oldRoot: newAt, newRoot.Timestamp: newAt}
+			if diff := cmp.Diff(wantIssues, service.currentCache().ConversationIssues); diff != "" {
+				t.Fatalf("conflict guards depend on replay order (-want +got):\n%s", diff)
+			}
+			clock.now = started.Add(48*time.Hour + time.Minute)
+			newRequest.RequestID = "duplicate"
+			if service.Conversations().Status.Phase != "degraded" {
+				t.Fatal("partial expiry cleared conflict quarantine before replay")
+			}
+			if _, err := service.Converse(ctx, "operator", newRequest); !errors.Is(err, ErrNotReady) {
+				t.Fatalf("conflicting ID could be retried before replay: %v", err)
+			}
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.Converse(ctx, "operator", newRequest); err != nil {
+				t.Fatalf("retained request was not recovered after conflict expiry: %v", err)
+			}
+			if archive.posts != 2 {
+				t.Fatal("retained conflicting delivery was posted twice")
 			}
 		})
 	}

@@ -166,6 +166,11 @@ func TestChaiChatController(t *testing.T) {
 			want:       `["Conversation unavailable ▾","Retained draft",true]`,
 		},
 		{
+			name:       "unreadable chat recovery warns and pauses sends without disabling alert coverage",
+			expression: `setup(); queue.push(snapshot([conversation('healthy')], {status: {phase: 'degraded', error: 'Chat sending is paused because retained conversation history is unreadable. Alert workflow actions remain available.'}})); await open(); input('Draft remains editable'); return [find('chai-send').disabled, find('chai-draft').value, find('chai-error').textContent, content(find('chai-history')).includes('Investigation healthy'), posts().length];`,
+			want:       `[true,"Draft remains editable","Chat sending is paused because retained conversation history is unreadable. Alert workflow actions remain available.",true,0]`,
+		},
+		{
 			name:       "rate limited poll backs off and never posts",
 			expression: `setup(); queue.push({...reply({error: 'Slow down'}, 429), retryAfter: 120}); await open(); const delays = Array.from(timers.values()).map(item => item.delay); await chat.refresh(); return [calls.length, posts().length, delays.every(value => value > 100000)];`,
 			want:       `[1,0,true]`,

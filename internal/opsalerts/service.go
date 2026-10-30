@@ -54,6 +54,7 @@ type serviceCache struct {
 	Conversations       map[string]Conversation
 	ConversationRecords map[string]conversationRecord
 	ConversationPending map[string]conversationAttempt
+	ConversationIssues  map[string]time.Time
 }
 
 // Service serializes recovery and mutations while keeping snapshots nonblocking.
@@ -171,8 +172,17 @@ func (s *Service) currentCache() serviceCache {
 // publish swaps complete cache state without holding a lock across I/O.
 func (s *Service) publish(cache serviceCache) {
 	s.mu.Lock()
+	previousIssues := s.conversationIssueCount(s.cache, s.clock.Now())
+	issues := s.conversationIssueCount(cache, s.clock.Now())
 	s.cache = cache
 	s.mu.Unlock()
+	if issues != previousIssues {
+		if issues > 0 {
+			logrus.WithField("affected_threads", issues).Warn("chat recovery incomplete; new chat requests paused")
+		} else {
+			logrus.Info("chat recovery complete; new chat requests resumed")
+		}
+	}
 }
 
 // degrade preserves the last complete queue while disabling writes.
@@ -223,7 +233,8 @@ func (s *Service) Sync(ctx context.Context) error {
 			}
 		}
 		thread, exists := previous.Threads[root.Timestamp]
-		if !exists || thread.Root.ReplyCount != root.ReplyCount || thread.Root.LatestReply != root.LatestReply {
+		_, chatIssue := previous.ConversationIssues[root.Timestamp]
+		if !exists || chatIssue || thread.Root.ReplyCount != root.ReplyCount || thread.Root.LatestReply != root.LatestReply {
 			thread.Replies, err = s.archive.Replies(ctx, s.cfg.ChannelID, root.Timestamp)
 			if err != nil {
 				return s.degrade(previous, fmt.Errorf("reading thread %s: %w", root.Timestamp, err))
@@ -276,6 +287,9 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 			if reply.Timestamp == thread.Root.Timestamp || reply.SubType == slack.MsgSubTypeMessageDeleted {
 				continue
 			}
+			if s.conversationCandidate(reply) {
+				continue
+			}
 			if reply.ThreadTimestamp != "" && reply.ThreadTimestamp != thread.Root.Timestamp {
 				return cache, fmt.Errorf("reply outside requested thread")
 			}
@@ -285,9 +299,6 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 			seen.Insert(reply.Timestamp)
 			if _, err := slackTime(reply.Timestamp); err != nil {
 				return cache, err
-			}
-			if reply.Metadata.EventType == ConversationMetadataEvent && matchesIdentity(reply, s.cfg.Writer) {
-				continue
 			}
 			if matchesIdentity(reply, s.cfg.Writer) {
 				record, exists, err := decodeMessageRecord(reply.Msg, o.Identity.ID)

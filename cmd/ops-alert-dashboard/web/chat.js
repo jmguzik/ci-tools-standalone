@@ -5,10 +5,12 @@
   const storageKey = user => 'ops-alert-dashboard.chai.pending.v1.' + encodeURIComponent(user);
   const validPending = value => value && typeof value.request_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.request_id) && typeof value.text === 'string' && !!value.text.trim() && bytes(value.text) <= 4000 && (!value.conversation_id || typeof value.conversation_id === 'string') && (!value.occurrence_id || typeof value.occurrence_id === 'string');
   const instant = value => /^\d{10}(?:\.\d+)?$/.test(String(value)) ? new Date(Number(value) * 1000).toISOString() : value;
+  /** Keep untrusted Slack links outside executable and credential-bearing URL schemes. */
   const safeURL = value => {
     if (typeof value !== 'string' || /[\u0000-\u0020\\]/.test(value)) return null;
     try { const url = new URL(value); return url.protocol === 'https:' && !url.username && !url.password ? url.href : null; } catch { return null; }
   };
+  /** Own one non-modal chat window without changing dashboard navigation or workflow state. */
   function create(options) {
     const root = options.root, doc = root.ownerDocument || document;
     const make = (tag, text, className) => { const element = doc.createElement(tag); if (text != null) element.textContent = String(text); if (className) element.className = className; return element; };
@@ -35,18 +37,22 @@
     const selected = () => state.conversations.find(item => item.id === state.selected);
     const draftKey = () => state.selected || (state.context ? 'alert:' + state.context.id : 'new');
     const ready = () => !!state.user && !state.paused && state.enabled && state.status?.phase === 'ready' && state.snapshot?.status?.phase === 'ready' && !state.storageError && !state.syncError;
+    /** Persist the exact delivery key before a write can reach Slack. */
     function savePending(value, uncertain = state.pendingUncertain) {
       try { const serialized = JSON.stringify({request: value, uncertain}); sessionStorage.setItem(storageKey(state.user), serialized); if (sessionStorage.getItem(storageKey(state.user)) !== serialized) throw new Error('Storage unavailable'); state.pending = value; state.pendingUncertain = uncertain; return true; }
       catch { state.storageError = 'The request could not be retained in session storage. Sending is paused to prevent duplicates.'; render(); return false; }
     }
+    /** Release a delivery guard only when its removal can be verified locally. */
     function clearPending() {
       try { sessionStorage.removeItem(storageKey(state.user)); if (sessionStorage.getItem(storageKey(state.user)) !== null) throw new Error('Storage unavailable'); state.pending = null; state.pendingUncertain = false; return true; }
       catch { state.storageError = 'The confirmed request could not be cleared from session storage. Sending is paused.'; return false; }
     }
+    /** Recover this operator's guarded request without automatically resending it. */
     function restorePending() {
       try { const raw = sessionStorage.getItem(storageKey(state.user)); if (!raw) return; const retained = JSON.parse(raw); if (!validPending(retained.request) || typeof retained.uncertain !== 'boolean') throw new Error('Invalid retained request'); state.pending = retained.request; state.pendingUncertain = retained.uncertain; }
       catch { state.storageError = 'A retained Chai request could not be read safely. Restore session storage before sending.'; }
     }
+    /** Resolve retained delivery uncertainty only from a matching confirmed archive request. */
     function reconcile() {
       if (!state.pending) return;
       const conversation = state.conversations.find(item => (item.messages || []).some(message => message.request_id === state.pending.request_id));
@@ -58,6 +64,7 @@
       if (!state.selected && (!state.context || state.context.id === request.occurrence_id)) { state.selected = conversation.id; state.context = null; }
       state.error = '';
     }
+    /** Keep edits available while readiness and retained requests control sending. */
     function renderComposer() {
       const count = bytes(draft.value.trim()); counter.textContent = count + ' / 4000 bytes';
       draft.setAttribute('aria-invalid', count > 4000 ? 'true' : 'false');
@@ -65,6 +72,7 @@
       retainedText.hidden = !state.pending || state.paused; retainedText.textContent = state.pending && !state.paused ? 'Retained message: ' + state.pending.text : '';
       retry.hidden = !state.pending; retry.disabled = !ready() || state.sending;
     }
+    /** Render cached conversation state and preserve the operator's current draft. */
     function render() {
       if (state.destroyed) return;
       panel.hidden = !state.open; launcher.setAttribute('aria-expanded', String(state.open));
@@ -92,18 +100,23 @@
       } else { const empty = make('div', null, 'chai-empty'); empty.append(make('h3', state.selected ? 'Conversation unavailable' : 'What can Chai help with?'), make('p', state.selected ? 'This conversation is outside the current snapshot. Refresh or choose a conversation from history. Your draft is preserved.' : 'Investigate an alert or ask about CI operations. Replies appear here and in Slack.')); thread.append(empty); }
       if (nearBottom) thread.scrollTop = thread.scrollHeight;
       status.textContent = state.sending ? 'Sending to Chai…' : state.pending ? 'Delivery is unconfirmed. Retry only the retained request; its text and request ID are preserved.' : state.paused ? 'Session expired. Refresh the dashboard to sign in again.' : !state.user ? 'Waiting for your session…' : state.loading && !state.status ? 'Loading conversations…' : !state.enabled ? 'Chai conversations are unavailable.' : state.status?.phase !== 'ready' || state.snapshot?.status?.phase !== 'ready' ? 'Waiting for Slack coverage before sending.' : state.loading ? 'Syncing…' : state.status?.last_sync ? 'Synced ' + date(state.status.last_sync) : 'Replies refresh while this window is open.';
-      error.textContent = state.storageError || state.error; error.hidden = !error.textContent;
+      const recoveryError = state.snapshot?.status?.phase === 'ready' && state.status?.phase === 'degraded' ? state.status.error : '';
+      error.textContent = state.storageError || state.error || recoveryError; error.hidden = !error.textContent;
       draft.value = state.drafts.get(draftKey()) || ''; renderComposer();
     }
+    /** Poll only visible open chats and respect the most recent server backoff. */
     function schedule(delay = 5000) {
       window.clearTimeout(state.timer); state.timer = null;
       if (!state.destroyed && state.open && !doc.hidden && !state.paused && state.user) state.timer = window.setTimeout(refresh, Math.max(delay, state.nextPoll - Date.now()));
     }
+    /** Bound transport time without interpreting a timeout as a rejected write. */
     async function request(method, body) {
       const controller = new AbortController(), timeout = window.setTimeout(() => controller.abort(), method === 'GET' ? 12000 : 25000);
       try { return await options.request(method, body, controller.signal); } finally { window.clearTimeout(timeout); }
     }
+    /** Remove private display state when the authenticated identity is no longer verified. */
     function pause() { state.paused = true; window.clearTimeout(state.timer); state.conversations = []; state.drafts.clear(); state.selected = ''; state.context = null; options.onAuthError?.(); }
+    /** Ignore superseded cache reads so they cannot undo a confirmed send or identity change. */
     async function refresh() {
       if (state.destroyed || state.loading || !state.open || doc.hidden || state.paused || !state.user) return;
       if (Date.now() < state.nextPoll) { schedule(); return; }
@@ -118,12 +131,14 @@
       } catch (err) { if (generation === state.generation && conversationRevision === state.conversationRevision) { state.syncError = true; state.error = err.name === 'AbortError' ? 'Conversation sync timed out. Your draft is preserved.' : err.message || 'Conversation sync is unavailable.'; state.failures++; state.nextPoll = Math.max(state.nextPoll, Date.now() + Math.min(60000, 5000 * 2 ** Math.min(state.failures, 4))); } }
       finally { if (generation === state.generation) { state.loading = false; render(); schedule(); } }
     }
+    /** Freeze one explicit question and its destination before allocating a delivery key. */
     async function sendNew() {
       const text = draft.value.trim(); if (!ready() || state.selected && !selected() || state.pending || state.sending || !text || bytes(text) > 4000) return;
       if (!globalThis.crypto?.randomUUID) { state.error = 'A secure browser context is required to create a request ID.'; render(); return; }
       const payload = {request_id: crypto.randomUUID(), text}; if (state.selected) payload.conversation_id = state.selected; else if (state.context) payload.occurrence_id = state.context.id;
       if (savePending(payload, false)) await sendPending();
     }
+    /** Reuse the retained delivery key and keep uncertainty through subsequent failures. */
     async function sendPending() {
       if (!ready() || !state.pending || state.sending) return;
       const payload = state.pending, user = state.user, generation = state.generation;
@@ -150,7 +165,9 @@
       } catch (err) { if (generation === state.generation) state.error = (err.name === 'AbortError' ? 'Request timed out.' : err.message || 'Request interrupted.') + ' Delivery is unconfirmed. The original request ID is retained for retry.'; }
       finally { if (generation === state.generation) { state.sending = false; render(); schedule(); } }
     }
+    /** Start an unsent standalone draft without touching existing Slack threads. */
     function newConversation() { state.selected = ''; state.context = null; state.history = false; render(); draft.focus(); }
+    /** Resume the selected chat or bind an alert draft to its existing source thread. */
     function open(occurrence) {
       state.open = true;
       if (occurrence) {
@@ -161,7 +178,9 @@
       }
       render(); draft.focus(); refresh();
     }
+    /** Minimize the popup while retaining its selected conversation and unsent drafts. */
     function close() { state.open = false; state.history = false; window.clearTimeout(state.timer); render(); launcher.focus(); }
+    /** Reset private state on operator changes and take readiness from the main snapshot. */
     function update(snapshot) {
       const user = snapshot?.user || '';
       if (user !== state.user) {
@@ -170,8 +189,10 @@
       }
       state.snapshot = snapshot; state.paused = !user || snapshot?.authPaused === true; render(); if (state.open) refresh();
     }
+    /** Suspend foreground polling when the browser tab is hidden. */
     function visibility() { if (doc.hidden) window.clearTimeout(state.timer); else if (state.open) refresh(); }
     doc.addEventListener('visibilitychange', visibility);
+    /** Invalidate outstanding reads before removing this window and its listeners. */
     function destroy() { state.destroyed = true; state.generation++; window.clearTimeout(state.timer); doc.removeEventListener('visibilitychange', visibility); root.replaceChildren(); }
     render(); return {update, open, close, refresh, destroy};
   }

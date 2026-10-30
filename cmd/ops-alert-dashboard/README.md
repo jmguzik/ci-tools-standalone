@@ -384,6 +384,16 @@ Failed or missing metadata confirmation remains unconfirmed rather than falling
 back to a visible JSON record. Older clients' `/api/actions` investigation requests
 remain compatible with their existing workflow receipts.
 
+An unreadable dashboard chat request is quarantined instead of failing alert
+workflow recovery. Valid retained conversations remain readable, and acknowledge,
+snooze and close actions continue when their own archive coverage is complete.
+Chat sending pauses with a visible recovery warning because missing or damaged
+metadata cannot safely establish whether a question was already delivered. The
+pause is reconstructed from retained Slack records after a restart, and existing
+uncertain requests keep their delivery guards. Correcting the record or its
+departure from the retained history window allows recovery on the next complete
+sync. Malformed authoritative workflow receipts still fail workflow recovery.
+
 ## Recovery and operation
 
 The dashboard shows a rolling **48-hour** window by default. Change it with

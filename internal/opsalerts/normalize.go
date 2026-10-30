@@ -338,7 +338,7 @@ func (s *Service) normalize(m slack.Message) (Occurrence, bool, error) {
 	if m.SubType != "" && m.SubType != slack.MsgSubTypeBotMessage {
 		return Occurrence{}, false, nil
 	}
-	if m.Metadata.EventType == ConversationMetadataEvent && matchesIdentity(m, s.cfg.Writer) {
+	if s.conversationCandidate(m) {
 		return Occurrence{}, false, nil
 	}
 	source, err := s.source(m)

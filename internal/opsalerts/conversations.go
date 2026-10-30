@@ -161,29 +161,46 @@ func (s *Service) decodeConversation(message slack.Message) (conversationRecord,
 	return record, nil
 }
 
-// conversationRoot recognizes standalone chats independently of producer alerts.
-func (s *Service) conversationRoot(m slack.Message, now time.Time) (bool, error) {
-	if !matchesIdentity(m, s.cfg.Writer) || m.Hidden || m.SubType != "" && m.SubType != slack.MsgSubTypeBotMessage || m.ThreadTimestamp != "" && m.ThreadTimestamp != m.Timestamp {
-		return false, nil
+// conversationCandidate preserves recovery evidence even when chat metadata is unreadable.
+// Workflow receipt surfaces take precedence over mention-only chat recognition.
+func (s *Service) conversationCandidate(m slack.Message) bool {
+	if !matchesIdentity(m, s.cfg.Writer) || m.Hidden || m.SubType != "" && m.SubType != slack.MsgSubTypeBotMessage {
+		return false
 	}
-	marker := strings.HasSuffix(m.Text, "\n\n💬 Dashboard · Chai")
-	if m.Metadata.EventType != ConversationMetadataEvent && !marker {
+	if m.Metadata.EventType == ActionMetadataEvent || strings.HasPrefix(m.Text, ActionReceiptPrefix) || strings.HasPrefix(m.Text, ActionMarker) {
+		return false
+	}
+	return m.Metadata.EventType == ConversationMetadataEvent || strings.HasSuffix(m.Text, "\n\n💬 Dashboard · Chai") || regexp.MustCompile(`^<@[A-Za-z0-9_]{1,128}> `).MatchString(m.Text)
+}
+
+// conversationRoot retains candidate standalone chats independently of decoding health.
+func (s *Service) conversationRoot(m slack.Message, now time.Time) (bool, error) {
+	if !s.conversationCandidate(m) || m.ThreadTimestamp != "" && m.ThreadTimestamp != m.Timestamp {
 		return false, nil
 	}
 	at, err := slackTime(m.Timestamp)
 	if err != nil {
 		return false, err
 	}
-	if at.Before(s.historyStart(now, 0)) || at.After(now) {
-		return false, nil
+	return !at.Before(s.historyStart(now, 0)) && !at.After(now), nil
+}
+
+// conversationIssueCount applies the rolling window to chat-only recovery guards.
+func (s *Service) conversationIssueCount(cache serviceCache, now time.Time) int {
+	count := 0
+	for _, at := range cache.ConversationIssues {
+		if !at.Before(s.historyStart(now, 0)) && !at.After(now) {
+			count++
+		}
 	}
-	if m.Metadata.EventType != ConversationMetadataEvent {
-		return false, fmt.Errorf("conversation root missing metadata")
+	return count
+}
+
+// markConversationIssue keeps one recovery issue per affected thread without retaining errors.
+func markConversationIssue(cache *serviceCache, root string, at time.Time) {
+	if at.After(cache.ConversationIssues[root]) {
+		cache.ConversationIssues[root] = at
 	}
-	if _, err := s.decodeConversation(m); err != nil {
-		return false, fmt.Errorf("trusted conversation root: %w", err)
-	}
-	return true, nil
 }
 
 // Conversations returns copies and applies the rolling history window at read time.
@@ -192,6 +209,10 @@ func (s *Service) Conversations() ConversationSnapshot {
 	result := ConversationSnapshot{Status: cache.Coverage, Enabled: s.chaiUser() != "", Conversations: []Conversation{}}
 	now := s.clock.Now()
 	result.Status.Cutover = s.historyStart(now, 0)
+	if s.conversationIssueCount(cache, now) > 0 {
+		result.Status.Phase = "degraded"
+		result.Status.Error = "chat recovery incomplete; new chat requests are paused"
+	}
 	for _, conversation := range cache.Conversations {
 		if conversation.CreatedAt.Before(s.historyStart(now, 0)) || conversation.CreatedAt.After(now) {
 			continue
@@ -207,6 +228,9 @@ func (s *Service) Conversations() ConversationSnapshot {
 func (s *Service) replayConversations(cache *serviceCache) error {
 	cache.Conversations = map[string]Conversation{}
 	cache.ConversationRecords = map[string]conversationRecord{}
+	cache.ConversationIssues = map[string]time.Time{}
+	conflicts := sets.New[string]()
+	requestTimes := map[string]time.Time{}
 	cache.ConversationPending = maps.Clone(s.currentCache().ConversationPending)
 	now := s.clock.Now()
 	for id, attempt := range cache.ConversationPending {
@@ -244,6 +268,10 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 				continue
 			}
 			if message.ThreadTimestamp != "" && message.ThreadTimestamp != root {
+				if s.conversationCandidate(message) {
+					markConversationIssue(cache, root, rootAt)
+					continue
+				}
 				return fmt.Errorf("conversation reply outside requested thread")
 			}
 			at, err := slackTime(message.Timestamp)
@@ -255,26 +283,40 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 			}
 			item := ConversationMessage{Timestamp: message.Timestamp, Text: flatten(message), Author: message.User}
 			if matchesIdentity(message, s.cfg.Writer) {
-				if message.Metadata.EventType == ConversationMetadataEvent {
+				if s.conversationCandidate(message) {
 					record, err := s.decodeConversation(message)
 					if err != nil {
-						return err
+						markConversationIssue(cache, root, at)
+						continue
 					}
 					if record.SourceOccurrenceID != conversation.SourceOccurrenceID || record.Request.ConversationID != "" && record.Request.ConversationID != id || record.Request.OccurrenceID != "" && record.Request.OccurrenceID != id {
-						return fmt.Errorf("invalid conversation source association")
+						markConversationIssue(cache, root, at)
+						continue
 					}
 					if _, exists := cache.Records[record.Request.RequestID]; exists {
-						return fmt.Errorf("request ID shared by action and conversation")
+						markConversationIssue(cache, root, at)
+						continue
 					}
 					record.Root = root
 					if previous, exists := cache.ConversationRecords[record.Request.RequestID]; exists {
+						if at.After(requestTimes[record.Request.RequestID]) {
+							requestTimes[record.Request.RequestID] = at
+						}
 						if previous != record {
-							return fmt.Errorf("conflicting conversation request ID")
+							issueAt := requestTimes[record.Request.RequestID]
+							markConversationIssue(cache, root, issueAt)
+							markConversationIssue(cache, previous.Root, issueAt)
+							conflicts.Insert(record.Request.RequestID)
+							delete(cache.ConversationRecords, record.Request.RequestID)
 						}
 						continue
 					}
+					if conflicts.Has(record.Request.RequestID) {
+						markConversationIssue(cache, root, at)
+						continue
+					}
 					cache.ConversationRecords[record.Request.RequestID] = record
-					delete(cache.ConversationPending, record.Request.RequestID)
+					requestTimes[record.Request.RequestID] = at
 					item.Text = record.Request.Text
 					item.Author = record.Actor
 					item.IsOperator = true
@@ -318,6 +360,26 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 		if hasRequest {
 			cache.Conversations[id] = conversation
 		}
+	}
+	for id, conversation := range cache.Conversations {
+		messages := make([]ConversationMessage, 0, len(conversation.Messages))
+		hasRequest := false
+		for _, message := range conversation.Messages {
+			if conflicts.Has(message.RequestID) {
+				continue
+			}
+			hasRequest = hasRequest || message.IsOperator
+			messages = append(messages, message)
+		}
+		if !hasRequest {
+			delete(cache.Conversations, id)
+			continue
+		}
+		conversation.Messages = messages
+		cache.Conversations[id] = conversation
+	}
+	for id := range cache.ConversationRecords {
+		delete(cache.ConversationPending, id)
 	}
 	return nil
 }
@@ -399,6 +461,9 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 		if !attempt.Failed {
 			return Conversation{}, ErrDeliveryUncertain
 		}
+	}
+	if s.conversationIssueCount(cache, s.clock.Now()) > 0 {
+		return Conversation{}, ErrNotReady
 	}
 	root := ""
 	source := ""
