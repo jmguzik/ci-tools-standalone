@@ -7,11 +7,9 @@ import re
 import click
 import requests
 import yaml
-from google.api_core.exceptions import NotFound, PermissionDenied
-from google.auth import default
+from google.api_core.exceptions import RetryError, ServiceUnavailable
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import secretmanager
-from google.cloud.secretmanager import SecretPayload
 
 # Test Platform's project in GCP Secret Manager
 PROJECT_ID = "openshift-ci-secrets"
@@ -41,40 +39,18 @@ REQUEST_INFO = "request-information"
 SECRET_NAME_MAX_LENGTH = 200
 
 
-def ensure_authentication(
-    client: secretmanager.SecretManagerServiceClient, collection: str
-):
+def is_login_error(error: Exception) -> bool:
     """
-    Ensures that the user is authenticated with Google Cloud.
-    If client and collection are not empty, verifies that the user
-    has permission to access secrets in a collection.
-
-    Raises:
-        click.ClickException: If application default credentials are not found.
+    is_login_error reports whether a Google error means the user's Google login is missing,
+    expired, or revoked: missing credentials, an unavailable-service error carrying Google's
+    invalid_grant OAuth error (how an expired or revoked login is reported), or a retry
+    timeout whose last error was one. Other unavailable-service errors are not login errors.
     """
-    try:
-        _, _ = default()
-    except DefaultCredentialsError as e:
-        raise click.ClickException(
-            "Credentials for authenticating into google cloud not found. Run the `login` command to authenticate."
-        ) from e
-
-    if client and collection != "":
-        index_secret = client.secret_version_path(
-            PROJECT_ID, get_index_secret_for_collection(collection), "latest"
-        )
-        try:
-            client.access_secret_version(request={"name": index_secret})
-        except PermissionDenied:
-            raise click.ClickException(
-                f"You don't have permission to access secrets in collection '{collection}'."
-            )
-        except NotFound:
-            raise click.ClickException(f"Collection '{collection}' does not exist.")
-        except Exception as e:
-            raise click.ClickException(
-                f"Failed to access collection '{collection}': {e}"
-            )
+    if isinstance(error, RetryError):
+        error = error.cause
+    if isinstance(error, ServiceUnavailable):
+        return "invalid_grant" in str(error)
+    return isinstance(error, DefaultCredentialsError)
 
 
 def validate_collection(_ctx, _param, value):
@@ -217,10 +193,6 @@ def get_secret_name(collection: str, path: str) -> str:
     return f"{collection}__{path_normalized}"
 
 
-def get_index_secret_for_collection(collection: str) -> str:
-    return f"{collection}__{INDEX_SECRET_NAME}"
-
-
 def get_updater_sa_secret_for_collection(collection: str) -> str:
     return f"{collection}__{UPDATER_SA_SECRET_NAME}"
 
@@ -350,44 +322,6 @@ def check_if_collection_exists(collection: str) -> bool:
     return collection in collections_set
 
 
-def get_secrets_from_index(
-    client: secretmanager.SecretManagerServiceClient, collection: str
-) -> list[str]:
-    """
-    Gets the secrets listed in the index secret of the collection.
-
-    Args:
-        client (secretmanager.SecretManagerServiceClient): Secret Manager client.
-        collection (str): Name of the collection.
-
-    Returns:
-        list[str]: A list of secrets.
-    """
-    index_secret = client.secret_version_path(
-        PROJECT_ID, get_index_secret_for_collection(collection), "latest"
-    )
-    try:
-        response = client.access_secret_version(request={"name": index_secret})
-    except PermissionDenied:
-        raise click.ClickException(
-            f"You don't have permission to access secrets in collection '{collection}'."
-        )
-    except NotFound:
-        raise click.ClickException(f"Collection '{collection}' does not exist.")
-    except Exception as e:
-        raise click.ClickException(
-            f"Failed to list secrets for collection '{collection}': {e}"
-        )
-
-    secret_list = []
-    try:
-        secret_list = yaml.safe_load(response.payload.data.decode("UTF-8"))
-    except yaml.YAMLError as e:
-        raise click.ClickException(f"Failed to parse the index secret: {e}") from e
-
-    return secret_list if secret_list is not None else []
-
-
 def destroy_previous_versions(
     client: secretmanager.SecretManagerServiceClient,
     secret_path: str,
@@ -412,35 +346,3 @@ def destroy_previous_versions(
     previous_versions.sort(key=lambda version: version.create_time, reverse=True)
     for v in previous_versions[1:]:
         client.destroy_secret_version(request={"name": v.name})
-
-
-def update_index_secret(
-    client: secretmanager.SecretManagerServiceClient,
-    collection: str,
-    secret_names: list[str],
-):
-    """
-    Updates the index secret for the collection with a new list of secrets.
-
-    Args:
-        client (secretmanager.SecretManagerServiceClient): Secret Manager client.
-        collection (str): Name of the collection.
-        secret_names (list[str]): A list of the new list of secrets to write into the index.
-    """
-
-    name = client.secret_path(PROJECT_ID, get_index_secret_for_collection(collection))
-    payload = yaml.safe_dump(sorted(secret_names))
-    try:
-        new_version = client.add_secret_version(
-            parent=name, payload=SecretPayload(data=payload.encode("utf-8"))
-        )
-    except Exception as e:
-        raise click.ClickException(f"Error while updating index: '{e}'.")
-
-    try:
-        destroy_previous_versions(client, name, new_version.name)
-    except Exception as e:
-        click.echo(
-            f"Warning: index for collection '{collection}' was updated, but failed to clean up previous versions: {e}",
-            err=True,
-        )

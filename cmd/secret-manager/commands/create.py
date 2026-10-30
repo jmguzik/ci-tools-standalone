@@ -14,10 +14,7 @@ from util import (
     ROTATION_INSTRUCTIONS,
     check_if_collection_exists,
     create_payload,
-    ensure_authentication,
     get_secret_name,
-    get_secrets_from_index,
-    update_index_secret,
     validate_collection,
     validate_path,
     validate_secret_source,
@@ -69,14 +66,6 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
             "See: https://docs.ci.openshift.org/docs/how-tos/adding-a-new-secret-to-ci/"
         )
     client = secretmanager.SecretManagerServiceClient()
-    ensure_authentication(client, collection)
-
-    index_secrets = get_secrets_from_index(client, collection)
-    path_normalized = secret_path.replace("/", "__")
-    if path_normalized in index_secrets:
-        raise click.ClickException(
-            f"Secret '{secret_path}' already exists."
-        )
 
     secret_id_normalized = get_secret_name(collection, secret_path)
     try:
@@ -115,7 +104,6 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
             parent=gcp_secret.name,
             payload=SecretPayload(data=create_payload(from_file, from_literal)),
         )
-        update_index_secret(client, collection, index_secrets + [path_normalized])
         click.echo(f"Secret '{secret_path}' created successfully.")
     except Exception as e:
         raise click.ClickException(
