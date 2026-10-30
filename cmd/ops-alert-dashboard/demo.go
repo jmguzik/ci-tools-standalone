@@ -49,6 +49,14 @@ func (a *demoArchive) Post(ctx context.Context, channel, root, requestID string,
 	if err := ctx.Err(); err != nil {
 		return "", errors.Join(opsalerts.ErrDeliveryFailed, err)
 	}
+	if channel != "CHY2E1BL4" {
+		return "", fmt.Errorf("%w: unknown demo channel", opsalerts.ErrDeliveryFailed)
+	}
+	for _, parent := range a.roots {
+		if parent.ClientMsgID == requestID {
+			return parent.Timestamp, nil
+		}
+	}
 	for _, messages := range a.threads {
 		for _, message := range messages {
 			if message.ClientMsgID == requestID {
@@ -56,28 +64,48 @@ func (a *demoArchive) Post(ctx context.Context, channel, root, requestID string,
 			}
 		}
 	}
+	if root == "" {
+		a.next = demoMessageTime(time.Now().UTC(), a.next)
+		timestamp := protocolTimestamp(a.next)
+		a.roots = append(a.roots, slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, Timestamp: timestamp, ClientMsgID: requestID, Text: message.Text, Metadata: message.Metadata}})
+		a.chaiReply(len(a.roots)-1, message.Text)
+		return timestamp, nil
+	}
 	for i := range a.roots {
 		if a.roots[i].Timestamp != root || channel != "CHY2E1BL4" {
 			continue
 		}
-		if now := time.Now().UTC(); now.After(a.next) {
-			a.next = now
-		}
-		a.next = a.next.Add(time.Millisecond)
+		a.next = demoMessageTime(time.Now().UTC(), a.next)
 		timestamp := protocolTimestamp(a.next)
 		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: message.Text, Metadata: message.Metadata}})
 		a.roots[i].ReplyCount++
 		a.roots[i].LatestReply = timestamp
-		if strings.Contains(message.Text, "<@U_CHAI>") {
-			a.next = a.next.Add(time.Millisecond)
-			reply := slack.Message{Msg: slack.Msg{Type: "message", User: "U_CHAI", BotID: "B_CHAI", ThreadTimestamp: root, Timestamp: protocolTimestamp(a.next), Text: "Demo Chai reply: this is synthetic evidence. Check the affected controller logs, recent deployment changes, and the linked dashboard. No remediation was run."}}
-			a.threads[root] = append(a.threads[root], reply)
-			a.roots[i].ReplyCount++
-			a.roots[i].LatestReply = reply.Timestamp
-		}
+		a.chaiReply(i, message.Text)
 		return timestamp, nil
 	}
 	return "", fmt.Errorf("%w: demo alert root does not exist", opsalerts.ErrDeliveryFailed)
+}
+
+// chaiReply keeps synthetic assistant messages attached to their original demo parent.
+func (a *demoArchive) chaiReply(index int, text string) {
+	if !strings.Contains(text, "<@U_CHAI>") {
+		return
+	}
+	a.next = demoMessageTime(time.Now().UTC(), a.next)
+	root := a.roots[index].Timestamp
+	reply := slack.Message{Msg: slack.Msg{Type: "message", User: "U_CHAI", BotID: "B_CHAI", ThreadTimestamp: root, Timestamp: protocolTimestamp(a.next), Text: "Demo Chai reply: this is synthetic evidence. Check the affected controller logs, recent deployment changes, and the linked dashboard. No remediation was run."}}
+	a.threads[root] = append(a.threads[root], reply)
+	a.roots[index].ReplyCount++
+	a.roots[index].LatestReply = reply.Timestamp
+}
+
+// demoMessageTime leaves clock headroom so immediate replay never sees a synthetic future message.
+func demoMessageTime(now, previous time.Time) time.Time {
+	next := now.Add(-time.Second)
+	if !next.After(previous) {
+		next = previous.Add(time.Microsecond)
+	}
+	return next
 }
 
 // SetReaction keeps demo workflow exercises entirely in memory.
@@ -198,7 +226,7 @@ Read-only demo scan; no resources were changed.`},
 		}
 	}
 	roots = append(roots, demoMessage(now, 10*time.Hour, "U_CHAI", "B_CHAI", "[Scheduled task: pending_workloads_scan | Instructions: earlier/instructions.md]\nPending workload scan: one queue needs follow-up\n\n• build01: 2 Pending at the scan snapshot. Check eligible worker capacity.\n\nCoverage: inspected 16 of 17 contexts.\nCoverage gap: build13 could not be inspected.\nSynthetic demo report; this is earlier task history, not live cluster state."))
-	archive := &demoArchive{roots: roots, threads: map[string][]slack.Message{}, next: now, writer: cfg.Writer}
+	archive := &demoArchive{roots: roots, threads: map[string][]slack.Message{}, next: now.Add(-time.Second), writer: cfg.Writer}
 	classes, err := opsalerts.LoadClassification(demoClassification)
 	if err != nil {
 		return nil, err

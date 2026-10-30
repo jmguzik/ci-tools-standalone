@@ -41,16 +41,20 @@ type pendingDelivery struct {
 
 // serviceCache is published atomically after a complete replay.
 type serviceCache struct {
-	Coverage     Coverage
-	Threads      map[string]threadCache
-	Occurrences  map[string]Occurrence
-	Records      map[string]actionRecord
-	Rules        map[string]Snooze
-	WIPRules     map[string]WIPRule
-	WIPRevisions map[string]string
-	WIPOverrides map[string]string
-	Pending      map[string]pendingDelivery
-	Decorations  decorationState
+	Coverage            Coverage
+	Threads             map[string]threadCache
+	Occurrences         map[string]Occurrence
+	Records             map[string]actionRecord
+	Rules               map[string]Snooze
+	WIPRules            map[string]WIPRule
+	WIPRevisions        map[string]string
+	WIPOverrides        map[string]string
+	Pending             map[string]pendingDelivery
+	Decorations         decorationState
+	Conversations       map[string]Conversation
+	ConversationRecords map[string]conversationRecord
+	ConversationPending map[string]conversationAttempt
+	ConversationIssues  map[string]time.Time
 }
 
 // Service serializes recovery and mutations while keeping snapshots nonblocking.
@@ -62,6 +66,7 @@ type Service struct {
 	serial     chan struct{}
 	mu         sync.RWMutex
 	cache      serviceCache
+	activity   conversationActivity
 }
 
 // NewService validates trusted identities and starts with incomplete coverage.
@@ -167,8 +172,17 @@ func (s *Service) currentCache() serviceCache {
 // publish swaps complete cache state without holding a lock across I/O.
 func (s *Service) publish(cache serviceCache) {
 	s.mu.Lock()
+	previousIssues := s.conversationIssueCount(s.cache, s.clock.Now())
+	issues := s.conversationIssueCount(cache, s.clock.Now())
 	s.cache = cache
 	s.mu.Unlock()
+	if issues != previousIssues {
+		if issues > 0 {
+			logrus.WithField("affected_threads", issues).Warn("chat recovery incomplete; new chat requests paused")
+		} else {
+			logrus.Info("chat recovery complete; new chat requests resumed")
+		}
+	}
 }
 
 // degrade preserves the last complete queue while disabling writes.
@@ -206,7 +220,11 @@ func (s *Service) Sync(ctx context.Context) error {
 		if normalizeErr != nil {
 			return s.degrade(previous, normalizeErr)
 		}
-		if !admitted || !s.retained(occurrence, now, 24*time.Hour) {
+		chatRoot, chatErr := s.conversationRoot(root, now)
+		if chatErr != nil {
+			return s.degrade(previous, chatErr)
+		}
+		if !chatRoot && (!admitted || !s.retained(occurrence, now, 24*time.Hour)) {
 			continue
 		}
 		if existing, exists := threads[root.Timestamp]; exists {
@@ -215,7 +233,8 @@ func (s *Service) Sync(ctx context.Context) error {
 			}
 		}
 		thread, exists := previous.Threads[root.Timestamp]
-		if !exists || thread.Root.ReplyCount != root.ReplyCount || thread.Root.LatestReply != root.LatestReply {
+		_, chatIssue := previous.ConversationIssues[root.Timestamp]
+		if !exists || chatIssue || thread.Root.ReplyCount != root.ReplyCount || thread.Root.LatestReply != root.LatestReply {
 			thread.Replies, err = s.archive.Replies(ctx, s.cfg.ChannelID, root.Timestamp)
 			if err != nil {
 				return s.degrade(previous, fmt.Errorf("reading thread %s: %w", root.Timestamp, err))
@@ -249,6 +268,14 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		if err != nil {
 			return cache, err
 		}
+		chatRoot, chatErr := s.conversationRoot(thread.Root, now)
+		if chatErr != nil {
+			return cache, chatErr
+		}
+		if chatRoot {
+			retainedThreads[thread.Root.Timestamp] = thread
+			continue
+		}
 		if !admitted || !s.retained(o, now, 24*time.Hour) {
 			continue
 		}
@@ -258,6 +285,9 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		sort.Slice(replies, func(i, j int) bool { return timestampLess(replies[i].Timestamp, replies[j].Timestamp) })
 		for _, reply := range replies {
 			if reply.Timestamp == thread.Root.Timestamp || reply.SubType == slack.MsgSubTypeMessageDeleted {
+				continue
+			}
+			if s.conversationCandidate(reply) {
 				continue
 			}
 			if reply.ThreadTimestamp != "" && reply.ThreadTimestamp != thread.Root.Timestamp {
@@ -347,6 +377,9 @@ func (s *Service) replay(threads map[string]threadCache, pending map[string]pend
 		if _, exists := cache.Occurrences[attempt.Request.OccurrenceID]; !exists {
 			delete(cache.Pending, id)
 		}
+	}
+	if err := s.replayConversations(&cache); err != nil {
+		return cache, err
 	}
 	return cache, nil
 }

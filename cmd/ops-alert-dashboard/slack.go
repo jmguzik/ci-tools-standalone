@@ -116,19 +116,22 @@ func (a *slackArchive) Post(ctx context.Context, channel, rootTS, requestID stri
 	if err != nil {
 		return "", errors.Join(opsalerts.ErrDeliveryFailed, fmt.Errorf("encoding action metadata: %w", err))
 	}
-	if message.Metadata.EventType != opsalerts.ActionMetadataEvent {
+	if message.Metadata.EventType != opsalerts.ActionMetadataEvent && message.Metadata.EventType != opsalerts.ConversationMetadataEvent {
 		return "", fmt.Errorf("%w: invalid action metadata", opsalerts.ErrDeliveryFailed)
 	}
 	if len(metadata) > opsalerts.MaxActionMetadataBytes {
 		return "", fmt.Errorf("%w: action metadata exceeds the %d-byte application budget", opsalerts.ErrDeliveryFailed, opsalerts.MaxActionMetadataBytes)
 	}
-	postedChannel, timestamp, err := a.writer.PostMessageContext(ctx, channel,
-		slack.MsgOptionTS(rootTS), slack.MsgOptionText(message.Text, false),
+	options := []slack.MsgOption{slack.MsgOptionText(message.Text, false),
 		slack.MsgOptionMetadata(message.Metadata),
 		slack.MsgOptionDisableLinkUnfurl(), slack.MsgOptionDisableMediaUnfurl(),
 		slack.MsgOptionParse(false),
 		slack.UnsafeMsgOptionEndpoint(slack.APIURL+"chat.postMessage", clientMessageID(requestID).set),
-	)
+	}
+	if rootTS != "" {
+		options = append(options, slack.MsgOptionTS(rootTS))
+	}
+	postedChannel, timestamp, err := a.writer.PostMessageContext(ctx, channel, options...)
 	if err != nil {
 		var rejected slack.SlackErrorResponse
 		var rateLimit *slack.RateLimitedError
@@ -149,6 +152,9 @@ func (a *slackArchive) Post(ctx context.Context, channel, rootTS, requestID stri
 
 // confirmMetadata detects successful-looking posts whose durable payload was omitted.
 func (a *slackArchive) confirmMetadata(ctx context.Context, channel, rootTS, timestamp string, expected []byte) error {
+	if rootTS == "" {
+		rootTS = timestamp
+	}
 	params := slack.GetConversationRepliesParameters{ChannelID: channel, Timestamp: rootTS, Oldest: timestamp, Latest: timestamp, Inclusive: true, Limit: 1, IncludeAllMetadata: true}
 	messages, _, _, err := a.reader.GetConversationRepliesContext(ctx, &params)
 	if err != nil {
@@ -230,7 +236,7 @@ func waitRateLimit(ctx context.Context, err error) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return errors.Join(ctx.Err(), err)
 	case <-timer.C:
 		return nil
 	}

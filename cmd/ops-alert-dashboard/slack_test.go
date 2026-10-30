@@ -148,6 +148,13 @@ func TestSlackRateLimitCancellation(t *testing.T) {
 			if !errors.Is(err, context.Canceled) {
 				t.Errorf("want canceled read, got %v", err)
 			}
+			var limited *slack.RateLimitedError
+			if !errors.As(err, &limited) {
+				t.Fatalf("canceled read lost the Slack rate limit: %v", err)
+			}
+			if diff := cmp.Diff(time.Hour, limited.RetryAfter); diff != "" {
+				t.Errorf("unexpected retained Retry-After (-want +got):\n%s", diff)
+			}
 			if diff := cmp.Diff(1, len(fake.forms)); diff != "" {
 				t.Errorf("unexpected retries (-want +got):\n%s", diff)
 			}
@@ -378,6 +385,127 @@ func TestVerifySlackIdentity(t *testing.T) {
 			}
 			if diff := cmp.Diff("B", cfg.Writer.BotID); diff != "" {
 				t.Errorf("unexpected verified bot (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestSlackConversationPost checks new-root and reply delivery without retrying ambiguous confirmations.
+func TestSlackConversationPost(t *testing.T) {
+	const requestID = "chat-stable-request"
+	message := slack.Msg{Text: "<@U_CHAI> Explain the controller backlog.\n\n💬 Dashboard · Chai", Metadata: slack.SlackMetadata{EventType: opsalerts.ConversationMetadataEvent, EventPayload: map[string]interface{}{"record": `{"version":1,"actor":"operator@example.test","request":{"request_id":"chat-stable-request"}}`}}}
+	metadata, err := json.Marshal(message.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted := slackHTTPResult{body: `{"ok":true,"channel":"C","ts":"200.000001"}`}
+	rootRead := slackHTTPResult{body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","metadata":%s}]}`, metadata)}
+	cases := []struct {
+		name, root string
+		results    []slackHTTPResult
+		wantError  error
+		wantText   string
+	}{
+		{name: "new root has no thread timestamp", results: []slackHTTPResult{posted, rootRead}},
+		{name: "new root self thread timestamp", results: []slackHTTPResult{posted, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","thread_ts":"200.000001","metadata":%s}]}`, metadata)}}},
+		{name: "followup stays in original thread", root: "100.000001", results: []slackHTTPResult{posted, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","thread_ts":"100.000001","metadata":%s}]}`, metadata)}}},
+		{name: "missing metadata is uncertain", results: []slackHTTPResult{posted, {body: `{"ok":true,"messages":[{"ts":"200.000001"}]}`}}, wantError: opsalerts.ErrDeliveryUncertain, wantText: "metadata is missing or differs"},
+		{name: "changed metadata is uncertain", results: []slackHTTPResult{posted, {body: strings.Replace(rootRead.body, "operator@example.test", "other@example.test", 1)}}, wantError: opsalerts.ErrDeliveryUncertain, wantText: "metadata is missing or differs"},
+		{name: "wrong returned message is uncertain", results: []slackHTTPResult{posted, {body: strings.Replace(rootRead.body, "200.000001", "199.000001", 1)}}, wantError: opsalerts.ErrDeliveryUncertain, wantText: "not returned with its metadata"},
+		{name: "wrong root thread is uncertain", results: []slackHTTPResult{posted, {body: fmt.Sprintf(`{"ok":true,"messages":[{"ts":"200.000001","thread_ts":"100.000001","metadata":%s}]}`, metadata)}}, wantError: opsalerts.ErrDeliveryUncertain, wantText: "outside its thread"},
+		{name: "readback rate limit is not retried", results: []slackHTTPResult{posted, {status: 429}}, wantError: opsalerts.ErrDeliveryUncertain, wantText: "rate limit"},
+		{name: "write rate limit is not retried", results: []slackHTTPResult{{status: 429}}, wantError: opsalerts.ErrDeliveryFailed, wantText: "rate limit"},
+		{name: "write transport uncertainty is not retried", results: []slackHTTPResult{{err: errors.New("connection lost")}}, wantError: opsalerts.ErrDeliveryUncertain, wantText: "connection lost"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &slackHTTPFake{results: tc.results}
+			client := fakeSlackClient(fake)
+			archive := &slackArchive{reader: client, writer: client}
+			got, err := archive.Post(context.Background(), "C", tc.root, requestID, message)
+			if !errors.Is(err, tc.wantError) {
+				t.Fatalf("want error %v, got %v", tc.wantError, err)
+			}
+			if tc.wantText != "" && (err == nil || !strings.Contains(err.Error(), tc.wantText)) {
+				t.Errorf("want error containing %q, got %v", tc.wantText, err)
+			}
+			wantTimestamp := "200.000001"
+			if tc.wantError != nil {
+				wantTimestamp = ""
+			}
+			if diff := cmp.Diff(wantTimestamp, got); diff != "" {
+				t.Errorf("unexpected timestamp (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(len(tc.results), len(fake.forms)); diff != "" {
+				t.Fatalf("unexpected attempts (-want +got):\n%s", diff)
+			}
+			wantPost := url.Values{"channel": {"C"}, "text": {message.Text}, "client_msg_id": {requestID}, "metadata": {string(metadata)}}
+			if tc.root != "" {
+				wantPost.Set("thread_ts", tc.root)
+			} else if _, present := fake.forms[0]["thread_ts"]; present {
+				t.Error("new root must omit thread_ts")
+			}
+			for key, want := range wantPost {
+				if diff := cmp.Diff(want, fake.forms[0][key]); diff != "" {
+					t.Errorf("unexpected post %s (-want +got):\n%s", key, diff)
+				}
+			}
+			text := fake.forms[0].Get("text")
+			for _, private := range []string{requestID, `"version"`, `"actor"`, opsalerts.ActionMarker} {
+				if strings.Contains(text, private) {
+					t.Errorf("private record %q leaked in text %q", private, text)
+				}
+			}
+			paths := []string{"/api/chat.postMessage"}
+			if len(tc.results) == 2 {
+				paths = append(paths, "/api/conversations.replies")
+				root := tc.root
+				if root == "" {
+					root = "200.000001"
+				}
+				wantRead := url.Values{"channel": {"C"}, "ts": {root}, "oldest": {"200.000001"}, "latest": {"200.000001"}, "inclusive": {"1"}, "limit": {"1"}, "include_all_metadata": {"1"}}
+				for key, want := range wantRead {
+					if diff := cmp.Diff(want, fake.forms[1][key]); diff != "" {
+						t.Errorf("unexpected bounded read %s (-want +got):\n%s", key, diff)
+					}
+				}
+			}
+			if diff := cmp.Diff(paths, fake.paths); diff != "" {
+				t.Errorf("unexpected endpoints (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestWaitRateLimitCancellation preserves server backoff after a foreground worker is canceled.
+func TestWaitRateLimitCancellation(t *testing.T) {
+	cases := []struct {
+		name       string
+		retryAfter time.Duration
+		wrapped    bool
+	}{
+		{name: "server backoff exceeds worker deadline", retryAfter: time.Hour},
+		{name: "wrapped rate limit remains discoverable", retryAfter: 2 * time.Minute, wrapped: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			limited := &slack.RateLimitedError{RetryAfter: tc.retryAfter}
+			var input error = limited
+			if tc.wrapped {
+				input = fmt.Errorf("reading replies: %w", limited)
+			}
+			err := waitRateLimit(ctx, input)
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("want context cancellation, got %v", err)
+			}
+			var got *slack.RateLimitedError
+			if !errors.As(err, &got) {
+				t.Fatalf("cancellation lost the Slack rate limit: %v", err)
+			}
+			if diff := cmp.Diff(tc.retryAfter, got.RetryAfter); diff != "" {
+				t.Errorf("unexpected retained Retry-After (-want +got):\n%s", diff)
 			}
 		})
 	}

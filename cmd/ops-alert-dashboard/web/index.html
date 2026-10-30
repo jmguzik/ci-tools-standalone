@@ -7,6 +7,7 @@
 <title>Test Platform · Operations</title>
 <link rel="stylesheet" href="/style.css">
 <script src="/reports.js" defer></script>
+<script src="/chat.js" defer></script>
 <script src="/app.js" defer></script>
 </head>
 <body>
@@ -23,6 +24,7 @@
 <div id="content"></div>
 <footer><span>Slack is the shared source of workflow history.</span><span>Workflow state does not establish source health · Times use your browser’s local time zone</span></footer>
 </main></div>
+<div id="chai-chat-root"></div>
 <dialog id="action-dialog" aria-labelledby="dialog-title"><form id="action-form"><div class="dialog-head"><h2 id="dialog-title"></h2><button class="btn" id="dialog-close" type="button" aria-label="Close preview">✕ Close</button></div><p id="dialog-context" class="muted"></p><fieldset id="scope-controls"><legend>Apply to</legend><label><input type="radio" name="scope" value="occurrence" checked> This occurrence</label><label><input type="radio" name="scope" value="regex"> Matching identifier regex</label></fieldset><label id="draft-label" for="draft"></label><textarea id="draft" required></textarea><div id="preview" class="preview" aria-live="polite"></div><p id="form-error" class="error-text" role="alert"></p><div class="actions"><button type="submit" class="btn primary" id="confirm"></button><button type="button" class="btn" id="cancel">Cancel</button></div></form></dialog>
 </body>
 </html>
