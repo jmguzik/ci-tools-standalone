@@ -170,6 +170,11 @@ func (s *Service) conversationCandidate(m slack.Message) bool {
 	if m.Metadata.EventType == ActionMetadataEvent || strings.HasPrefix(m.Text, ActionReceiptPrefix) || strings.HasPrefix(m.Text, ActionMarker) {
 		return false
 	}
+	// Legacy investigations start with a Chai mention and put their action
+	// record on a later line. Explicit chat metadata can quote that marker.
+	if m.Metadata.EventType != ConversationMetadataEvent && strings.Contains(m.Text, "\n"+ActionMarker) {
+		return false
+	}
 	return m.Metadata.EventType == ConversationMetadataEvent || strings.HasSuffix(m.Text, "\n\n💬 Dashboard · Chai") || regexp.MustCompile(`^<@[A-Za-z0-9_]{1,128}> `).MatchString(m.Text)
 }
 
