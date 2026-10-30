@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
-from google.api_core.exceptions import DeadlineExceeded, NotFound, PermissionDenied, RetryError, ServiceUnavailable
+from google.api_core.exceptions import DeadlineExceeded, InvalidArgument, NotFound, PermissionDenied, RetryError, ServiceUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from commands.create import create as create_command
@@ -46,18 +46,31 @@ class CommandsTest(unittest.TestCase):
         client.access_secret_version.assert_not_called()
 
     def test_create(self):
-        for name, get_error, want_exit, want_output, want_created in [
-            ("new secret is created", NotFound("missing"), 0, "created successfully", True),
-            ("existing secret is rejected", None, 1, "already exists", False),
-            ("missing permission is reported", PermissionDenied("denied"), 1, "Insufficient permissions", False),
+        for name, args, get_error, add_error, delete_error, want_exit, want_output, want_created, want_deleted in [
+            ("new secret is created", ["-l", "value"], NotFound("missing"), None, None,
+             0, "created successfully", True, False),
+            ("existing secret is rejected", ["-l", "value"], None, None, None,
+             1, "already exists", False, False),
+            ("missing permission is reported", ["-l", "value"], PermissionDenied("denied"), None, None,
+             1, "Insufficient permissions", False, False),
+            ("missing file is rejected before creating the secret", ["-f", "/nonexistent/secret.txt"],
+             NotFound("missing"), None, None, 2, "does not exist", False, False),
+            ("failed version add removes the empty secret", ["-l", "value"], NotFound("missing"),
+             InvalidArgument("too large"), None, 1, "Please try again", True, True),
+            ("failed cleanup asks the user to delete the secret", ["-l", "value"], NotFound("missing"),
+             InvalidArgument("too large"), PermissionDenied("denied"), 1,
+             "Run 'delete -c my-collection aws/key'", True, True),
         ]:
             with self.subTest(name=name):
                 client = fake_client()
                 client.get_secret.side_effect = get_error
+                client.create_secret.return_value.name = f"projects/openshift-ci-secrets/secrets/{SECRET_ID}"
+                client.add_secret_version.side_effect = add_error
+                client.delete_secret.side_effect = delete_error
                 result = self.run_command(
                     create_command,
                     "create",
-                    ["-c", "my-collection", "aws/key", "-l", "value"],
+                    ["-c", "my-collection", "aws/key", *args],
                     client,
                     check_if_collection_exists=True,
                     prompt_for_labels={},
@@ -69,6 +82,12 @@ class CommandsTest(unittest.TestCase):
                 self.assertEqual(client.add_secret_version.call_count, int(want_created))
                 if want_created:
                     self.assertEqual(client.create_secret.call_args.kwargs["request"]["secret_id"], SECRET_ID)
+                if want_deleted:
+                    client.delete_secret.assert_called_once_with(
+                        name=f"projects/openshift-ci-secrets/secrets/{SECRET_ID}"
+                    )
+                else:
+                    client.delete_secret.assert_not_called()
                 self.assert_index_untouched(client)
 
     def test_update(self):
