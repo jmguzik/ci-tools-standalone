@@ -58,6 +58,7 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
     Example: secret-manager create -c my-collection aws/password -l "secret value"
     """
     validate_secret_source(from_file, from_literal)
+    payload = create_payload(from_file, from_literal)
 
     if not check_if_collection_exists(collection):
         raise click.ClickException(
@@ -100,16 +101,28 @@ def create(collection: str, secret_path: str, from_file: str, from_literal: str)
                 },
             }
         )
+    except Exception as e:
+        raise click.ClickException(f"Failed to create secret '{secret_path}': {e}.") from e
+
+    try:
         client.add_secret_version(
             parent=gcp_secret.name,
-            payload=SecretPayload(data=create_payload(from_file, from_literal)),
+            payload=SecretPayload(data=payload),
         )
-        click.echo(f"Secret '{secret_path}' created successfully.")
     except Exception as e:
+        try:
+            client.delete_secret(name=gcp_secret.name)
+        except Exception as delete_error:
+            raise click.ClickException(
+                f"Failed to create secret '{secret_path}' (storing the secret value failed: {e}; "
+                f"cleanup failed: {delete_error}). "
+                f"Run 'delete -c {collection} {secret_path}', then try again."
+            ) from e
         raise click.ClickException(
-            f"Failed to create secret '{secret_path}': {e}. "
-            f"If the secret is in an inconsistent state, run 'delete -c {collection} {secret_path}', then try again."
+            f"Failed to create secret '{secret_path}' (storing the secret value failed: {e}). Please try again."
         ) from e
+
+    click.echo(f"Secret '{secret_path}' created successfully.")
 
 
 def prompt_for_labels() -> dict[str, str]:
