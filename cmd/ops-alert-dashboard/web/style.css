@@ -70,6 +70,74 @@
   .chai-draft { font-size: 16px; }
 }
 
+#alert-thread-root { position: fixed; top: 0; right: 0; bottom: 0; z-index: 45; display: flex; justify-content: flex-end; pointer-events: none; }
+#alert-thread-root > * { pointer-events: auto; }
+.thread-panel { display: flex; flex-direction: column; width: min(640px,100vw); height: 100dvh; min-height: 0; overflow-y: auto; background: var(--surface); border-left: 1px solid var(--line); box-shadow: -12px 0 40px light-dark(#20304b30,#0008); }
+.thread-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 15px 16px 10px; }
+.thread-heading { display: flex; flex-direction: column; gap: 2px; }
+.thread-heading > strong { font-size: 17px; }
+.thread-subtitle { color: var(--muted); font-size: 14px; }
+.thread-controls { display: flex; gap: 6px; align-items: center; }
+.thread-icon-button,.thread-refresh,.thread-close { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 6px 10px; }
+.thread-close { min-width: 32px; font-size: 17px; }
+.thread-context { padding: 8px 16px; background: var(--soft); border-block: 1px solid var(--line); font-size: 14px; overflow-wrap: anywhere; }
+.thread-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 16px 0; }
+.thread-link { color: var(--ink); }
+.thread-status { flex-shrink: 0; padding: 8px 16px; font-size: 14px; color: var(--muted); }
+.thread-error { padding: 7px 16px; color: var(--red); font-size: 14px; max-height: 120px; overflow: auto; }
+.thread-body { flex: 1; min-height: 60px; padding: 12px 16px; overflow-y: auto; overscroll-behavior: contain; overflow-wrap: anywhere; }
+.thread-empty { color: var(--muted); padding: 14px 2px; }
+.thread-message + .thread-message { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.thread-root { background: var(--soft); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; }
+.thread-root + .thread-replies, .thread-root + .thread-empty, .thread-root + .thread-load-older { margin-top: 12px; }
+.thread-message-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; font-size: 14px; }
+.thread-message-meta time { color: var(--muted); }
+.thread-avatar { width: 22px; height: 22px; border-radius: 5px; flex-shrink: 0; }
+.thread-avatar-fallback { display: inline-flex; align-items: center; justify-content: center; background: var(--selected); color: var(--ink); font-size: 13px; font-weight: 600; }
+.thread-bot-label { border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: 11px; color: var(--muted); }
+.thread-actor,.thread-edited { color: var(--muted); font-size: 13px; }
+.thread-message-body .thread-text { font-size: 15px; }
+.thread-message-body pre { max-width: 100%; overflow-x: auto; }
+.thread-text,.thread-rich-section { white-space: pre-wrap; }
+.thread-text blockquote { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line); }
+.thread-reactions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.thread-reaction { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 12px; padding: 2px 8px; background: var(--soft); font-size: 13px; cursor: default; }
+.thread-emoji { width: 18px; height: 18px; vertical-align: -3px; }
+.thread-attachment { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; margin-top: 10px; }
+.thread-attachment-author,.thread-attachment-footer { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; }
+.thread-attachment-image { max-width: 100%; max-height: 260px; border-radius: 6px; margin-top: 8px; }
+.thread-attachment-caption { display: block; color: var(--muted); font-size: 13px; }
+.thread-field { margin-top: 6px; }
+.thread-field strong { display: block; }
+.thread-field.short { display: inline-block; vertical-align: top; width: calc(50% - 6px); margin-right: 6px; }
+.thread-block-header { margin: 8px 0 4px; }
+.thread-block-context { color: var(--muted); font-size: 13px; }
+.thread-unsupported { color: var(--orange); font-size: 13px; margin: 8px 0 0; overflow-wrap: anywhere; }
+.thread-load-older { display: block; width: 100%; margin: 10px 0; padding: 8px; border: 1px dashed var(--line); border-radius: 6px; background: var(--surface); color: var(--muted); }
+.thread-pending-preview { padding: 7px 16px; font-size: 14px; max-height: 80px; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; color: var(--orange); }
+.thread-retry,.thread-discard { margin: 0 16px 8px; align-self: flex-start; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 6px 10px; }
+.thread-discard { color: var(--red); }
+.thread-composer { flex-shrink: 0; display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--line); padding: 12px 16px; background: var(--soft); }
+.thread-composer label { font-size: 14px; }
+.thread-draft { width: 100%; min-height: 74px; max-height: 150px; resize: vertical; padding: 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.thread-composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
+.thread-counter { color: var(--muted); font-size: 14px; }
+.thread-send { border: 1px solid var(--ink); border-radius: 6px; background: var(--ink); color: var(--surface); padding: 7px 12px; font-weight: 600; font-size: 15px; }
+@media(max-width:600px) {
+  .thread-panel { width: 100vw; }
+  .thread-draft { font-size: 16px; }
+}
+/* Keep the independent Chai launcher reachable while the non-modal discussion is open. */
+@media(min-width:1000px) {
+  body:has(#alert-thread-panel:not([hidden])) #chai-chat-root { right: auto; left: 20px; width: min(420px,calc(100vw - 680px)); }
+}
+@media(max-width:999px) {
+  body:has(#alert-thread-panel:not([hidden])) #chai-chat-root { z-index: 46; }
+  .thread-panel { height: calc(100dvh - 84px); }
+  #alert-thread-root { bottom: 84px; }
+  .thread-header { flex-wrap: wrap; }
+}
+
 * {
   box-sizing: border-box;
 }
