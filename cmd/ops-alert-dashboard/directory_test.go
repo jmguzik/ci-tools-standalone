@@ -13,6 +13,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/openshift/ci-tools-standalone/internal/opsalerts"
 	"github.com/slack-go/slack"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // directoryClock supplies deterministic expiry and Retry-After boundaries.
@@ -213,18 +214,19 @@ func TestSlackDirectoryTTL(t *testing.T) {
 		{name: "profile positive", ttl: time.Hour},
 		{name: "profile negative", negative: true, ttl: 5 * time.Minute},
 		{name: "emoji positive", emoji: true, ttl: time.Hour},
+		{name: "emoji negative", emoji: true, negative: true, ttl: 5 * time.Minute},
 		{name: "emoji long Retry-After", emoji: true, rate: true, ttl: time.Hour},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			first := slackHTTPResult{body: `{"ok":true,"user":{"id":"U_ONE","name":"First"}}`}
 			last := slackHTTPResult{body: `{"ok":true,"user":{"id":"U_ONE","name":"Second"}}`}
-			if tc.negative {
-				first.body = `{"ok":false,"error":"user_not_found"}`
-			}
 			if tc.emoji {
 				first.body = `{"ok":true,"emoji":{"custom":"https://emoji.slack-edge.com/first.png"}}`
 				last.body = `{"ok":true,"emoji":{"custom":"https://emoji.slack-edge.com/second.png"}}`
+			}
+			if tc.negative {
+				first.body = `{"ok":false,"error":"user_not_found"}`
 			}
 			if tc.rate {
 				first = slackHTTPResult{status: 429}
@@ -342,6 +344,253 @@ func (c *directoryWaitContext) Done() <-chan struct{} { c.once.Do(c.observe); re
 func enrichDirectoryAsync(ctx context.Context, directory *slackDirectory, page opsalerts.AlertThread, done chan<- directoryEnrichResult) {
 	directory.EnrichThread(ctx, &page)
 	done <- directoryEnrichResult{page: page}
+}
+
+// TestSlackDirectorySnapshotEviction keeps checked metadata stable across an unrelated cache eviction.
+func TestSlackDirectorySnapshotEviction(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		negative, cooldown bool
+	}{
+		{name: "warm profile and emoji"},
+		{name: "negative profile and emoji warnings", negative: true},
+		{name: "shared cooldown warnings", cooldown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+			clock := &directoryClock{now: now}
+			person := opsalerts.ThreadPerson{ID: "U_ONE", Name: "Cached profile", AvatarURL: "https://avatars.slack-edge.com/cached.png"}
+			entry := directoryPerson{Person: person, Until: now.Add(time.Hour)}
+			cache := directoryCache{
+				people:     map[string]directoryPerson{},
+				emojis:     map[string]string{"custom": "alias:target", "target": "https://emoji.slack-edge.com/cached.png"},
+				emojiUntil: now.Add(time.Hour),
+				backoff:    map[string]directoryBackoff{},
+			}
+			wantWarnings := []string{}
+			if tc.negative {
+				profileFailure, _ := metadataFailure(errors.New("unavailable"), "users", now)
+				emojiFailure, _ := metadataFailure(errors.New("unavailable"), "emoji", now)
+				entry.Warning, cache.emojiWarning = profileFailure.Warning, emojiFailure.Warning
+				wantWarnings = []string{emojiFailure.Warning, profileFailure.Warning}
+			}
+			if tc.cooldown {
+				profileFailure, _ := metadataFailure(&slack.RateLimitedError{RetryAfter: time.Hour}, "users", now)
+				emojiFailure, _ := metadataFailure(&slack.RateLimitedError{RetryAfter: time.Hour}, "emoji", now)
+				entry.Until, cache.emojiUntil = now, now
+				cache.backoff["users"], cache.backoff["emoji"] = profileFailure, emojiFailure
+				wantWarnings = []string{emojiFailure.Warning, profileFailure.Warning}
+			}
+			cache.people[person.ID] = entry
+			for i := range 511 {
+				cache.people[fmt.Sprintf("U_FILL_%03d", i)] = directoryPerson{Until: now.Add(2 * time.Hour)}
+			}
+			fake := &slackHTTPFake{results: []slackHTTPResult{{body: `{"ok":true,"bot":{"id":"B_NEW","name":"Unrelated"}}`}}}
+			directory := &slackDirectory{client: fakeSlackClient(fake), clock: clock, cache: cache}
+			page := directoryFixture()
+			reply := opsalerts.ThreadPerson{ID: person.ID, Name: "Message app", AvatarURL: "https://avatars.slack-edge.com/message.png", IsBot: true}
+			page.Messages = []opsalerts.ThreadMessage{{Author: reply}}
+			people, emojis := threadReferences(page)
+			snapshot, ready := directory.cachedSnapshot(people, emojis)
+			if !ready {
+				t.Fatal("cached metadata required a lookup")
+			}
+			unrelated := directoryPersonPage("B_NEW")
+			directory.EnrichThread(context.Background(), &unrelated)
+			if _, exists := directory.cache.people[person.ID]; exists || len(directory.cache.people) != 512 {
+				t.Fatal("unrelated cold lookup did not evict the checked profile at the cache bound")
+			}
+			if len(fake.forms) != 1 {
+				t.Fatalf("unexpected HTTP requests: %d", len(fake.forms))
+			}
+			// Mutate the live maps and advance time before presenting the checked snapshot.
+			directory.mu.Lock()
+			directory.cache.emojis["target"] = "https://emoji.slack-edge.com/changed.png"
+			directory.cache.backoff["users"] = directoryBackoff{Until: now.Add(3 * time.Hour), Warning: "changed user cooldown"}
+			directory.cache.backoff["emoji"] = directoryBackoff{Until: now.Add(3 * time.Hour), Warning: "changed emoji cooldown"}
+			directory.mu.Unlock()
+			clock.now = now.Add(2 * time.Hour)
+			snapshot.cache.presentCached(&page, people, emojis, sets.New[string](), snapshot.now)
+			if diff := cmp.Diff(person, page.Root.Author); diff != "" {
+				t.Errorf("unexpected snapshotted author (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(reply, page.Messages[0].Author); diff != "" {
+				t.Errorf("unexpected message override (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(wantWarnings, page.Warnings); diff != "" {
+				t.Errorf("unexpected snapshotted warnings (-want +got):\n%s", diff)
+			}
+			wantEmojis := map[string]string{"custom": "alias:target", "target": "https://emoji.slack-edge.com/cached.png"}
+			if diff := cmp.Diff(wantEmojis, page.Emojis); diff != "" {
+				t.Errorf("unexpected snapshotted emoji (-want +got):\n%s", diff)
+			}
+			page.People[person.ID] = opsalerts.ThreadPerson{Name: "Browser mutation"}
+			page.Emojis["target"] = "Browser mutation"
+			if diff := cmp.Diff(person, snapshot.cache.people[person.ID].Person); diff != "" {
+				t.Errorf("page mutated snapshot profile (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(wantEmojis, snapshot.cache.emojis); diff != "" {
+				t.Errorf("page mutated snapshot emoji (-want +got):\n%s", diff)
+			}
+			if directory.cache.emojis["target"] != "https://emoji.slack-edge.com/changed.png" {
+				t.Error("page mutated the live emoji cache")
+			}
+		})
+	}
+}
+
+// TestSlackDirectoryWarmReaders proves cached pages never wait behind unrelated SDK calls.
+func TestSlackDirectoryWarmReaders(t *testing.T) {
+	now := time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+	profileFailure, _ := metadataFailure(errors.New("profile unavailable"), "users", now)
+	emojiFailure, _ := metadataFailure(errors.New("emoji unavailable"), "emoji", now)
+	profileCooldown, _ := metadataFailure(&slack.RateLimitedError{RetryAfter: time.Hour}, "users", now)
+	emojiCooldown, _ := metadataFailure(&slack.RateLimitedError{RetryAfter: time.Hour}, "emoji", now)
+	cases := []struct {
+		name                        string
+		bot, negative, expired      bool
+		profileBackoff              bool
+		emojiBackoff, missing       bool
+		missingReference, coldEmoji bool
+		missingEmoji                bool
+		wantWarnings                []string
+	}{
+		{name: "warm profiles and emoji"},
+		{name: "negative profile and emoji caches", negative: true, wantWarnings: []string{emojiFailure.Warning, profileFailure.Warning}},
+		{name: "missing user under shared cooldown", missing: true, profileBackoff: true, wantWarnings: []string{profileCooldown.Warning}},
+		{name: "missing bot under shared cooldown", bot: true, missing: true, profileBackoff: true, wantWarnings: []string{profileCooldown.Warning}},
+		{name: "expired user under shared cooldown", expired: true, profileBackoff: true, wantWarnings: []string{profileCooldown.Warning}},
+		{name: "expired bot under shared cooldown", bot: true, expired: true, profileBackoff: true, wantWarnings: []string{profileCooldown.Warning}},
+		{name: "expired emoji under shared cooldown", coldEmoji: true, emojiBackoff: true, wantWarnings: []string{emojiCooldown.Warning}},
+		{name: "missing emoji under shared cooldown", missingEmoji: true, emojiBackoff: true, wantWarnings: []string{emojiCooldown.Warning}},
+		{name: "fresh user under another identity cooldown", profileBackoff: true},
+		{name: "fresh bot under another identity cooldown", bot: true, profileBackoff: true},
+		{name: "fresh emoji under shared cooldown", emojiBackoff: true},
+		{name: "negative caches under shared cooldowns", negative: true, profileBackoff: true, emojiBackoff: true, wantWarnings: []string{emojiFailure.Warning, profileFailure.Warning}},
+		{name: "mixed fresh and missing references", missingReference: true},
+		{name: "fresh profile and expired emoji", coldEmoji: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, method := "U_ONE", "users"
+			if tc.bot {
+				id, method = "B_ONE", "bots"
+			}
+			person := opsalerts.ThreadPerson{ID: id, Name: "Cached profile", AvatarURL: "https://avatars.slack-edge.com/cached.png", IsBot: tc.bot}
+			entry := directoryPerson{Person: person, Until: now.Add(time.Hour)}
+			cache := directoryCache{
+				people:     map[string]directoryPerson{},
+				emojis:     map[string]string{"custom": "alias:target", "target": "https://emoji.slack-edge.com/cached.png"},
+				emojiUntil: now.Add(time.Hour),
+				backoff:    map[string]directoryBackoff{},
+			}
+			if tc.expired {
+				entry.Until = now
+			}
+			if tc.negative {
+				entry.Person = opsalerts.ThreadPerson{}
+				entry.Warning = profileFailure.Warning
+				cache.emojiWarning = emojiFailure.Warning
+				cache.emojis = nil
+			}
+			if !tc.missing {
+				cache.people[id] = entry
+			}
+			if tc.profileBackoff {
+				cache.backoff[method] = profileCooldown
+			}
+			if tc.emojiBackoff {
+				cache.backoff["emoji"] = emojiCooldown
+			}
+			if tc.coldEmoji {
+				cache.emojiUntil = now
+			}
+			if tc.missingEmoji {
+				cache.emojis = nil
+				cache.emojiUntil = time.Time{}
+			}
+			holderID := "U_HOLDER"
+			holderResponse := `{"ok":true,"user":{"id":"U_HOLDER","name":"Unrelated"}}`
+			if tc.profileBackoff && method == "users" {
+				holderID = "B_HOLDER"
+				holderResponse = `{"ok":true,"bot":{"id":"B_HOLDER","name":"Unrelated"}}`
+			}
+			results := []slackHTTPResult{{body: holderResponse}}
+			wantLookup := tc.missingReference || tc.coldEmoji && !tc.emojiBackoff
+			if tc.missingReference {
+				results = append(results, slackHTTPResult{body: `{"ok":true,"user":{"id":"U_MISSING","name":"Fetched profile"}}`})
+			}
+			if tc.coldEmoji && !tc.emojiBackoff {
+				results = append(results, slackHTTPResult{body: `{"ok":true,"emoji":{"custom":"https://emoji.slack-edge.com/refreshed.png"}}`})
+			}
+			release, entered := make(chan struct{}), make(chan struct{})
+			transport := &directoryHTTPFake{fake: &slackHTTPFake{results: results}, entered: entered, release: release}
+			directory := &slackDirectory{client: slack.New("unit-test-placeholder", slack.OptionHTTPClient(transport)), clock: &directoryClock{now: now}, cache: cache}
+			holderDone := make(chan directoryEnrichResult, 1)
+			go enrichDirectoryAsync(context.Background(), directory, directoryPersonPage(holderID), holderDone)
+			<-entered
+			page := directoryPersonPage(id)
+			page.Root.Text = ":custom:"
+			if tc.missingReference {
+				page.Root.Text += " <@U_MISSING>"
+			}
+			wantPerson := person
+			if tc.missing || tc.negative {
+				wantPerson = opsalerts.ThreadPerson{ID: id, Name: "Message fallback", AvatarURL: "https://avatars.slack-edge.com/fallback.png", IsBot: tc.bot}
+				page.People[id] = wantPerson
+			}
+			observed := make(chan struct{})
+			ctx := &directoryWaitContext{Context: context.Background(), observed: observed}
+			warmDone := make(chan directoryEnrichResult, 1)
+			go enrichDirectoryAsync(ctx, directory, page, warmDone)
+			var result directoryEnrichResult
+			select {
+			case result = <-warmDone:
+				calls := transport.count()
+				close(release)
+				<-holderDone
+				if wantLookup {
+					t.Fatal("missing or expired metadata did not acquire the lookup gate")
+				}
+				if calls != 1 {
+					t.Fatalf("cached reader performed extra HTTP requests: %d", calls)
+				}
+			case <-observed:
+				close(release)
+				<-holderDone
+				result = <-warmDone
+				if !wantLookup {
+					t.Fatal("cache-only reader waited for the unrelated lookup gate")
+				}
+			}
+			if diff := cmp.Diff(wantPerson, result.page.Root.Author); diff != "" {
+				t.Errorf("unexpected author (-want +got):\n%s", diff)
+			}
+			wantWarnings := tc.wantWarnings
+			if wantWarnings == nil {
+				wantWarnings = []string{}
+			}
+			if diff := cmp.Diff(wantWarnings, result.page.Warnings); diff != "" {
+				t.Errorf("unexpected warnings (-want +got):\n%s", diff)
+			}
+			wantEmojis := cache.emojis
+			if tc.negative || tc.missingEmoji {
+				wantEmojis = map[string]string{}
+			}
+			if tc.coldEmoji && !tc.emojiBackoff {
+				wantEmojis = map[string]string{"custom": "https://emoji.slack-edge.com/refreshed.png"}
+			}
+			if diff := cmp.Diff(wantEmojis, result.page.Emojis); diff != "" {
+				t.Errorf("unexpected emoji (-want +got):\n%s", diff)
+			}
+			if tc.missingReference && result.page.People["U_MISSING"].Name != "Fetched profile" {
+				t.Error("mixed references did not fetch the missing identity")
+			}
+			if diff := cmp.Diff(len(results), transport.count()); diff != "" {
+				t.Errorf("unexpected request count (-want +got):\n%s", diff)
+			}
+		})
+	}
 }
 
 // TestSlackDirectoryCancellation checks both cancelled gate waiters and cancelled first loads without cache poisoning.

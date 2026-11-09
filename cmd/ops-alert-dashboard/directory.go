@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"sort"
 	"strings"
@@ -36,6 +37,12 @@ type directoryCache struct {
 	emojiUntil   time.Time
 	emojiWarning string
 	backoff      map[string]directoryBackoff
+}
+
+// directorySnapshot keeps eligibility and presentation on the same detached cache view.
+type directorySnapshot struct {
+	cache directoryCache
+	now   time.Time
 }
 
 // slackDirectory coalesces misses with a cancellable gate, never a network-held cache lock.
@@ -89,6 +96,10 @@ func (a *slackArchive) EnrichThread(ctx context.Context, thread *opsalerts.Alert
 func (d *slackDirectory) EnrichThread(ctx context.Context, thread *opsalerts.AlertThread) {
 	people, emojis := threadReferences(*thread)
 	warnings := sets.New[string]()
+	if snapshot, ready := d.cachedSnapshot(people, emojis); ready {
+		snapshot.cache.presentCached(thread, people, emojis, warnings, snapshot.now)
+		return
+	}
 	if err := d.acquire(ctx); err != nil {
 		warnings.Insert("Slack metadata lookup cancelled; showing cached names, icons and shortcodes")
 		d.presentCached(thread, people, emojis, warnings)
@@ -111,6 +122,38 @@ func (d *slackDirectory) EnrichThread(ctx context.Context, thread *opsalerts.Ale
 		}
 	}
 	d.presentCached(thread, people, emojis, warnings)
+}
+
+// cachedSnapshot detaches cache-only results before another lookup can evict their entries.
+func (d *slackDirectory) cachedSnapshot(people, emojis []string) (directorySnapshot, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	now := d.now()
+	snapshot := directorySnapshot{now: now, cache: directoryCache{people: make(map[string]directoryPerson, len(people))}}
+	for _, id := range people {
+		entry := d.cache.people[id]
+		snapshot.cache.people[id] = entry
+		if now.Before(entry.Until) {
+			continue
+		}
+		method := "users"
+		if strings.HasPrefix(id, "B") {
+			method = "bots"
+		}
+		if !now.Before(d.cache.backoff[method].Until) {
+			return directorySnapshot{}, false
+		}
+	}
+	if len(emojis) > 0 && !now.Before(d.cache.emojiUntil) && !now.Before(d.cache.backoff["emoji"].Until) {
+		return directorySnapshot{}, false
+	}
+	snapshot.cache.backoff = maps.Clone(d.cache.backoff)
+	snapshot.cache.emojiUntil, snapshot.cache.emojiWarning = d.cache.emojiUntil, d.cache.emojiWarning
+	snapshot.cache.emojis = make(map[string]string, len(emojis))
+	for _, name := range emojis {
+		d.cache.copyEmoji(snapshot.cache.emojis, name, 0)
+	}
+	return snapshot, true
 }
 
 // lookupPerson deliberately uses the documented singular users.info API.
@@ -301,6 +344,11 @@ func (d *slackDirectory) lookupEmojis(ctx context.Context) string {
 func (d *slackDirectory) presentCached(thread *opsalerts.AlertThread, people, emojis []string, warnings sets.Set[string]) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	d.cache.presentCached(thread, people, emojis, warnings, d.now())
+}
+
+// presentCached renders either a locked live cache or a detached snapshot into page-owned maps.
+func (c *directoryCache) presentCached(thread *opsalerts.AlertThread, people, emojis []string, warnings sets.Set[string], now time.Time) {
 	if thread.People == nil {
 		thread.People = map[string]opsalerts.ThreadPerson{}
 	}
@@ -312,7 +360,7 @@ func (d *slackDirectory) presentCached(thread *opsalerts.AlertThread, people, em
 		if fallback.ID == "" {
 			fallback = opsalerts.ThreadPerson{ID: id, Name: id, IsBot: strings.HasPrefix(id, "B")}
 		}
-		entry := d.cache.people[id]
+		entry := c.people[id]
 		card := entry.Person
 		if card.ID == "" {
 			card = fallback
@@ -321,9 +369,28 @@ func (d *slackDirectory) presentCached(thread *opsalerts.AlertThread, people, em
 		if entry.Warning != "" {
 			warnings.Insert(entry.Warning)
 		}
+		method := "users"
+		if strings.HasPrefix(id, "B") {
+			method = "bots"
+		}
+		if cooldown := c.backoff[method]; !now.Before(entry.Until) && now.Before(cooldown.Until) && cooldown.Warning != "" {
+			warnings.Insert(cooldown.Warning)
+		}
+	}
+	if len(emojis) > 0 {
+		warning := ""
+		if now.Before(c.emojiUntil) {
+			warning = c.emojiWarning
+		}
+		if cooldown := c.backoff["emoji"]; !now.Before(c.emojiUntil) && now.Before(cooldown.Until) {
+			warning = cooldown.Warning
+		}
+		if warning != "" {
+			warnings.Insert(warning)
+		}
 	}
 	for _, name := range emojis {
-		d.copyEmoji(thread.Emojis, name, 0)
+		c.copyEmoji(thread.Emojis, name, 0)
 	}
 	thread.Root.Author = mergeThreadPerson(thread.Root.Author, thread.People[thread.Root.Author.ID])
 	for i := range thread.Messages {
@@ -346,20 +413,20 @@ func mergeThreadPerson(original, fallback opsalerts.ThreadPerson) opsalerts.Thre
 }
 
 // copyEmoji follows bounded aliases so the browser can resolve the target without another API call.
-func (d *slackDirectory) copyEmoji(target map[string]string, name string, depth int) {
+func (c *directoryCache) copyEmoji(target map[string]string, name string, depth int) {
 	if depth > 8 {
 		return
 	}
 	if _, exists := target[name]; exists {
 		return
 	}
-	value := d.cache.emojis[name]
+	value := c.emojis[name]
 	if value == "" {
 		return
 	}
 	target[name] = value
 	if alias, ok := strings.CutPrefix(value, "alias:"); ok {
-		d.copyEmoji(target, alias, depth+1)
+		c.copyEmoji(target, alias, depth+1)
 	}
 }
 
