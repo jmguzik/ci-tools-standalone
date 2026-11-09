@@ -170,7 +170,7 @@ func productionService(ctx context.Context, cfg settings, classes *opsalerts.Cla
 	if identity.TeamID != cfg.Slack.WorkspaceID {
 		return nil, fmt.Errorf("history token belongs to a different Slack workspace")
 	}
-	return opsalerts.NewService(cfg.Slack, classes, &slackArchive{reader: reader, writer: writer}, nil)
+	return opsalerts.NewService(cfg.Slack, classes, &slackArchive{reader: reader, writer: writer, directory: &slackDirectory{client: reader}}, nil)
 }
 
 // synchronize reconciles Slack independently of fast browser reads.

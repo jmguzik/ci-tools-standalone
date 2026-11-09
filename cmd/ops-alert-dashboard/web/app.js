@@ -14,6 +14,7 @@
   /** Use the browser's timezone rules so daylight-saving changes need no manual offset. */
   const date = value => { const d = new Date(value); return Number.isFinite(d.getTime()) ? new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(d) : 'Not available'; };
   const chaiChat = window.OpsChaiChat?.create({root: el('chai-chat-root'), renderBody: chatBody, formatDate: date, request: chatRequest, onAuthError: chatAuthenticationError});
+  const slackThread = window.OpsSlackThread?.create({root: el('alert-thread-root'), request: threadRequest, formatDate: date, channelName: () => channelName(), usergroups: () => state.snapshot?.usergroups || {}, onAuthError: chatAuthenticationError});
   /** Reuse the safe report renderer for conversational Markdown without interpreting HTML. */
   function chatBody(source, reference) { const body = node('div', null, 'report-body'); renderReportBody(body, source, reference); return body; }
   /** Keep chat writes on the same authenticated origin and server-derived actor as actions. */
@@ -24,6 +25,18 @@
     if (method === 'POST') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.snapshot?.csrf_token || ''; options.body = JSON.stringify(body); }
     const active = method === 'GET' && body?.conversation_id ? '?active=' + encodeURIComponent(body.conversation_id) : '';
     const response = await fetch('/api/conversations' + active, options);
+    const json = (response.headers.get('content-type') || '').includes('application/json');
+    if (generation !== state.generation || response.redirected || !json || response.status === 401 || response.status === 403) return {ok: false, status: 401, body: {error: 'Your authenticated session could not be verified.'}};
+    return {ok: response.ok, status: response.status, body: await response.json(), retryAfter: response.headers.get('retry-after')};
+  }
+  /** Keep original-thread reads and writes on the authenticated origin with the same session checks as chat. */
+  async function threadRequest(method, body, signal) {
+    const generation = state.generation;
+    const headers = {Accept: 'application/json'};
+    const options = {method, credentials: 'same-origin', cache: 'no-store', signal, headers};
+    if (method === 'POST') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.snapshot?.csrf_token || ''; options.body = JSON.stringify(body); }
+    const query = method === 'GET' && body?.occurrence_id ? '?occurrence_id=' + encodeURIComponent(body.occurrence_id) + (body.before ? '&before=' + encodeURIComponent(body.before) : '') : '';
+    const response = await fetch('/api/alert-thread' + query, options);
     const json = (response.headers.get('content-type') || '').includes('application/json');
     if (generation !== state.generation || response.redirected || !json || response.status === 401 || response.status === 403) return {ok: false, status: 401, body: {error: 'Your authenticated session could not be verified.'}};
     return {ok: response.ok, status: response.status, body: await response.json(), retryAfter: response.headers.get('retry-after')};
@@ -321,6 +334,7 @@
     if (el('action-dialog').open) closeDialog(); state.fetchError = message;
     document.title = 'Sign in · Test Platform Operations';
     chaiChat?.update(null);
+    slackThread?.update(null);
   }
   /** Recognize proxy sign-in responses before treating their HTML as dashboard data. */
   async function responseJSON(response) {
@@ -620,7 +634,9 @@
       else actions.append(action('◷ Snooze', 'snooze', o));
       actions.append(action('☑ Close investigation', 'close', o));
     }
-    const ask = button('✧ Ask Chai', () => chaiChat ? chaiChat.open({occurrenceID: id(o), title: displayTitle(o)}) : openDialog('investigate', o)); ask.disabled = !state.snapshot || state.authPaused; actions.append(ask); container.append(actions);
+    const ask = button('✧ Ask Chai', () => chaiChat ? chaiChat.open({occurrenceID: id(o), title: displayTitle(o)}) : openDialog('investigate', o)); ask.disabled = !state.snapshot || state.authPaused; actions.append(ask);
+    // Loading the original discussion is isolated from reading state, selection and workflow actions.
+    const discussion = button('💬 Load Slack conversation', () => slackThread?.open({occurrenceID: id(o), title: displayTitle(o), slackURL: o.message.slack_url})); discussion.id = 'thread-open-' + id(o); discussion.disabled = !state.snapshot || state.authPaused; actions.append(discussion); container.append(actions);
     container.append(node('p', ready() ? 'Actions are saved in this Slack thread before the dashboard confirms them.' : state.pending ? 'Resolve the unconfirmed request before creating another action.' : 'Actions are available when coverage is ready and the snapshot is current.', 'fine'));
     renderSOPs(container, o);
     renderMetrics(container, o);
@@ -1417,9 +1433,10 @@
       }
       state.authPaused = false; state.snapshot = snapshot; state.fetchError = '';
       chaiChat?.update(snapshot);
+      slackThread?.update(snapshot);
       reconcilePersonal(snapshot, previous, options.quiet || !previous || options.reauthenticate); restorePending(snapshot.user); pruneSelection(); advanceSelection(selection);
       if (state.view === 'unmerged_prs') refreshPRs();
-    } catch (err) { state.wasReady = false; state.fetchError = err.name === 'AbortError' ? 'Snapshot timed out after 12 seconds. Actions are paused; refresh to retry.' : err.message || 'Snapshot unavailable. Actions are paused.'; }
+    } catch (err) { state.wasReady = false; state.fetchError = err.name === 'AbortError' ? 'Snapshot timed out after 12 seconds. Actions are paused; refresh to retry.' : err.message || 'Snapshot unavailable. Actions are paused.'; slackThread?.update(state.authPaused || !state.snapshot ? null : {...state.snapshot, status: {...state.snapshot.status, phase: 'degraded'}}); }
     finally { window.clearTimeout(timeout); state.fetching = false; render(); }
   }
   /** Retain an immutable request identity before its first network attempt. */

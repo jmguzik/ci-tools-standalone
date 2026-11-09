@@ -54,6 +54,11 @@ alerts, and other DPTP-bot parent notifications default to Orange / Other.
 
 The app must be a member of the channel and its token must be authorized for
 channel history and replies, `chat:write`, and `reactions:write`.
+For discussion display names, avatars and custom emoji, also grant the read
+token `users:read` and `emoji:read`. These directory reads are shared and cached,
+not repeated for every message or browser. Missing directory access leaves
+readable Slack IDs and emoji shortcodes with a warning; it does not grant access
+to additional channels. Bot identity is never changed with `chat:write.customize`.
 See Slack's [history](https://docs.slack.dev/reference/methods/conversations.history/)
 and [replies](https://docs.slack.dev/reference/methods/conversations.replies/)
 documentation for scopes and workspace limits. Read requests fetch every page,
@@ -224,6 +229,68 @@ An expired proxy session pauses background requests and provides Sign in again.
 Old data is marked stale and action delivery remains unconfirmed until reconciled.
 No pending mutation is replayed automatically after sign-in. The external proxy
 controls session lifetime; the core-ci deployment configures twelve hours.
+
+## Slack discussions
+
+Choose **Load Slack conversation** in an alert's inspector to open its original
+Slack thread in a separate, non-modal discussion panel. Loading a conversation
+does not mark the alert read, acknowledge it, or start a Chai investigation.
+Repeated alert names still have separate source threads; the server resolves
+the destination from the retained occurrence, not browser-supplied channel or
+thread identifiers. **Open in Slack** remains available for the original view.
+
+The panel shows the root message and a bounded page of replies in chronological
+order (up to 30 replies per page). **Load older messages** retrieves earlier
+cached replies only when requested. Names, avatars, bot identity, timestamps, edited indicators,
+mentions, reactions, custom emoji, supported Slack formatting, attachments and
+rich blocks are retained. Unsupported interactive blocks or media are identified
+with a link to the original Slack thread rather than silently interpreted as
+dashboard actions. Message HTML is never executed. Remote images are restricted
+to approved public Slack image hosts and the approved avatar host; arbitrary
+external images are not fetched through a server proxy.
+
+Thread reads and pagination reuse the complete shared Slack cache already used
+for workflow recovery. They do not introduce per-browser thread-history reads
+or continuous discussion polling. **Refresh cached conversation** reads the
+latest published cache and displays its source sync time. Messages arriving
+outside the dashboard appear after the regular shared Slack sync and an explicit
+refresh. This is not live Slack replication: reply edits or reactions that do
+not change the thread's reply count or latest-reply timestamp can wait until a
+later shared thread refetch. User profiles and relevant custom emoji are resolved lazily through a
+bounded shared directory cache, including cached failures, so reopening a thread
+does not repeat fresh directory lookups. Successful metadata is cached for one
+hour and failures for five minutes; Slack rate-limit backoff is shared across
+viewers. The directory cache retains at most 512 identities and 4,096 custom
+emoji, with bounded page-level enrichment and no remote image proxy.
+
+Only **Post reply** sends a message. Replies go to the selected alert's original
+thread as the configured dashboard bot, with the authenticated operator clearly
+attributed. They do not impersonate a Slack user, automatically mention Chai,
+or change alert workflow state. The composer accepts up to 4,000 UTF-8 bytes.
+New replies containing the reserved `OPS_ALERT_ACTION_V1` workflow-control marker
+are rejected rather than rewritten, so quoted text cannot become an action
+record when read by an older dashboard version. Existing Slack evidence remains
+visible without changing its text.
+Slack may normalize emoji and links when returning messages. Delivery records
+identify the original submission independently of that display formatting;
+edited messages keep their edited indicator and actual Slack sender identity.
+Drafts survive closing the panel and normal dashboard refreshes, but private
+display state and drafts are cleared when authentication or operator identity
+changes.
+
+The exact request ID, text and destination are retained in per-operator session
+storage before posting. Retry is explicit and reuses that request; ambiguous
+delivery is never treated as a confirmed failure or automatically reposted.
+Retries of uncertain or restored requests only reconcile against confirmed
+archive evidence, including after a server restart. Confirmation is independent
+of pagination, so an older reply can be confirmed without reloading or reposting
+it. If confirmation is still
+unavailable, check the original Slack thread before explicitly discarding the
+retained request; discarding does not prove that the reply was not delivered.
+Reads and replies require the existing authorized proxy session, and replies
+also require matching Origin and the operator-bound CSRF token. Slack tokens
+are never exposed to the browser. The synthetic demo supports discussion loading
+and replies without contacting Slack.
 
 ## Unmerged bot PRs
 
@@ -478,7 +545,8 @@ identity, scoped daily-reset WIP/Snooze and replay, stale/idempotent/uncertain
 writes, Chai thread binding, HTTP authorization/CSRF, Slack pagination, and complete
 GitHub search caching. Browser logic unit cases run with Node when available and
 cover personal unread state, notification deduplication, safe formatting, alert
-name grouping, and explicit recovery of partial close batches. Tests use fixed
+name grouping, on-demand Slack discussions, and explicit recovery of partial
+close batches. Tests use fixed
 clocks and in-memory transports. There is no integration or browser test
 framework.
 

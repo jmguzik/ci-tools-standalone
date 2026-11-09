@@ -24,6 +24,12 @@ import (
 // ConversationMetadataEvent separates chat requests from workflow receipts.
 const ConversationMetadataEvent = "ops_dashboard_conversation_v1"
 
+// ThreadReplyMetadataEvent keeps ordinary discussion replies separate from Chai requests.
+const ThreadReplyMetadataEvent = "ops_dashboard_thread_reply_v1"
+
+// threadReplyHeader survives stripped metadata without resembling a workflow receipt.
+const threadReplyHeader = "Dashboard reply (on behalf of an authenticated operator):\n\n"
+
 const conversationFooter = "\n\n💬 Dashboard · Chai"
 
 // ConversationRequest binds a stable delivery key to one operator question.
@@ -72,6 +78,7 @@ type conversationRecordRequest struct {
 
 // conversationRecord retains the exact original request and its server-thread binding.
 type conversationRecord struct {
+	Mode               string                    `json:"mode,omitempty"`
 	Version            int                       `json:"version"`
 	ChaiUser           string                    `json:"chai_user"`
 	TextHash           string                    `json:"text_hash"`
@@ -111,7 +118,7 @@ func (s *Service) decodeConversation(message slack.Message) (conversationRecord,
 	var record conversationRecord
 	raw, ok := message.Metadata.EventPayload["record"].(string)
 	envelope, err := json.Marshal(message.Metadata)
-	if err != nil || message.Metadata.EventType != ConversationMetadataEvent || !ok || len(message.Metadata.EventPayload) != 1 || len(envelope) > MaxActionMetadataBytes || strings.ContainsAny(raw, "\r\n") {
+	if err != nil || (message.Metadata.EventType != ConversationMetadataEvent && message.Metadata.EventType != ThreadReplyMetadataEvent) || !ok || len(message.Metadata.EventPayload) != 1 || len(envelope) > MaxActionMetadataBytes || strings.ContainsAny(raw, "\r\n") {
 		return record, fmt.Errorf("invalid conversation metadata envelope")
 	}
 	decoder := json.NewDecoder(strings.NewReader(raw))
@@ -122,19 +129,38 @@ func (s *Service) decodeConversation(message slack.Message) (conversationRecord,
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return record, fmt.Errorf("trailing conversation metadata")
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9_]{1,128}$`).MatchString(record.ChaiUser) {
+	if message.Metadata.EventType == ThreadReplyMetadataEvent {
+		if err := strictPlainRecord(json.NewDecoder(strings.NewReader(raw)), false); err != nil {
+			return record, fmt.Errorf("invalid thread reply metadata: %w", err)
+		}
+	}
+	if record.Mode != "reply" && (record.Mode != "" || message.Metadata.EventType != ConversationMetadataEvent || !regexp.MustCompile(`^[A-Za-z0-9_]{1,128}$`).MatchString(record.ChaiUser)) {
 		return record, fmt.Errorf("invalid conversation Chai user")
 	}
 	text, found := strings.CutPrefix(message.Text, "<@"+record.ChaiUser+"> ")
-	if record.Root == "" {
+	if record.Mode == "reply" {
+		if message.Metadata.EventType != ThreadReplyMetadataEvent || record.ChaiUser != "" || record.Root == "" || record.Request.OccurrenceID != s.cfg.ChannelID+":"+record.Root || record.SourceOccurrenceID != record.Request.OccurrenceID || record.Request.ConversationID != "" {
+			return record, fmt.Errorf("invalid thread reply association")
+		}
+		text, found = strings.CutPrefix(message.Text, threadReplyHeader)
+	} else if record.Root == "" {
 		text, found = trimConversationFooter(text)
 		found = found && strings.HasPrefix(message.Text, "<@"+record.ChaiUser+"> ")
 	}
-	record.Request.Text = html.UnescapeString(text)
-	if !found || record.TextHash != fmt.Sprintf("%x", sha256.Sum256([]byte(record.Request.Text))) {
+	record.Request.Text = text
+	if record.Mode != "reply" {
+		record.Request.Text = html.UnescapeString(text)
+	}
+	if !found || record.Mode != "reply" && record.TextHash != fmt.Sprintf("%x", sha256.Sum256([]byte(record.Request.Text))) || record.Mode == "reply" && !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(record.TextHash) {
 		return record, fmt.Errorf("conversation text does not match metadata")
 	}
-	if err := validateConversation(record.Actor, ConversationRequest(record.Request)); err != nil {
+	validationRequest := ConversationRequest(record.Request)
+	if record.Mode == "reply" {
+		// Slack canonicalizes emoji and URLs and allows later edits. The immutable
+		// digest confirms the submission; the current framed body is display only.
+		validationRequest.Text = "reply"
+	}
+	if err := validateConversation(record.Actor, validationRequest); err != nil {
 		return record, err
 	}
 	if record.Version != 1 || record.At.IsZero() || len(record.Root) > 64 || len(record.SourceOccurrenceID) > 256 {
@@ -180,7 +206,16 @@ func (s *Service) conversationCandidate(m slack.Message) bool {
 	if !matchesIdentity(m, s.cfg.Writer) || m.Hidden || m.SubType != "" && m.SubType != slack.MsgSubTypeBotMessage {
 		return false
 	}
-	if m.Metadata.EventType == ActionMetadataEvent || strings.HasPrefix(m.Text, ActionReceiptPrefix) || strings.HasPrefix(m.Text, ActionMarker) {
+	if m.Metadata.EventType == ThreadReplyMetadataEvent {
+		return true
+	}
+	if m.Metadata.EventType == ActionMetadataEvent {
+		return false
+	}
+	if strings.HasPrefix(m.Text, threadReplyHeader) {
+		return true
+	}
+	if strings.HasPrefix(m.Text, ActionReceiptPrefix) || strings.HasPrefix(m.Text, ActionMarker) {
 		return false
 	}
 	// Legacy investigations start with a Chai mention and put their action
@@ -275,6 +310,9 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 			}
 		}
 		messages := append([]slack.Message{thread.Root}, thread.Replies...)
+		for i := range messages {
+			messages[i] = visibleThreadMessage(messages[i])
+		}
 		sort.Slice(messages, func(i, j int) bool { return timestampLess(messages[i].Timestamp, messages[j].Timestamp) })
 		seen := sets.New[string]()
 		hasRequest := false
@@ -321,7 +359,7 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 						if at.After(requestTimes[record.Request.RequestID]) {
 							requestTimes[record.Request.RequestID] = at
 						}
-						if previous != record {
+						if !sameConversationRecord(previous, record) {
 							issueAt := requestTimes[record.Request.RequestID]
 							markConversationIssue(cache, root, issueAt)
 							markConversationIssue(cache, previous.Root, issueAt)
@@ -340,7 +378,7 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 					item.Author = record.Actor
 					item.IsOperator = true
 					item.RequestID = record.Request.RequestID
-					hasRequest = true
+					hasRequest = hasRequest || record.Mode != "reply"
 					if conversation.Title == "" {
 						conversation.Title = conversationTitle(record.Request.Text)
 					}
@@ -387,7 +425,8 @@ func (s *Service) replayConversations(cache *serviceCache) error {
 			if conflicts.Has(message.RequestID) {
 				continue
 			}
-			hasRequest = hasRequest || message.IsOperator
+			record := cache.ConversationRecords[message.RequestID]
+			hasRequest = hasRequest || message.IsOperator && record.Mode != "reply"
 			messages = append(messages, message)
 		}
 		if !hasRequest {
@@ -424,6 +463,10 @@ func (s *Service) conversationMessage(record conversationRecord) (slack.Msg, err
 		text += conversationFooter
 	}
 	message := slack.Msg{Text: text, Metadata: slack.SlackMetadata{EventType: ConversationMetadataEvent, EventPayload: map[string]interface{}{"record": string(data)}}}
+	if record.Mode == "reply" {
+		message.Text = threadReplyHeader + escapeSlack(record.Request.Text)
+		message.Metadata.EventType = ThreadReplyMetadataEvent
+	}
 	envelope, err := json.Marshal(message.Metadata)
 	if err != nil {
 		return slack.Msg{}, err
@@ -436,11 +479,22 @@ func (s *Service) conversationMessage(record conversationRecord) (slack.Msg, err
 
 // Converse serializes writes with archive recovery and never retries an uncertain post.
 func (s *Service) Converse(ctx context.Context, actor string, req ConversationRequest) (Conversation, error) {
-	req.Text = strings.TrimSpace(req.Text)
-	if err := validateConversation(actor, req); err != nil {
+	return s.postConversation(ctx, actor, req, false, false)
+}
+
+// postConversation shares serialization and durable delivery guards across the two explicit write modes.
+func (s *Service) postConversation(ctx context.Context, actor string, req ConversationRequest, plain, reconcileOnly bool) (Conversation, error) {
+	if !plain {
+		req.Text = strings.TrimSpace(req.Text)
+	}
+	validationRequest := req
+	if plain {
+		validationRequest.Text = strings.TrimSpace(req.Text)
+	}
+	if err := validateConversation(actor, validationRequest); err != nil {
 		return Conversation{}, err
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9_]{1,128}$`).MatchString(s.chaiUser()) {
+	if !plain && !regexp.MustCompile(`^[A-Za-z0-9_]{1,128}$`).MatchString(s.chaiUser()) {
 		return Conversation{}, fmt.Errorf("%w: configured Chai user identity required", ErrValidation)
 	}
 	if err := s.acquire(ctx); err != nil {
@@ -448,7 +502,7 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 	}
 	defer s.release()
 	cache := s.currentCache()
-	if cache.Coverage.Phase != "ready" {
+	if !plain && cache.Coverage.Phase != "ready" {
 		return Conversation{}, ErrNotReady
 	}
 	if _, exists := cache.Pending[req.RequestID]; exists {
@@ -458,8 +512,14 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 		return Conversation{}, ErrConflict
 	}
 	if previous, exists := cache.ConversationRecords[req.RequestID]; exists {
-		if previous.Actor != actor || ConversationRequest(previous.Request) != req {
+		if !matchesConversationRequest(previous, actor, req, plain) {
 			return Conversation{}, ErrConflict
+		}
+		if plain {
+			if o, exists := cache.Occurrences[req.OccurrenceID]; !exists || !s.retained(o, s.clock.Now(), 0) {
+				return Conversation{}, ErrNotFound
+			}
+			return Conversation{ID: req.OccurrenceID}, nil
 		}
 		for _, c := range cache.Conversations {
 			for _, m := range c.Messages {
@@ -474,12 +534,18 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 		return Conversation{}, ErrNotFound
 	}
 	if attempt, exists := cache.ConversationPending[req.RequestID]; exists {
-		if attempt.Record.Actor != actor || ConversationRequest(attempt.Record.Request) != req {
+		if !matchesConversationRequest(attempt.Record, actor, req, plain) {
 			return Conversation{}, ErrConflict
 		}
 		if !attempt.Failed {
 			return Conversation{}, ErrDeliveryUncertain
 		}
+	}
+	if reconcileOnly {
+		return Conversation{}, ErrDeliveryUncertain
+	}
+	if plain && cache.Coverage.Phase != "ready" {
+		return Conversation{}, ErrNotReady
 	}
 	if s.conversationIssueCount(cache, s.clock.Now()) > 0 {
 		return Conversation{}, ErrNotReady
@@ -508,6 +574,9 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 		}
 	}
 	record := conversationRecord{Version: 1, Request: conversationRecordRequest(req), ChaiUser: s.chaiUser(), TextHash: fmt.Sprintf("%x", sha256.Sum256([]byte(req.Text))), Actor: actor, At: s.clock.Now().UTC(), Root: root, SourceOccurrenceID: source}
+	if plain {
+		record.Mode, record.ChaiUser = "reply", ""
+	}
 	message, err := s.conversationMessage(record)
 	if err != nil {
 		return Conversation{}, err
@@ -540,6 +609,10 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 		return Conversation{}, s.degrade(s.currentCache(), deliveryErr)
 	}
 	conversation, exists := updated.Conversations[s.cfg.ChannelID+":"+root]
+	if plain {
+		_, exists = updated.ConversationRecords[req.RequestID]
+		conversation = Conversation{ID: req.OccurrenceID}
+	}
 	if !exists {
 		return Conversation{}, s.failedConversation(cache, record, fmt.Errorf("saved conversation outside retained window"))
 	}
@@ -547,6 +620,77 @@ func (s *Service) Converse(ctx context.Context, actor string, req ConversationRe
 	updated.Decorations = cache.Decorations
 	s.publish(updated)
 	return detachedConversation(conversation), nil
+}
+
+// matchesConversationRequest uses the immutable original hash for Slack-normalized plain replies.
+func matchesConversationRequest(record conversationRecord, actor string, req ConversationRequest, plain bool) bool {
+	if record.Actor != actor || (record.Mode == "reply") != plain {
+		return false
+	}
+	if !plain {
+		return ConversationRequest(record.Request) == req
+	}
+	return record.Request.RequestID == req.RequestID && record.Request.OccurrenceID == req.OccurrenceID && record.Request.ConversationID == req.ConversationID && record.TextHash == fmt.Sprintf("%x", sha256.Sum256([]byte(req.Text)))
+}
+
+// sameConversationRecord ignores Slack's mutable plain reply presentation, not its submission ledger.
+func sameConversationRecord(a, b conversationRecord) bool {
+	if a.Mode != "reply" || b.Mode != "reply" {
+		return a == b
+	}
+	a.Request.Text, b.Request.Text = "", ""
+	a.At, b.At = time.Time{}, time.Time{}
+	return a == b
+}
+
+// strictPlainRecord checks canonical plain-only schemas, leaving legacy Chai decoding unchanged.
+func strictPlainRecord(decoder *json.Decoder, request bool) error {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return fmt.Errorf("plain ledger must be an object")
+	}
+	keys := sets.New[string]()
+	allowed := sets.New("mode", "version", "chai_user", "text_hash", "request", "actor", "at", "root", "source_occurrence_id")
+	if request {
+		allowed = sets.New("conversation_id", "occurrence_id", "request_id")
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok || !allowed.Has(name) || keys.Has(name) {
+			return fmt.Errorf("duplicate or noncanonical plain ledger field")
+		}
+		keys.Insert(name)
+		if name == "request" {
+			if err := strictPlainRecord(decoder, true); err != nil {
+				return err
+			}
+			continue
+		}
+		value, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if name == "version" {
+			if _, ok := value.(float64); !ok {
+				return fmt.Errorf("invalid plain ledger version")
+			}
+			continue
+		}
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("plain ledger fields must be strings")
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return fmt.Errorf("invalid plain ledger object")
+	}
+	if request && !keys.HasAll("occurrence_id", "request_id") || !request && !keys.HasAll("mode", "version", "chai_user", "text_hash", "request", "actor", "at", "root", "source_occurrence_id") {
+		return fmt.Errorf("incomplete plain ledger")
+	}
+	return nil
 }
 
 // failedConversation preserves a delivery guard until trusted archive replay confirms it.
