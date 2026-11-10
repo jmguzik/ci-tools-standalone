@@ -782,12 +782,14 @@ func (s *Service) TouchConversation(id string) bool {
 	return true
 }
 
-// nextConversationRefresh selects one active thread and reserves its polling budget.
-func (s *Service) nextConversationRefresh(now time.Time) string {
+// nextConversationRefresh selects one active thread and reserves the shared
+// targeted-read budget for it. It returns the selected thread and the global
+// deadline claimed for the read; both are zero when nothing was selected.
+func (s *Service) nextConversationRefresh(now time.Time) (string, time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if now.Before(s.activity.Next) {
-		return ""
+		return "", time.Time{}
 	}
 	selected := ""
 	for id, interest := range s.activity.Threads {
@@ -802,13 +804,15 @@ func (s *Service) nextConversationRefresh(now time.Time) string {
 			selected = id
 		}
 	}
+	claimed := time.Time{}
 	if selected != "" {
 		interest := s.activity.Threads[selected]
 		interest.Next = now.Add(conversationPollInterval)
 		s.activity.Threads[selected] = interest
-		s.activity.Next = now.Add(conversationRefreshBudget)
+		claimed = now.Add(conversationRefreshBudget)
+		s.activity.Next = claimed
 	}
-	return selected
+	return selected, claimed
 }
 
 // claimRefreshBudget reserves the global targeted-read budget shared with
@@ -821,6 +825,20 @@ func (s *Service) claimRefreshBudget(now time.Time) time.Duration {
 	}
 	s.activity.Next = now.Add(conversationRefreshBudget)
 	return 0
+}
+
+// releaseRefreshBudget returns a claimed global budget deadline when the
+// claiming selection ends up reading nothing, so unrelated viewers are not
+// throttled by a skip. Only the exact claimed deadline is cleared, so newer
+// reservations such as a rate-limit backoff survive. A selection only happens
+// once any previous deadline has elapsed, so zeroing the claim cannot drop an
+// older unexpired deadline.
+func (s *Service) releaseRefreshBudget(claimed time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activity.Next.Equal(claimed) {
+		s.activity.Next = time.Time{}
+	}
 }
 
 // deferConversationRefresh postpones background polling of one root until at least the given time.
@@ -850,18 +868,22 @@ func (s *Service) SyncConversation(ctx context.Context) error {
 		return ErrNotReady
 	}
 	now := s.clock.Now()
-	id := s.nextConversationRefresh(now)
+	id, claimed := s.nextConversationRefresh(now)
 	if id == "" {
 		return nil
 	}
 	conversation, exists := cache.Conversations[id]
 	if !exists || conversation.CreatedAt.Before(s.historyStart(now, 0)) {
+		// The selected chat is no longer retained, so no Slack read happens.
+		s.releaseRefreshBudget(claimed)
 		return nil
 	}
 	root := strings.TrimPrefix(id, s.cfg.ChannelID+":")
 	if thread, exists := cache.Threads[root]; exists && now.Before(thread.RefreshAfter) {
-		// A recent targeted read or memoized failure already covers this root.
+		// A recent targeted read or memoized failure already covers this root,
+		// and a skip that reads nothing must not hold the shared budget.
 		s.deferConversationRefresh(root, thread.RefreshAfter)
+		s.releaseRefreshBudget(claimed)
 		return nil
 	}
 	updated, err := s.reloadThread(ctx, cache, root)
