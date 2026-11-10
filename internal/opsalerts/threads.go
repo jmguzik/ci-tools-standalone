@@ -3,7 +3,9 @@ package opsalerts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
 	"sort"
@@ -131,7 +133,12 @@ func (s *Service) alertThread(cache serviceCache, occurrenceID, before string) (
 	if !exists {
 		return AlertThread{}, ErrNotReady
 	}
-	result := AlertThread{OccurrenceID: occurrenceID, ChannelID: s.cfg.ChannelID, RootTS: o.Identity.Timestamp, SlackURL: o.Message.SlackURL, FetchedAt: cache.Coverage.LastSync, Messages: []ThreadMessage{}, People: map[string]ThreadPerson{}, Emojis: map[string]string{}, Warnings: []string{}}
+	// The per-root fetch time stays accurate even when full coverage advanced without re-reading this thread.
+	fetchedAt := thread.FetchedAt
+	if fetchedAt.IsZero() {
+		fetchedAt = cache.Coverage.LastSync
+	}
+	result := AlertThread{OccurrenceID: occurrenceID, ChannelID: s.cfg.ChannelID, RootTS: o.Identity.Timestamp, SlackURL: o.Message.SlackURL, FetchedAt: fetchedAt, Messages: []ThreadMessage{}, People: map[string]ThreadPerson{}, Emojis: map[string]string{}, Warnings: []string{}}
 	root := visibleThreadMessage(thread.Root)
 	result.Root = s.threadMessage(root, cache.ConversationRecords)
 	byTimestamp := map[string]slack.Message{}
@@ -180,6 +187,164 @@ func (s *Service) alertThread(cache serviceCache, occurrenceID, before string) (
 		result.People[item.Author.ID] = item.Author
 	}
 	return result, nil
+}
+
+// ThreadRefreshError reports how long a caller should wait before refreshing
+// the same discussion again. It satisfies errors.Is(err, ErrNotReady) so
+// transport layers can sanitize the cause while honoring RetryAfter.
+type ThreadRefreshError struct {
+	RetryAfter time.Duration
+}
+
+// Error implements error without exposing retained archive content.
+func (e *ThreadRefreshError) Error() string {
+	return fmt.Sprintf("%s: thread refresh available in %s", ErrNotReady, e.RetryAfter)
+}
+
+// Is lets sanitized APIs treat a throttled refresh like incomplete coverage.
+func (e *ThreadRefreshError) Is(target error) bool { return target == ErrNotReady }
+
+// threadReadCooldown bounds repeated targeted reads of one root after a confirmed read.
+const threadReadCooldown = 5 * time.Second
+
+// threadReadFailureCooldown memoizes failed targeted reads so repeated errors do not spam Slack.
+const threadReadFailureCooldown = 10 * time.Second
+
+// RefreshAlertThread reads one retained alert discussion from Slack on demand.
+// A successful read of the same root is reusable for the cooldown window, so
+// recent and concurrent viewers get the latest cached page without another
+// Slack call. Memoized read failures and an exhausted shared budget return
+// ThreadRefreshError instead of silently stale cache, and read failures never
+// degrade workflow coverage or retained content.
+func (s *Service) RefreshAlertThread(ctx context.Context, occurrenceID string) (AlertThread, error) {
+	if err := s.acquire(ctx); err != nil {
+		return AlertThread{}, errors.Join(ErrNotReady, err)
+	}
+	defer s.release()
+	// A done context can still win the acquire select against a free token.
+	if err := ctx.Err(); err != nil {
+		return AlertThread{}, errors.Join(ErrNotReady, err)
+	}
+	cache := s.currentCache()
+	if cache.Coverage.Phase != "ready" {
+		return AlertThread{}, ErrNotReady
+	}
+	occurrence, exists := cache.Occurrences[occurrenceID]
+	if !exists || !s.retained(occurrence, s.clock.Now(), 0) {
+		return AlertThread{}, ErrNotFound
+	}
+	root := occurrence.Identity.Timestamp
+	thread, exists := cache.Threads[root]
+	if !exists {
+		return AlertThread{}, ErrNotReady
+	}
+	now := s.clock.Now()
+	if !thread.RefreshFailed && !thread.FetchedAt.IsZero() {
+		if age := now.Sub(thread.FetchedAt); age >= 0 && age < threadReadCooldown {
+			// A recent successful read still describes Slack, and reusing it
+			// needs no I/O, so it also bypasses the shared global budget.
+			return s.alertThread(cache, occurrenceID, "")
+		}
+	}
+	if remaining := thread.RefreshAfter.Sub(now); remaining > 0 {
+		return AlertThread{}, &ThreadRefreshError{RetryAfter: remaining}
+	}
+	if remaining := s.claimRefreshBudget(now); remaining > 0 {
+		return AlertThread{}, &ThreadRefreshError{RetryAfter: remaining}
+	}
+	updated, err := s.reloadThread(ctx, cache, root)
+	if err != nil {
+		return AlertThread{}, s.threadRefreshFailure(ctx, cache, root, err)
+	}
+	s.publish(updated)
+	s.deferConversationRefresh(root, s.clock.Now().Add(conversationPollInterval))
+	return s.alertThread(updated, occurrenceID, "")
+}
+
+// reloadThread applies one confirmed archive read to a single root, including
+// replies, edits, deletions and a replacement root, then republishes nothing.
+// Callers keep deciding themselves whether a read is mandatory.
+func (s *Service) reloadThread(ctx context.Context, cache serviceCache, root string) (serviceCache, error) {
+	replies, err := s.archive.Replies(ctx, s.cfg.ChannelID, root)
+	if err != nil {
+		return cache, err
+	}
+	threads := maps.Clone(cache.Threads)
+	thread := threads[root]
+	thread.Replies = replies
+	for _, message := range replies {
+		if message.Timestamp == root {
+			thread.Root = message
+			break
+		}
+	}
+	now := s.clock.Now()
+	thread.FetchedAt = now
+	thread.RefreshAfter = now.Add(threadReadCooldown)
+	thread.RefreshFailed = false
+	threads[root] = thread
+	updated, err := s.replay(threads, cache.Pending)
+	if err != nil {
+		return cache, err
+	}
+	updated.Coverage = cache.Coverage
+	updated.Decorations = cache.Decorations
+	return updated, nil
+}
+
+// saveThreadReply records one confirmed thread write without rereading Slack.
+// A post confirms only its own message, so it never advances the
+// complete-thread fetch time that refresh reuse depends on.
+func saveThreadReply(threads map[string]threadCache, root, ts string, saved slack.Message) {
+	thread := threads[root]
+	thread.Replies = append(append([]slack.Message{}, thread.Replies...), saved)
+	thread.Root.ReplyCount++
+	thread.Root.LatestReply = ts
+	threads[root] = thread
+}
+
+// memoizeThreadReadFailure records the retry cooldown for a failed targeted
+// read. A rate limit registers even when the caller's context is already
+// done, because the transport already learned Slack's retry deadline; a plain
+// cancellation memoizes nothing so one leaving viewer cannot throttle others.
+// It returns the cooldown and whether one was recorded.
+func (s *Service) memoizeThreadReadFailure(ctx context.Context, cache serviceCache, root string, err error) (time.Duration, bool) {
+	cooldown := threadReadFailureCooldown
+	var limited *slack.RateLimitedError
+	rateLimited := errors.As(err, &limited) && limited.RetryAfter > 0
+	if rateLimited {
+		cooldown = limited.RetryAfter
+	} else if ctx.Err() != nil {
+		return 0, false
+	}
+	now := s.clock.Now()
+	if rateLimited {
+		s.mu.Lock()
+		if until := now.Add(cooldown); until.After(s.activity.Next) {
+			s.activity.Next = until
+		}
+		s.mu.Unlock()
+	}
+	threads := maps.Clone(cache.Threads)
+	thread := threads[root]
+	thread.RefreshAfter = now.Add(cooldown)
+	thread.RefreshFailed = true
+	threads[root] = thread
+	cache.Threads = threads
+	s.publish(cache)
+	return cooldown, true
+}
+
+// threadRefreshFailure memoizes a failed targeted read and returns a sanitized
+// error that keeps the original cause and carries the typed retry hint, so a
+// first failure already tells the transport when to retry.
+func (s *Service) threadRefreshFailure(ctx context.Context, cache serviceCache, root string, err error) error {
+	cooldown, memoized := s.memoizeThreadReadFailure(ctx, cache, root, err)
+	cause := fmt.Errorf("refreshing alert thread: %w", err)
+	if !memoized {
+		return errors.Join(ErrNotReady, cause)
+	}
+	return errors.Join(&ThreadRefreshError{RetryAfter: cooldown}, cause)
 }
 
 // ReplyToAlert uses the same durable write path as Chai without mentioning or requiring Chai.
