@@ -128,7 +128,8 @@
   const emoji = {rotating_light: '🚨', warning: '⚠️', eyes: '👀', zzz: '💤', white_check_mark: '✅', heavy_check_mark: '✔️', fire: '🔥', x: '❌', red_circle: '🔴', large_orange_circle: '🟠', large_yellow_circle: '🟡', information_source: 'ℹ️', rocket: '🚀', tada: '🎉', thumbsup: '👍', '+1': '👍', thumbsdown: '👎', '-1': '👎', hourglass_flowing_sand: '⏳', construction: '🚧', bell: '🔔', no_entry: '⛔', heart: '❤️', pray: '🙏', smile: '😄', bug: '🐛', robot_face: '🤖'};
   const decodeSlack = value => text(value).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   const emojify = value => value.replace(/:([a-z0-9_+-]+):/g, (match, name) => emoji[name] || match);
-  const channelName = () => state.snapshot?.channel_name || 'Operations channel';
+  /** Hoisted declaration: the Slack thread controller renders once while being created, before later const helpers in this script are initialized. */
+  function channelName() { return state.snapshot?.channel_name || 'Operations channel'; }
   /** Produce readable title text without interpreting source markup as HTML. */
   function plainSlack(value) {
     return emojify(decodeSlack(value)).replace(/<([^>|]+)\|([^>]+)>/g, '$2').replace(/<(https:\/\/[^>]+)>/g, '$1').replace(/[*_~`]/g, '');
