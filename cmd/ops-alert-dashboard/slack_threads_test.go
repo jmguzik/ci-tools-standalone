@@ -24,7 +24,7 @@ func TestSlackPlainReplyPost(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			message := slack.Msg{Text: "Dashboard reply: hello", Metadata: slack.SlackMetadata{EventType: opsalerts.ThreadReplyMetadataEvent, EventPayload: map[string]any{"record": `{"request":{"request_id":"plain"}}`}}}
+			message := slack.Msg{Text: "Dashboard reply (on behalf of operator@example.test):\n\n<@U_CHAI> check <#C_TEAM> *bold* _italic_", Metadata: slack.SlackMetadata{EventType: opsalerts.ThreadReplyMetadataEvent, EventPayload: map[string]any{"record": `{"request":{"request_id":"plain"}}`}}}
 			metadata, err := json.Marshal(message.Metadata)
 			if err != nil {
 				t.Fatal(err)
@@ -45,6 +45,12 @@ func TestSlackPlainReplyPost(t *testing.T) {
 			}
 			if fake.forms[0].Get("client_msg_id") != "plain" || fake.forms[0].Get("thread_ts") != "100.000001" || fake.forms[0].Get("metadata") != string(metadata) {
 				t.Fatalf("post lost durable delivery fields: %v", fake.forms[0])
+			}
+			if diff := cmp.Diff(message.Text, fake.forms[0].Get("text")); diff != "" {
+				t.Errorf("Slack references were escaped (-want +got):\n%s", diff)
+			}
+			if fake.forms[0].Get("parse") != "none" || fake.forms[0].Get("link_names") != "" {
+				t.Fatal("explicit references enabled automatic mention expansion")
 			}
 			if fake.forms[1].Get("oldest") != "200.000001" || fake.forms[1].Get("latest") != "200.000001" || fake.forms[1].Get("limit") != "1" {
 				t.Fatalf("unbounded metadata confirmation: %v", fake.forms[1])

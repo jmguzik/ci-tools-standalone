@@ -265,8 +265,26 @@ emoji, with bounded page-level enrichment and no remote image proxy.
 
 Only **Post reply** sends a message. Replies go to the selected alert's original
 thread as the configured dashboard bot, with the authenticated operator clearly
-attributed. They do not impersonate a Slack user, automatically mention Chai,
-or change alert workflow state. The composer accepts up to 4,000 UTF-8 bytes.
+attributed in the visible Slack header as well as the delivery record. They do
+not impersonate a Slack user or change alert workflow state. Chai is notified
+only when explicitly mentioned. The composer accepts up to 4,000 UTF-8 bytes.
+
+Explicit mentions remain actionable. `@chai-bot` uses the configured Chai Slack
+user ID, known cached Slack handles resolve to user IDs, and the configured
+channel name (for example `#ops-testplatform`) resolves to its channel ID.
+Canonical Slack references such as `<@U123ABC>` and `<#C123ABC>` are also retained.
+User and channel references in the discussion viewer link to their Slack
+profiles and channels. This resolution does not scan the workspace directory or
+perform new Slack reads when posting.
+
+Unknown, ambiguous, or expired handle references are rejected before posting,
+with a readable error and the draft retained, rather than silently becoming
+ordinary text. Open the conversation in Slack to find an explicit reference if
+the participant is not already cached. Code blocks, inline code, escaped
+references, email addresses, URL fragments, and numeric issue references such
+as `#123` stay literal. User-group and broadcast mentions are not supported by this composer;
+use Slack for those deliberately wider notifications.
+
 New replies containing the reserved `OPS_ALERT_ACTION_V1` workflow-control marker
 are rejected rather than rewritten, so quoted text cannot become an action
 record when read by an older dashboard version. Existing Slack evidence remains
@@ -274,6 +292,8 @@ visible without changing its text.
 Slack may normalize emoji and links when returning messages. Delivery records
 identify the original submission independently of that display formatting;
 edited messages keep their edited indicator and actual Slack sender identity.
+Legacy generic reply headers remain readable. Once attributed headers have been
+posted, rollback requires a version that recognizes those headers.
 Drafts survive closing the panel and normal dashboard refreshes, but private
 display state and drafts are cleared when authentication or operator identity
 changes.

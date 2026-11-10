@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/openshift/ci-tools-standalone/internal/opsalerts"
@@ -18,6 +19,16 @@ const demoThreadPersonIcon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAA
 
 // demoThreadEmojiIcon demonstrates a custom Slack emoji without a CDN request.
 const demoThreadEmojiIcon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAVElEQVR4nO3XIRIAIAhEUS7jjTyS99ZKIYCIgb8zVPYFCiIqY81dMWKlJ6Cq1MQAAJC9UAdAGcBbCsAFsJbflAII30BWKYAw4MUAAAAAwP/XrD3gAPcuAwkw+MuhAAAAAElFTkSuQmCC"
+
+// ResolveThreadReference supplies known demo handles without any Slack calls.
+func (*demoArchive) ResolveThreadReference(kind, name string) (string, bool) {
+	if kind != "@" {
+		return "", false
+	}
+	people := map[string]string{"demo-operator": "U_DEMO_OPERATOR", "dptp-bot": "U_DPTP", "chai-bot": "U_CHAI"}
+	id, found := people[strings.ToLower(name)]
+	return id, found
+}
 
 // seedDemoDiscussion adds safe rich Slack content without changing workflow state.
 func seedDemoDiscussion(archive *demoArchive, now time.Time) error {

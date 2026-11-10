@@ -22,6 +22,8 @@ type ThreadReplyRequest struct {
 	RequestID     string `json:"request_id"`
 	Text          string `json:"text"`
 	ReconcileOnly bool   `json:"reconcile_only,omitempty"`
+	// ChannelName is supplied by the authenticated dashboard, never JSON input.
+	ChannelName string `json:"-"`
 }
 
 // ThreadPerson identifies the actual Slack sender, not the operator using the dashboard.
@@ -194,7 +196,7 @@ func (s *Service) ReplyToAlert(ctx context.Context, actor string, req ThreadRepl
 		}
 	}
 	request := ConversationRequest{OccurrenceID: req.OccurrenceID, RequestID: req.RequestID, Text: req.Text}
-	_, err := s.postConversation(ctx, actor, request, true, req.ReconcileOnly)
+	_, err := s.postConversation(ctx, actor, request, true, req.ReconcileOnly, req.ChannelName)
 	if err != nil {
 		return AlertThread{}, err
 	}

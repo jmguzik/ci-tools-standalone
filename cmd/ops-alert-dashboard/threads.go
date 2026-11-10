@@ -64,10 +64,16 @@ func (d *dashboard) alertThread(w http.ResponseWriter, r *http.Request, actor st
 			writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid reply JSON", Code: "validation"})
 			return
 		}
+		req.ChannelName = d.channelName
 		thread, err = service.ReplyToAlert(ctx, actor, req)
 	}
 	if err != nil {
 		status, code := actionError(err)
+		var referenceError *opsalerts.ThreadReferenceError
+		if errors.As(err, &referenceError) {
+			writeJSON(w, status, apiError{Error: referenceError.Error(), Code: code})
+			return
+		}
 		writeJSON(w, status, apiError{Error: "Slack discussion request could not be completed (" + code + ")", Code: code})
 		return
 	}
