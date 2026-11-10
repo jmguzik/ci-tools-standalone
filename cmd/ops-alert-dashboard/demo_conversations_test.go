@@ -21,7 +21,7 @@ func TestDemoConversationPosts(t *testing.T) {
 		{name: "new question without mention"},
 		{name: "followup with Chai", root: "100.000001", chai: true},
 		{name: "plain reply", root: "100.000001", plain: true},
-		{name: "plain reply never synthesizes Chai", root: "100.000001", plain: true, chai: true},
+		{name: "plain reply explicitly mentions Chai", root: "100.000001", plain: true, chai: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,7 +63,7 @@ func TestDemoConversationPosts(t *testing.T) {
 			if tc.root != "" {
 				wantReplies++
 			}
-			if tc.chai && !tc.plain {
+			if tc.chai {
 				wantReplies++
 			}
 			if diff := cmp.Diff(wantReplies, len(messages)); diff != "" {

@@ -59,7 +59,8 @@
     const loadOlder = button('↑ Load older messages', loadOlderPage, 'thread-load-older'); loadOlder.hidden = true;
     const retainedText = make('div', null, 'thread-pending-preview');
     const composer = make('div', null, 'thread-composer'), label = make('label', null, 'thread-composer-label'); label.htmlFor = 'alert-thread-draft';
-    const draft = make('textarea', null, 'thread-draft'); draft.id = 'alert-thread-draft'; draft.rows = 3; draft.placeholder = 'Write a reply to the original thread…'; draft.setAttribute('aria-describedby', 'alert-thread-counter');
+    const mentionHint = make('p', null, 'thread-subtitle'); mentionHint.id = 'alert-thread-mentions';
+    const draft = make('textarea', null, 'thread-draft'); draft.id = 'alert-thread-draft'; draft.rows = 3; draft.placeholder = 'Write a reply to the original thread…'; draft.setAttribute('aria-describedby', 'alert-thread-counter alert-thread-mentions');
     draft.addEventListener('input', () => { if (state.occurrence && !state.paused) { state.drafts.delete(state.occurrence.id); state.drafts.set(state.occurrence.id, draft.value); trimCache(state.drafts); } renderComposer(); });
     const footer = make('div', null, 'thread-composer-footer'), counter = make('span', null, 'thread-counter'); counter.id = 'alert-thread-counter';
     const send = button('Post reply', sendNew, 'thread-send'), retry = button('Retry retained reply', sendPending, 'thread-retry');
@@ -157,16 +158,24 @@
       return make('span', ':' + shortcode + ':');
     }
     const emojify = (value, view) => text(value).replace(/:([a-z0-9_+-]+):/g, (match, name) => Object.hasOwn(emoji, name) ? emoji[name] : match);
+    /** Make known Slack user and channel references actionable without trusting arbitrary link hosts. */
+    function referenceLink(kind, id, label, view) {
+      const pattern = kind === '@' ? /^[UW][A-Za-z0-9_]{1,127}$/ : /^[CG][A-Za-z0-9_]{1,127}$/;
+      const original = safeURL(view?.meta.slack_url);
+      if (!pattern.test(text(id)) || !original || !/(?:^|\.)slack\.com$/.test(original.hostname)) return make('span', label, 'thread-mention');
+      const path = kind === '@' ? '/team/' : '/archives/';
+      return anchor(original.origin + path + encodeURIComponent(id), label, 'thread-mention thread-link');
+    }
     /** Render one Slack angle-bracket token as a resolved mention, channel, group or safe link. */
     function specialToken(token, view) {
       const [target, supplied] = token.split('|');
-      const person = target.match(/^@([A-Z0-9]+)$/i);
+      const person = target.match(/^@([A-Z0-9_]+)$/i);
       if (person) {
         const resolved = view?.people?.[person[1]];
-        return make('span', '@' + (text(supplied).trim() || resolved?.name || person[1]), 'thread-mention');
+        return referenceLink('@', person[1], '@' + (text(supplied).trim() || resolved?.name || person[1]), view);
       }
-      const channel = target.match(/^#([A-Z0-9]+)$/i);
-      if (channel) return make('span', '#' + (text(supplied).trim() || (channel[1] === view?.meta.channel_id ? channelNameNow() : channel[1])), 'thread-mention');
+      const channel = target.match(/^#([A-Z0-9_]+)$/i);
+      if (channel) return referenceLink('#', channel[1], '#' + (text(supplied).trim() || (channel[1] === view?.meta.channel_id ? channelNameNow() : channel[1])), view);
       const group = target.match(/^!subteam\^([A-Z0-9]+)$/i);
       if (group) { const groups = usergroupsNow(); return make('span', '@' + (text(supplied).trim() || (Object.hasOwn(groups, group[1]) ? text(groups[group[1]]).trim() : '') || group[1]), 'thread-mention'); }
       const broadcast = target.match(/^!(here|channel|everyone)$/i);
@@ -247,9 +256,9 @@
           const label = typeof leaf.text === 'string' && leaf.text ? decodeSlack(leaf.text) : decodeSlack(leaf.url);
           return anchor(decodeSlack(leaf.url), label, 'thread-link') || make('span', label);
         }
-        case 'user': return make('span', '@' + (text(leaf.name).trim() || view?.people?.[leaf.user_id]?.name || leaf.user_id || 'unknown user'), 'thread-mention');
+        case 'user': return referenceLink('@', leaf.user_id, '@' + (text(leaf.name).trim() || view?.people?.[leaf.user_id]?.name || leaf.user_id || 'unknown user'), view);
         case 'usergroup': { const groups = usergroupsNow(); return make('span', '@' + ((Object.hasOwn(groups, leaf.usergroup_id) ? text(groups[leaf.usergroup_id]).trim() : '') || leaf.usergroup_id || 'unknown group'), 'thread-mention'); }
-        case 'channel': return make('span', '#' + (text(leaf.name).trim() || (leaf.channel_id === view?.meta.channel_id ? channelNameNow() : leaf.channel_id) || 'unknown channel'), 'thread-mention');
+        case 'channel': return referenceLink('#', leaf.channel_id, '#' + (text(leaf.name).trim() || (leaf.channel_id === view?.meta.channel_id ? channelNameNow() : leaf.channel_id) || 'unknown channel'), view);
         case 'emoji': return emojiNode(leaf.name, view);
         case 'broadcast': return make('span', '@' + (text(leaf.range).trim() || 'channel'), 'thread-mention');
         case 'color': return make('span', text(leaf.value));
@@ -495,6 +504,7 @@
       loadOlder.disabled = state.loading || state.loadingOlder || state.sending;
       loadOlder.textContent = state.loadingOlder ? 'Loading earlier messages…' : '↑ Load older messages';
       label.textContent = 'Reply as ' + botName + ' on behalf of ' + (state.user || 'the current operator');
+      mentionHint.textContent = 'Use workspace @handles, #' + channelNameNow() + ', or Slack references such as <@USERID> and <#CHANNELID>. The shared user directory may need time to load; retry explicitly if asked. Unknown names are rejected; quote references as code to send them literally.';
       const desired = state.occurrence ? state.drafts.get(state.occurrence.id) || '' : '';
       if (draft.value !== desired) draft.value = desired;
       renderComposer();
@@ -646,7 +656,7 @@
     }
     /** Invalidate outstanding reads before removing this window and its listeners. */
     function destroy() { state.destroyed = true; state.generation++; root.replaceChildren(); }
-    composer.append(label, draft, footer);
+    composer.append(label, draft, mentionHint, footer);
     root.append(panel);
     render();
     return {update, open, close: closePanel, refresh, destroy};

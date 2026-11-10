@@ -80,7 +80,7 @@ func (a *demoArchive) Post(ctx context.Context, channel, root, requestID string,
 		a.threads[root] = append(a.threads[root], slack.Message{Msg: slack.Msg{Type: "message", SubType: "bot_message", User: a.writer.UserID, BotID: a.writer.BotID, ThreadTimestamp: root, Timestamp: timestamp, ClientMsgID: requestID, Text: message.Text, Metadata: message.Metadata}})
 		a.roots[i].ReplyCount++
 		a.roots[i].LatestReply = timestamp
-		if message.Metadata.EventType != opsalerts.ThreadReplyMetadataEvent {
+		if message.Metadata.EventType != opsalerts.ThreadReplyMetadataEvent || strings.Contains(message.Text, "<@U_CHAI>") {
 			a.chaiReply(i, message.Text)
 		}
 		return timestamp, nil

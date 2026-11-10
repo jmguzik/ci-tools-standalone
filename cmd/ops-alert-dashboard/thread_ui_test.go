@@ -524,6 +524,31 @@ func TestSlackThreadController(t *testing.T) {
 			want:       `[true,false,true,true]`,
 		},
 		{
+			name:       "user and channel references retain Slack actions",
+			expression: `setup(); queue.push(reply(thread('one', [message(2, {text: '<@U_CHAI> <#C123> <#G_OTHER|private>'})], {people: {U_CHAI: {name: 'Chai'}}}))); await open(); return findAll('thread-mention').map(node => [node.tag, content(node), node.href]);`,
+			want:       `[["a","@Chai","https://workspace.slack.com/team/U_CHAI"],["a","#ops","https://workspace.slack.com/archives/C123"],["a","#private","https://workspace.slack.com/archives/G_OTHER"]]`,
+		},
+		{
+			name:       "rich text mentions retain profile and channel links",
+			expression: `setup(); queue.push(reply(thread('one', [message(2, {blocks: [{type: 'rich_text', elements: [{type: 'rich_text_section', elements: [{type: 'user', user_id: 'U2'}, {type: 'channel', channel_id: 'C123'}]}]}]})], {people: {U2: {name: 'Bob'}}}))); await open(); return findAll('thread-mention').map(node => [content(node), node.href, node.rel]);`,
+			want:       `[["@Bob","https://workspace.slack.com/team/U2","noopener noreferrer"],["#ops","https://workspace.slack.com/archives/C123","noopener noreferrer"]]`,
+		},
+		{
+			name:       "derived mention actions never trust a non Slack workspace",
+			expression: `setup(); queue.push(reply(thread('one', [message(2, {text: '<@U2> <#C123>'})], {slack_url: 'https://evil.example/thread'}))); await open(); return findAll('thread-mention').map(node => [node.tag, node.href || null]);`,
+			want:       `[["span",null],["span",null]]`,
+		},
+		{
+			name:       "unresolved references retain an editable draft without a delivery guard",
+			expression: `setup(); await open(); input('Ask @missing'); queue.push(reply({code: 'validation', error: 'Cannot resolve Slack reference @missing'}, 400)); await click('thread-send'); return [find('thread-draft').value, store.size, find('thread-error').textContent, posts()[0].body.text];`,
+			want:       `["Ask @missing",0,"Cannot resolve Slack reference @missing","Ask @missing"]`,
+		},
+		{
+			name:       "workspace loading preserves draft and clears guard without automatically posting",
+			expression: `setup(); await open(); input('Ask @alice'); queue.push(reply({code: 'not_ready', error: 'Slack user directory is loading; no reply was posted. Try again shortly.'}, 503)); await click('thread-send'); return [find('thread-draft').value, store.size, find('thread-send').disabled, find('thread-error').textContent, posts().length];`,
+			want:       `["Ask @alice",0,false,"Slack user directory is loading; no reply was posted. Try again shortly.",1]`,
+		},
+		{
 			name:       "destroy invalidates pending reads and removes isolated panel",
 			expression: `setup(); let resolve; queue.push(new Promise(done => {resolve = done;})); controller.open({occurrenceID: 'one'}); controller.destroy(); resolve(reply()); await settle(); return [root.children.length, posts().length, timers.size];`,
 			want:       `[0,0,0]`,

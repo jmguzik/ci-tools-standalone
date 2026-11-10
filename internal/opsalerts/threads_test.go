@@ -517,7 +517,7 @@ func TestPlainReplyConfirmationSnapshotChange(t *testing.T) {
 			}
 			root := archive.roots[0].Timestamp
 			req := ConversationRequest{OccurrenceID: "C_TEST:" + root, RequestID: "changing", Text: "original"}
-			if _, err := service.postConversation(ctx, "operator", req, true, false); err != nil {
+			if _, err := service.postConversation(ctx, "operator", req, true, false, ""); err != nil {
 				t.Fatal(err)
 			}
 			cache := service.currentCache()
@@ -609,7 +609,7 @@ func TestPlainReplyLegacyMarkerReconcile(t *testing.T) {
 				t.Fatal(err)
 			}
 			req := ConversationRequest{OccurrenceID: "C_TEST:" + archive.roots[0].Timestamp, RequestID: "legacy", Text: tc.text}
-			if _, err := service.postConversation(ctx, "operator", req, true, false); err != nil {
+			if _, err := service.postConversation(ctx, "operator", req, true, false, ""); err != nil {
 				t.Fatal(err)
 			}
 			restarted, err := NewService(service.cfg, service.classifier, archive, clock)
@@ -664,7 +664,7 @@ func TestPlainReplyConflictingProof(t *testing.T) {
 				record.SourceOccurrenceID = "C_TEST:" + record.Root
 				record.Request.OccurrenceID = record.SourceOccurrenceID
 			}
-			message, err := service.conversationMessage(record)
+			message, err := service.conversationMessage(record, "", "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -693,7 +693,7 @@ func TestPlainReplyConflictingProof(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, m := range view.Messages {
-					if m.Actor != "" || m.RequestID != "" || m.Author.ID != "U_WRITER" || !strings.HasPrefix(m.Text, threadReplyHeader) {
+					if m.Actor != "" || m.RequestID != "" || m.Author.ID != "U_WRITER" || !strings.HasPrefix(m.Text, threadReplyPrefix) {
 						t.Fatalf("conflicting receipt exposed proof: %#v", m)
 					}
 				}

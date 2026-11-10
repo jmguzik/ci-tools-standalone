@@ -30,6 +30,9 @@ const ThreadReplyMetadataEvent = "ops_dashboard_thread_reply_v1"
 // threadReplyHeader survives stripped metadata without resembling a workflow receipt.
 const threadReplyHeader = "Dashboard reply (on behalf of an authenticated operator):\n\n"
 
+// threadReplyPrefix recognizes attributed replies even if their metadata is stripped.
+const threadReplyPrefix = "Dashboard reply (on behalf of "
+
 const conversationFooter = "\n\n💬 Dashboard · Chai"
 
 // ConversationRequest binds a stable delivery key to one operator question.
@@ -142,7 +145,7 @@ func (s *Service) decodeConversation(message slack.Message) (conversationRecord,
 		if message.Metadata.EventType != ThreadReplyMetadataEvent || record.ChaiUser != "" || record.Root == "" || record.Request.OccurrenceID != s.cfg.ChannelID+":"+record.Root || record.SourceOccurrenceID != record.Request.OccurrenceID || record.Request.ConversationID != "" {
 			return record, fmt.Errorf("invalid thread reply association")
 		}
-		text, found = strings.CutPrefix(message.Text, threadReplyHeader)
+		text, found = threadReplyDisplayBody(message.Text)
 	} else if record.Root == "" {
 		text, found = trimConversationFooter(text)
 		found = found && strings.HasPrefix(message.Text, "<@"+record.ChaiUser+"> ")
@@ -212,7 +215,7 @@ func (s *Service) conversationCandidate(m slack.Message) bool {
 	if m.Metadata.EventType == ActionMetadataEvent {
 		return false
 	}
-	if strings.HasPrefix(m.Text, threadReplyHeader) {
+	if strings.HasPrefix(m.Text, threadReplyPrefix) {
 		return true
 	}
 	if strings.HasPrefix(m.Text, ActionReceiptPrefix) || strings.HasPrefix(m.Text, ActionMarker) {
@@ -453,7 +456,7 @@ func conversationTitle(text string) string {
 }
 
 // conversationMessage keeps Slack text conversational and durable data in metadata.
-func (s *Service) conversationMessage(record conversationRecord) (slack.Msg, error) {
+func (s *Service) conversationMessage(record conversationRecord, channelName, replyBody string) (slack.Msg, error) {
 	data, err := json.Marshal(record)
 	if err != nil {
 		return slack.Msg{}, err
@@ -464,7 +467,15 @@ func (s *Service) conversationMessage(record conversationRecord) (slack.Msg, err
 	}
 	message := slack.Msg{Text: text, Metadata: slack.SlackMetadata{EventType: ConversationMetadataEvent, EventPayload: map[string]interface{}{"record": string(data)}}}
 	if record.Mode == "reply" {
-		message.Text = threadReplyHeader + escapeSlack(record.Request.Text)
+		body := replyBody
+		if body == "" {
+			var err error
+			body, err = s.threadReplyBody(record.Request.Text, channelName)
+			if err != nil {
+				return slack.Msg{}, err
+			}
+		}
+		message.Text = attributedThreadReplyHeader(record.Actor) + body
 		message.Metadata.EventType = ThreadReplyMetadataEvent
 	}
 	envelope, err := json.Marshal(message.Metadata)
@@ -479,11 +490,11 @@ func (s *Service) conversationMessage(record conversationRecord) (slack.Msg, err
 
 // Converse serializes writes with archive recovery and never retries an uncertain post.
 func (s *Service) Converse(ctx context.Context, actor string, req ConversationRequest) (Conversation, error) {
-	return s.postConversation(ctx, actor, req, false, false)
+	return s.postConversation(ctx, actor, req, false, false, "")
 }
 
 // postConversation shares serialization and durable delivery guards across the two explicit write modes.
-func (s *Service) postConversation(ctx context.Context, actor string, req ConversationRequest, plain, reconcileOnly bool) (Conversation, error) {
+func (s *Service) postConversation(ctx context.Context, actor string, req ConversationRequest, plain, reconcileOnly bool, channelName string) (Conversation, error) {
 	if !plain {
 		req.Text = strings.TrimSpace(req.Text)
 	}
@@ -496,6 +507,14 @@ func (s *Service) postConversation(ctx context.Context, actor string, req Conver
 	}
 	if !plain && !regexp.MustCompile(`^[A-Za-z0-9_]{1,128}$`).MatchString(s.chaiUser()) {
 		return Conversation{}, fmt.Errorf("%w: configured Chai user identity required", ErrValidation)
+	}
+	replyBody := ""
+	if plain && !reconcileOnly {
+		var err error
+		replyBody, err = s.prepareThreadReply(ctx, req, channelName)
+		if err != nil {
+			return Conversation{}, err
+		}
 	}
 	if err := s.acquire(ctx); err != nil {
 		return Conversation{}, errors.Join(ErrNotReady, err)
@@ -577,7 +596,7 @@ func (s *Service) postConversation(ctx context.Context, actor string, req Conver
 	if plain {
 		record.Mode, record.ChaiUser = "reply", ""
 	}
-	message, err := s.conversationMessage(record)
+	message, err := s.conversationMessage(record, channelName, replyBody)
 	if err != nil {
 		return Conversation{}, err
 	}

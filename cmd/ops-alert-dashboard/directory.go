@@ -22,6 +22,8 @@ type directoryPerson struct {
 	Person  opsalerts.ThreadPerson
 	Until   time.Time
 	Warning string
+	Handle  string
+	UserID  string
 }
 
 // directoryBackoff suppresses misses across different identities for one Slack method.
@@ -48,12 +50,13 @@ type directorySnapshot struct {
 // slackDirectory coalesces misses with a cancellable gate, never a network-held cache lock.
 // Positive entries live 1 hour, failures 5 minutes; at most 512 identities and 4096 emojis are retained.
 type slackDirectory struct {
-	client *slack.Client
-	clock  opsalerts.Clock
-	once   sync.Once
-	gate   chan struct{}
-	mu     sync.RWMutex
-	cache  directoryCache
+	client    *slack.Client
+	clock     opsalerts.Clock
+	once      sync.Once
+	gate      chan struct{}
+	mu        sync.RWMutex
+	cache     directoryCache
+	workspace *workspaceUsers
 }
 
 // initGate allows zero-value construction without sharing mutable package state.
@@ -185,7 +188,7 @@ func (d *slackDirectory) lookupPerson(ctx context.Context, id string) directoryP
 	now := d.now()
 	entry.Until, entry.Warning = now.Add(time.Hour), ""
 	if err == nil {
-		entry.Person = person
+		entry.Person, entry.Handle, entry.UserID = person.Person, person.Handle, person.UserID
 	}
 	if err != nil {
 		failure, shared := metadataFailure(err, method, now)
@@ -212,20 +215,20 @@ func (d *slackDirectory) lookupPerson(ctx context.Context, id string) directoryP
 }
 
 // fetchPerson returns only the requested identity and never exposes upstream errors to a browser.
-func (d *slackDirectory) fetchPerson(ctx context.Context, id string) (opsalerts.ThreadPerson, error) {
+func (d *slackDirectory) fetchPerson(ctx context.Context, id string) (directoryPerson, error) {
 	if strings.HasPrefix(id, "B") {
 		bot, err := d.client.GetBotInfoContext(ctx, slack.GetBotInfoParameters{Bot: id})
 		if err != nil {
-			return opsalerts.ThreadPerson{}, err
+			return directoryPerson{}, err
 		}
 		if bot == nil || bot.ID != id {
-			return opsalerts.ThreadPerson{}, fmt.Errorf("slack returned a different bot identity")
+			return directoryPerson{}, fmt.Errorf("slack returned a different bot identity")
 		}
-		return opsalerts.ThreadPerson{ID: id, Name: bot.Name, IsBot: true, AvatarURL: opsalerts.SafeThreadImage(bot.Icons.Image48)}, nil
+		return directoryPerson{Person: opsalerts.ThreadPerson{ID: id, Name: bot.Name, IsBot: true, AvatarURL: opsalerts.SafeThreadImage(bot.Icons.Image48)}, Handle: bot.Name, UserID: bot.UserID}, nil
 	}
 	user, err := d.client.GetUserInfoContext(ctx, id)
 	if err != nil {
-		return opsalerts.ThreadPerson{}, err
+		return directoryPerson{}, err
 	}
 	if user != nil && user.ID == id {
 		name := user.Profile.DisplayName
@@ -242,9 +245,45 @@ func (d *slackDirectory) fetchPerson(ctx context.Context, id string) (opsalerts.
 		if avatar == "" {
 			avatar = opsalerts.SafeThreadImage(user.Profile.Image48)
 		}
-		return opsalerts.ThreadPerson{ID: id, Name: name, IsBot: user.IsBot, AvatarURL: avatar}, nil
+		return directoryPerson{Person: opsalerts.ThreadPerson{ID: id, Name: name, IsBot: user.IsBot, AvatarURL: avatar}, Handle: user.Name, UserID: user.ID}, nil
 	}
-	return opsalerts.ThreadPerson{}, fmt.Errorf("slack returned a different user identity")
+	return directoryPerson{}, fmt.Errorf("slack returned a different user identity")
+}
+
+// ResolveThreadReference prefers the complete workspace index over potentially ambiguous participant aliases.
+func (d *slackDirectory) ResolveThreadReference(kind, name string) (string, bool) {
+	if kind != "@" {
+		return "", false
+	}
+	if d.workspace != nil {
+		return d.workspace.resolve(name)
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	now := d.now()
+	id := ""
+	for _, entry := range d.cache.people {
+		if entry.Warning != "" || !now.Before(entry.Until) || entry.Handle == "" || !strings.EqualFold(entry.Handle, name) {
+			continue
+		}
+		target := entry.UserID
+		if target == "" {
+			target = entry.Person.ID
+		}
+		if id != "" && target != id {
+			return "", false
+		}
+		id = target
+	}
+	return id, id != ""
+}
+
+// ResolveThreadReference keeps reply mentions on the shared metadata cache.
+func (a *slackArchive) ResolveThreadReference(kind, name string) (string, bool) {
+	if a.directory == nil {
+		return "", false
+	}
+	return a.directory.ResolveThreadReference(kind, name)
 }
 
 // metadataFailure applies method-wide cooldowns only to rate limits and missing permissions.

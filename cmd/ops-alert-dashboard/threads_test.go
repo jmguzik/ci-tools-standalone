@@ -43,6 +43,7 @@ func TestDashboardAlertThread(t *testing.T) {
 		serviceErr               error
 		status                   int
 		code                     string
+		errorText                string
 		writes                   int
 	}{
 		{name: "cached read", method: "GET", status: 200},
@@ -54,6 +55,7 @@ func TestDashboardAlertThread(t *testing.T) {
 		{name: "unauthenticated", method: "GET", unauth: true, status: 403, code: "forbidden"},
 		{name: "arbitrary target", method: "POST", body: `{"channel_id":"C","text":"hello"}`, status: 400, code: "validation"},
 		{name: "actor override", method: "POST", body: `{"actor":"other","text":"hello"}`, status: 400, code: "validation"},
+		{name: "channel name override", method: "POST", body: strings.TrimSuffix(body, "}") + `,"channel_name":"other"}`, status: 400, code: "validation"},
 		{name: "extra object", method: "POST", body: body + `{}`, status: 400, code: "validation"},
 		{name: "duplicate reconcile flag", method: "POST", body: strings.TrimSuffix(body, "}") + `,"reconcile_only":false}`, status: 400, code: "validation"},
 		{name: "case variant reconcile flag", method: "POST", body: strings.TrimSuffix(body, "}") + `,"Reconcile_only":false}`, status: 400, code: "validation"},
@@ -65,6 +67,8 @@ func TestDashboardAlertThread(t *testing.T) {
 		{name: "null required string", method: "POST", body: strings.Replace(body, `"text":"hello"`, `"text":null`, 1), status: 400, code: "validation"},
 		{name: "oversized", method: "POST", body: `{"text":"` + strings.Repeat("a", 17000) + `"}`, status: 400, code: "validation"},
 		{name: "uncertain redacted", method: "POST", body: body, serviceErr: errors.Join(opsalerts.ErrDeliveryUncertain, errors.New("secret-token-upstream-body")), status: 502, code: "delivery_uncertain", writes: 1},
+		{name: "unresolved reference is actionable", method: "POST", body: body, serviceErr: &opsalerts.ThreadReferenceError{Reference: "@missing"}, status: 400, code: "validation", errorText: `cannot resolve Slack reference "@missing"`, writes: 1},
+		{name: "workspace loading is a definite rejection", method: "POST", body: body, serviceErr: &opsalerts.ThreadReferenceLookupError{}, status: 503, code: "not_ready", errorText: "no reply was posted", writes: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,6 +78,7 @@ func TestDashboardAlertThread(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			d.channelName = "ops-team"
 			r := httptest.NewRequest(tc.method, "/api/alert-thread?occurrence_id=C:100.000001&before=100.000002", strings.NewReader(tc.body))
 			r.RemoteAddr = "127.0.0.1:1234"
 			if !tc.unauth {
@@ -105,7 +110,7 @@ func TestDashboardAlertThread(t *testing.T) {
 				if got.User != "operator@example.test" || got.CSRFToken != d.csrfToken(got.User) {
 					t.Fatalf("identity response %#v", got)
 				}
-				if tc.method == "POST" && (service.request.ReconcileOnly != tc.reconcile || service.actor != got.User) {
+				if tc.method == "POST" && (service.request.ReconcileOnly != tc.reconcile || service.actor != got.User || service.request.ChannelName != "ops-team") {
 					t.Fatalf("request %#v actor %q", service.request, service.actor)
 				}
 			} else {
@@ -115,6 +120,9 @@ func TestDashboardAlertThread(t *testing.T) {
 				}
 				if diff := cmp.Diff(tc.code, got.Code); diff != "" {
 					t.Errorf("unexpected code (-want +got):\n%s", diff)
+				}
+				if tc.errorText != "" && !strings.Contains(got.Error, tc.errorText) {
+					t.Errorf("missing actionable error %q in %q", tc.errorText, got.Error)
 				}
 			}
 		})

@@ -879,7 +879,7 @@ func TestConversationConflictExpiry(t *testing.T) {
 				t.Fatal(err)
 			}
 			record.Request.RequestID = "duplicate"
-			message, err := service.conversationMessage(record)
+			message, err := service.conversationMessage(record, "", "")
 			if err != nil {
 				t.Fatal(err)
 			}
