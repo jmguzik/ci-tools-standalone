@@ -115,7 +115,7 @@ func (s *Service) threadReplyBody(text, channelName string) (string, error) {
 					return "", &ThreadReferenceError{Reference: text[i : end+size]}
 				}
 			}
-			if name != "" && !(text[i] == '#' && allThreadDigits(name)) {
+			if name != "" && (text[i] != '#' || !allThreadDigits(name)) {
 				kind := text[i : i+1]
 				id, found := s.resolveThreadReference(kind, name, channelName)
 				if !found && strings.HasSuffix(name, ".") {
