@@ -664,7 +664,7 @@ func TestPlainReplyConflictingProof(t *testing.T) {
 				record.SourceOccurrenceID = "C_TEST:" + record.Root
 				record.Request.OccurrenceID = record.SourceOccurrenceID
 			}
-			message, err := service.conversationMessage(record, "")
+			message, err := service.conversationMessage(record, "", "")
 			if err != nil {
 				t.Fatal(err)
 			}

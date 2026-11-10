@@ -3,6 +3,7 @@ package opsalerts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -14,6 +15,133 @@ import (
 type threadReferenceArchive struct {
 	*chatArchive
 	references map[string]string
+}
+
+// loadingThreadArchive models workspace refresh separately from cached reference resolution.
+type loadingThreadArchive struct {
+	*threadReferenceArchive
+	service *Service
+	loaded  map[string]string
+	err     error
+	calls   int
+}
+
+// PrepareThreadReferences asserts the service serialization lock is free before publishing handles.
+func (a *loadingThreadArchive) PrepareThreadReferences(_ context.Context) error {
+	a.calls++
+	select {
+	case a.service.serial <- struct{}{}:
+		a.service.release()
+	default:
+		return fmt.Errorf("directory refresh held the posting lock")
+	}
+	if a.err != nil {
+		return a.err
+	}
+	a.references = a.loaded
+	return nil
+}
+
+// TestWorkspaceThreadReply prepares only new resolvable user references before any serialized write.
+func TestWorkspaceThreadReply(t *testing.T) {
+	for _, tc := range []struct {
+		name, text, want string
+		reconcile        bool
+		unavailable      bool
+		loads            int
+		wantErr          error
+	}{
+		{name: "new workspace user", text: "Ask @alice", want: "Ask <@U_ALICE>", loads: 1},
+		{name: "multiple handles use one refresh", text: "@alice and @bob.", want: "<@U_ALICE> and <@U_BOB>.", loads: 1},
+		{name: "configured Chai avoids directory", text: "@chai-bot", want: "<@U_CHAI>"},
+		{name: "canonical user avoids directory", text: "<@U_ALICE>", want: "<@U_ALICE>"},
+		{name: "literal user avoids directory", text: "`@alice`", want: "`@alice`"},
+		{name: "unknown user after complete refresh", text: "@unknown", loads: 1, wantErr: ErrValidation},
+		{name: "Unicode avoids scan", text: "@田中", wantErr: ErrValidation},
+		{name: "malformed canonical avoids scan", text: "<@invalid>", wantErr: ErrValidation},
+		{name: "broadcast avoids scan", text: "@everyone.", wantErr: ErrValidation},
+		{name: "channel avoids scan", text: "#unknown", wantErr: ErrValidation},
+		{name: "loading is a definite rejection", text: "@alice", unavailable: true, loads: 1, wantErr: ErrNotReady},
+		{name: "unknown reconcile key never looks up or posts", text: "@alice", reconcile: true, wantErr: ErrDeliveryUncertain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			service, archive, _ := chatFixture(t)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			loader := &loadingThreadArchive{threadReferenceArchive: &threadReferenceArchive{chatArchive: archive}, service: service, loaded: map[string]string{"@alice": "U_ALICE", "@bob": "U_BOB"}}
+			if tc.unavailable {
+				loader.err = &ThreadReferenceLookupError{}
+			}
+			service.archive = loader
+			req := ThreadReplyRequest{OccurrenceID: "C_TEST:" + archive.roots[0].Timestamp, RequestID: "workspace", Text: tc.text, ReconcileOnly: tc.reconcile}
+			_, err := service.ReplyToAlert(ctx, "operator", req)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("unexpected reply error: got %v, want %v", err, tc.wantErr)
+			}
+			if loader.calls != tc.loads {
+				t.Errorf("got %d loads, want %d", loader.calls, tc.loads)
+			}
+			if tc.wantErr != nil {
+				if archive.posts != 0 || len(service.currentCache().ConversationPending) != 0 {
+					t.Fatal("preparation error or unknown reconcile key initiated delivery")
+				}
+				return
+			}
+			if diff := cmp.Diff(attributedThreadReplyHeader("operator")+tc.want, archive.lastText); diff != "" {
+				t.Errorf("unexpected reply (-want +got):\n%s", diff)
+			}
+			loader.references = nil
+			loader.err = &ThreadReferenceLookupError{}
+			req.ReconcileOnly = true
+			if _, err := service.ReplyToAlert(ctx, "operator", req); err != nil {
+				t.Fatalf("confirmed key depended on mutable directory state: %v", err)
+			}
+			req.ReconcileOnly = false
+			req.Text = tc.want + " different"
+			if _, err := service.ReplyToAlert(ctx, "operator", req); !errors.Is(err, ErrConflict) {
+				t.Fatalf("changed submission reused delivery key: %v", err)
+			}
+			if archive.posts != 1 || loader.calls != tc.loads {
+				t.Fatal("ledger retry posted or refreshed workspace users")
+			}
+		})
+	}
+}
+
+// TestFailedWorkspaceReplyRetry never confuses a definitely failed post with a prepared empty body.
+func TestFailedWorkspaceReplyRetry(t *testing.T) {
+	for _, tc := range []struct{ name, text string }{
+		{name: "workspace mention", text: "Ask @alice"},
+		{name: "ordinary reply", text: "ordinary body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			service, archive, _ := chatFixture(t)
+			if err := service.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			loader := &loadingThreadArchive{threadReferenceArchive: &threadReferenceArchive{chatArchive: archive}, service: service, loaded: map[string]string{"@alice": "U_ALICE"}}
+			service.archive = loader
+			req := ThreadReplyRequest{OccurrenceID: "C_TEST:" + archive.roots[0].Timestamp, RequestID: "failed-workspace", Text: tc.text}
+			archive.postError = ErrDeliveryFailed
+			if _, err := service.ReplyToAlert(ctx, "operator", req); !errors.Is(err, ErrDeliveryFailed) {
+				t.Fatalf("unexpected first delivery error: %v", err)
+			}
+			archive.postError = nil
+			firstText := archive.lastText
+			if _, err := service.ReplyToAlert(ctx, "operator", req); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(firstText, archive.lastText); diff != "" {
+				t.Errorf("unexpected retry body (-want +got):\n%s", diff)
+			}
+			if archive.posts != 2 {
+				t.Fatalf("got %d delivery attempts, want 2", archive.posts)
+			}
+		})
+	}
 }
 
 // ResolveThreadReference never reads Slack to resolve a test reference.
@@ -38,6 +166,9 @@ func TestThreadReplyText(t *testing.T) {
 		{name: "fenced code", text: "```\n@unknown #unknown <@U_CHAI>\n```", want: "```\n@unknown #unknown &lt;@U_CHAI&gt;\n```"},
 		{name: "email and URL fragments", text: "alice@example.com https://example.com/#unknown https://example.com/@unknown", want: "alice@example.com https://example.com/#unknown https://example.com/@unknown"},
 		{name: "issue and heading", text: "See #123\n# Heading", want: "See #123\n# Heading"},
+		{name: "issue with sentence punctuation", text: "See #123.", want: "See #123."},
+		{name: "issue with ellipsis", text: "See #123...", want: "See #123..."},
+		{name: "non-numeric channel with period is still rejected", text: "#123abc.", invalid: true},
 		{name: "escaped literal", text: `\@unknown \#unknown`, want: `\@unknown \#unknown`},
 		{name: "HTML remains inert", text: "<script>bad</script> & *bold* _italic_", want: "&lt;script&gt;bad&lt;/script&gt; &amp; *bold* _italic_"},
 		{name: "unknown user", text: "Ask @unknown", invalid: true},

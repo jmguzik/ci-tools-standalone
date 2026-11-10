@@ -456,7 +456,7 @@ func conversationTitle(text string) string {
 }
 
 // conversationMessage keeps Slack text conversational and durable data in metadata.
-func (s *Service) conversationMessage(record conversationRecord, channelName string) (slack.Msg, error) {
+func (s *Service) conversationMessage(record conversationRecord, channelName, replyBody string) (slack.Msg, error) {
 	data, err := json.Marshal(record)
 	if err != nil {
 		return slack.Msg{}, err
@@ -467,9 +467,13 @@ func (s *Service) conversationMessage(record conversationRecord, channelName str
 	}
 	message := slack.Msg{Text: text, Metadata: slack.SlackMetadata{EventType: ConversationMetadataEvent, EventPayload: map[string]interface{}{"record": string(data)}}}
 	if record.Mode == "reply" {
-		body, err := s.threadReplyBody(record.Request.Text, channelName)
-		if err != nil {
-			return slack.Msg{}, err
+		body := replyBody
+		if body == "" {
+			var err error
+			body, err = s.threadReplyBody(record.Request.Text, channelName)
+			if err != nil {
+				return slack.Msg{}, err
+			}
 		}
 		message.Text = attributedThreadReplyHeader(record.Actor) + body
 		message.Metadata.EventType = ThreadReplyMetadataEvent
@@ -503,6 +507,14 @@ func (s *Service) postConversation(ctx context.Context, actor string, req Conver
 	}
 	if !plain && !regexp.MustCompile(`^[A-Za-z0-9_]{1,128}$`).MatchString(s.chaiUser()) {
 		return Conversation{}, fmt.Errorf("%w: configured Chai user identity required", ErrValidation)
+	}
+	replyBody := ""
+	if plain && !reconcileOnly {
+		var err error
+		replyBody, err = s.prepareThreadReply(ctx, req, channelName)
+		if err != nil {
+			return Conversation{}, err
+		}
 	}
 	if err := s.acquire(ctx); err != nil {
 		return Conversation{}, errors.Join(ErrNotReady, err)
@@ -584,7 +596,7 @@ func (s *Service) postConversation(ctx context.Context, actor string, req Conver
 	if plain {
 		record.Mode, record.ChaiUser = "reply", ""
 	}
-	message, err := s.conversationMessage(record, channelName)
+	message, err := s.conversationMessage(record, channelName, replyBody)
 	if err != nil {
 		return Conversation{}, err
 	}

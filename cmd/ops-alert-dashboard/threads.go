@@ -74,6 +74,11 @@ func (d *dashboard) alertThread(w http.ResponseWriter, r *http.Request, actor st
 			writeJSON(w, status, apiError{Error: referenceError.Error(), Code: code})
 			return
 		}
+		var lookupError *opsalerts.ThreadReferenceLookupError
+		if errors.As(err, &lookupError) {
+			writeJSON(w, status, apiError{Error: lookupError.Error(), Code: code})
+			return
+		}
 		writeJSON(w, status, apiError{Error: "Slack discussion request could not be completed (" + code + ")", Code: code})
 		return
 	}

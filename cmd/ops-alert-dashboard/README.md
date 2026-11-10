@@ -269,21 +269,41 @@ attributed in the visible Slack header as well as the delivery record. They do
 not impersonate a Slack user or change alert workflow state. Chai is notified
 only when explicitly mentioned. The composer accepts up to 4,000 UTF-8 bytes.
 
-Explicit mentions remain actionable. `@chai-bot` uses the configured Chai Slack
-user ID, known cached Slack handles resolve to user IDs, and the configured
-channel name (for example `#ops-testplatform`) resolves to its channel ID.
+Explicit mentions remain actionable. Workspace `@handles` resolve to active,
+unambiguous Slack user IDs, including users who have never appeared in a cached
+discussion. Use the Slack handle, not a display name. `@chai-bot` uses the
+configured Chai Slack user ID, and the configured channel name (for example
+`#ops-testplatform`) resolves to its channel ID.
 Canonical Slack references such as `<@U123ABC>` and `<#C123ABC>` are also retained.
 User and channel references in the discussion viewer link to their Slack
-profiles and channels. This resolution does not scan the workspace directory or
-perform new Slack reads when posting.
+profiles and channels.
 
-Unknown, ambiguous, or expired handle references are rejected before posting,
+To limit Slack API usage, the server loads the workspace user directory only
+when an unresolved handle needs it, using the reader token's existing
+`users:read` scope. All operators share one cursor-paginated load per server
+instance, with 200 users per page and at most 10 page requests per minute.
+Complete indexes, including unknown-handle results, are reused for 24 hours;
+unknown names do not force extra scans. There are no scans on startup, page
+loads, or keystrokes. The trade-off is that new or renamed handles (and account
+deactivations) may take up to 24 hours to appear. Explicit `<@USERID>` references
+and configured Chai/current-channel references do not require a directory scan.
+
+A cold or refreshing directory may take time to load in a large workspace. A
+send waits at most two seconds for that shared load, then returns a definite
+"no reply was posted" error with the draft retained. Loading continues in the
+background, but never sends a deferred reply: click **Post reply** again when
+ready. Directory loading does not hold the workflow/posting lock. Slack
+`Retry-After` delays are respected; failed loads have a shared 15-minute cooldown
+(or longer if Slack requires it). Loads stop at server shutdown and are bounded
+to 1,000 pages, 200,000 users, and two hours; incomplete indexes are never used.
+
+Unknown, ambiguous, or deactivated handle references are rejected before posting,
 with a readable error and the draft retained, rather than silently becoming
-ordinary text. Open the conversation in Slack to find an explicit reference if
-the participant is not already cached. Code blocks, inline code, escaped
-references, email addresses, URL fragments, and numeric issue references such
-as `#123` stay literal. User-group and broadcast mentions are not supported by this composer;
-use Slack for those deliberately wider notifications.
+ordinary text. Use an explicit reference from Slack if a recently added or
+renamed handle is not in the daily directory snapshot. Code blocks, inline code,
+escaped references, email addresses, URL fragments, and numeric issue references
+such as `#123` and `#123.` stay literal. User-group and broadcast mentions are not
+supported by this composer; use Slack for those deliberately wider notifications.
 
 New replies containing the reserved `OPS_ALERT_ACTION_V1` workflow-control marker
 are rejected rather than rewritten, so quoted text cannot become an action

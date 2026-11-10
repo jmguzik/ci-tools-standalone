@@ -1,6 +1,8 @@
 package opsalerts
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -13,6 +15,73 @@ type threadReferenceDirectory interface {
 	ResolveThreadReference(string, string) (string, bool)
 }
 
+// threadReferenceLoader refreshes workspace handles before acquiring the posting lock.
+type threadReferenceLoader interface {
+	PrepareThreadReferences(context.Context) error
+}
+
+// ThreadReferenceLookupError is a definite pre-post rejection while workspace users are unavailable.
+type ThreadReferenceLookupError struct{}
+
+// Error preserves the draft without implying that directory loading attempted delivery.
+func (*ThreadReferenceLookupError) Error() string {
+	return "workspace user directory is loading or unavailable; no reply was posted, try again shortly or use a Slack reference such as <@USERID>"
+}
+
+// Unwrap lets the composer clear its delivery guard for a definite pre-post rejection.
+func (*ThreadReferenceLookupError) Unwrap() error { return ErrNotReady }
+
+// prepareThreadReply resolves new submissions without blocking serialized archive or workflow work.
+// Existing delivery keys must reach their ledger checks without looking up mutable handles again.
+func (s *Service) prepareThreadReply(ctx context.Context, req ConversationRequest, channelName string) (string, error) {
+	cache := s.currentCache()
+	if _, exists := cache.ConversationRecords[req.RequestID]; exists {
+		return "", nil
+	}
+	if attempt, exists := cache.ConversationPending[req.RequestID]; exists && !attempt.Failed {
+		return "", nil
+	}
+	if _, exists := cache.Records[req.RequestID]; exists {
+		return "", nil
+	}
+	if _, exists := cache.Pending[req.RequestID]; exists {
+		return "", nil
+	}
+	if cache.Coverage.Phase != "ready" {
+		return "", ErrNotReady
+	}
+	if occurrence, exists := cache.Occurrences[req.OccurrenceID]; !exists || !s.retained(occurrence, s.clock.Now(), 0) {
+		return "", ErrNotFound
+	}
+	body, err := s.threadReplyBody(req.Text, channelName)
+	var reference *ThreadReferenceError
+	loader, canLoad := s.archive.(threadReferenceLoader)
+	if !canLoad || !errors.As(err, &reference) || !loadableThreadReference(reference.Reference) {
+		return body, err
+	}
+	if err := loader.PrepareThreadReferences(ctx); err != nil {
+		return "", err
+	}
+	return s.threadReplyBody(req.Text, channelName)
+}
+
+// loadableThreadReference avoids workspace reads for malformed IDs, channels, and broadcast mentions.
+func loadableThreadReference(reference string) bool {
+	if !strings.HasPrefix(reference, "@") || len(reference) < 2 {
+		return false
+	}
+	name := strings.TrimRight(reference[1:], ".")
+	if name == "" || strings.EqualFold(name, "here") || strings.EqualFold(name, "channel") || strings.EqualFold(name, "everyone") {
+		return false
+	}
+	for i := range name {
+		if !threadHandleByte(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // ThreadReferenceError keeps unresolved mentions from silently becoming ordinary text.
 type ThreadReferenceError struct{ Reference string }
 
@@ -22,7 +91,7 @@ func (e *ThreadReferenceError) Error() string {
 	if len(reference) > 128 {
 		reference = reference[:128] + "…"
 	}
-	return fmt.Sprintf("cannot resolve Slack reference %q; use a known handle or a Slack reference such as <@USERID> or <#CHANNELID>, or quote it as code for literal text", reference)
+	return fmt.Sprintf("cannot resolve Slack reference %q; use an active workspace handle or a Slack reference such as <@USERID> or <#CHANNELID>, or quote it as code for literal text", reference)
 }
 
 // Unwrap makes an unresolved reference a definite rejection before any Slack write.
@@ -115,7 +184,7 @@ func (s *Service) threadReplyBody(text, channelName string) (string, error) {
 					return "", &ThreadReferenceError{Reference: text[i : end+size]}
 				}
 			}
-			if name != "" && (text[i] != '#' || !allThreadDigits(name)) {
+			if name != "" && (text[i] != '#' || !allThreadDigits(strings.TrimRight(name, "."))) {
 				kind := text[i : i+1]
 				id, found := s.resolveThreadReference(kind, name, channelName)
 				if !found && strings.HasSuffix(name, ".") {

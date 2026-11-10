@@ -504,7 +504,7 @@
       loadOlder.disabled = state.loading || state.loadingOlder || state.sending;
       loadOlder.textContent = state.loadingOlder ? 'Loading earlier messages…' : '↑ Load older messages';
       label.textContent = 'Reply as ' + botName + ' on behalf of ' + (state.user || 'the current operator');
-      mentionHint.textContent = 'Use @chai-bot, known Slack handles, #' + channelNameNow() + ', or Slack references such as <@USERID> and <#CHANNELID>. Unknown names are rejected; quote references as code to send them literally.';
+      mentionHint.textContent = 'Use workspace @handles, #' + channelNameNow() + ', or Slack references such as <@USERID> and <#CHANNELID>. The shared user directory may need time to load; retry explicitly if asked. Unknown names are rejected; quote references as code to send them literally.';
       const desired = state.occurrence ? state.drafts.get(state.occurrence.id) || '' : '';
       if (draft.value !== desired) draft.value = desired;
       renderComposer();

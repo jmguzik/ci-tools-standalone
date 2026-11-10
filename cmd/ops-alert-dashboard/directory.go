@@ -50,12 +50,13 @@ type directorySnapshot struct {
 // slackDirectory coalesces misses with a cancellable gate, never a network-held cache lock.
 // Positive entries live 1 hour, failures 5 minutes; at most 512 identities and 4096 emojis are retained.
 type slackDirectory struct {
-	client *slack.Client
-	clock  opsalerts.Clock
-	once   sync.Once
-	gate   chan struct{}
-	mu     sync.RWMutex
-	cache  directoryCache
+	client    *slack.Client
+	clock     opsalerts.Clock
+	once      sync.Once
+	gate      chan struct{}
+	mu        sync.RWMutex
+	cache     directoryCache
+	workspace *workspaceUsers
 }
 
 // initGate allows zero-value construction without sharing mutable package state.
@@ -249,10 +250,13 @@ func (d *slackDirectory) fetchPerson(ctx context.Context, id string) (directoryP
 	return directoryPerson{}, fmt.Errorf("slack returned a different user identity")
 }
 
-// ResolveThreadReference uses unique, fresh Slack handles without a workspace directory scan.
+// ResolveThreadReference prefers the complete workspace index over potentially ambiguous participant aliases.
 func (d *slackDirectory) ResolveThreadReference(kind, name string) (string, bool) {
 	if kind != "@" {
 		return "", false
+	}
+	if d.workspace != nil {
+		return d.workspace.resolve(name)
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()

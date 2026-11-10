@@ -68,6 +68,7 @@ func TestDashboardAlertThread(t *testing.T) {
 		{name: "oversized", method: "POST", body: `{"text":"` + strings.Repeat("a", 17000) + `"}`, status: 400, code: "validation"},
 		{name: "uncertain redacted", method: "POST", body: body, serviceErr: errors.Join(opsalerts.ErrDeliveryUncertain, errors.New("secret-token-upstream-body")), status: 502, code: "delivery_uncertain", writes: 1},
 		{name: "unresolved reference is actionable", method: "POST", body: body, serviceErr: &opsalerts.ThreadReferenceError{Reference: "@missing"}, status: 400, code: "validation", errorText: `cannot resolve Slack reference "@missing"`, writes: 1},
+		{name: "workspace loading is a definite rejection", method: "POST", body: body, serviceErr: &opsalerts.ThreadReferenceLookupError{}, status: 503, code: "not_ready", errorText: "no reply was posted", writes: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

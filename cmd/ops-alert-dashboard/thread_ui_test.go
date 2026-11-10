@@ -544,6 +544,11 @@ func TestSlackThreadController(t *testing.T) {
 			want:       `["Ask @missing",0,"Cannot resolve Slack reference @missing","Ask @missing"]`,
 		},
 		{
+			name:       "workspace loading preserves draft and clears guard without automatically posting",
+			expression: `setup(); await open(); input('Ask @alice'); queue.push(reply({code: 'not_ready', error: 'Slack user directory is loading; no reply was posted. Try again shortly.'}, 503)); await click('thread-send'); return [find('thread-draft').value, store.size, find('thread-send').disabled, find('thread-error').textContent, posts().length];`,
+			want:       `["Ask @alice",0,false,"Slack user directory is loading; no reply was posted. Try again shortly.",1]`,
+		},
+		{
 			name:       "destroy invalidates pending reads and removes isolated panel",
 			expression: `setup(); let resolve; queue.push(new Promise(done => {resolve = done;})); controller.open({occurrenceID: 'one'}); controller.destroy(); resolve(reply()); await settle(); return [root.children.length, posts().length, timers.size];`,
 			want:       `[0,0,0]`,
