@@ -10,6 +10,8 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -23,6 +25,11 @@ type alertThreadService interface {
 	ReplyToAlert(context.Context, string, opsalerts.ThreadReplyRequest) (opsalerts.AlertThread, error)
 }
 
+// alertThreadRefresher shares targeted Slack reads across authenticated discussion viewers.
+type alertThreadRefresher interface {
+	RefreshAlertThread(context.Context, string) (opsalerts.AlertThread, error)
+}
+
 // alertThreadResponse rebinds every result to the authenticated actor.
 type alertThreadResponse struct {
 	User      string                `json:"user"`
@@ -30,19 +37,53 @@ type alertThreadResponse struct {
 	Thread    opsalerts.AlertThread `json:"thread"`
 }
 
-// alertThread serves cache-only pages and explicit, guarded original-thread writes.
+// alertThread serves cached pages, requested Slack refreshes and guarded original-thread writes.
 func (d *dashboard) alertThread(w http.ResponseWriter, r *http.Request, actor string) {
 	service, ok := d.service.(alertThreadService)
 	if !ok {
 		writeJSON(w, http.StatusServiceUnavailable, apiError{Error: "Slack discussion is unavailable", Code: "not_ready"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	timeout := 45 * time.Second
+	if r.Method == http.MethodGet {
+		timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	var thread opsalerts.AlertThread
 	var err error
 	if r.Method == http.MethodGet {
-		thread, err = service.AlertThread(r.URL.Query().Get("occurrence_id"), r.URL.Query().Get("before"))
+		query, parseErr := url.ParseQuery(r.URL.RawQuery)
+		if parseErr != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid discussion query", Code: "validation"})
+			return
+		}
+		refresh := query["refresh"]
+		if len(refresh) > 1 || len(refresh) == 1 && refresh[0] != "true" && refresh[0] != "false" {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "refresh must be true or false", Code: "validation"})
+			return
+		}
+		fresh := len(refresh) == 1 && refresh[0] == "true"
+		if fresh && query.Get("before") != "" {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "older discussion pages are cache-only", Code: "validation"})
+			return
+		}
+		if fresh {
+			refresher, available := service.(alertThreadRefresher)
+			if !available {
+				writeJSON(w, http.StatusServiceUnavailable, apiError{Error: "Slack discussion refresh is unavailable; displayed messages may be stale", Code: "not_ready"})
+				return
+			}
+			err = ctx.Err()
+			if err != nil {
+				err = errors.Join(opsalerts.ErrNotReady, err)
+			}
+			if err == nil {
+				thread, err = refresher.RefreshAlertThread(ctx, query.Get("occurrence_id"))
+			}
+		} else {
+			thread, err = service.AlertThread(query.Get("occurrence_id"), query.Get("before"))
+		}
 	} else {
 		if r.Header.Get("Origin") != d.access.origin || !hmac.Equal([]byte(r.Header.Get("X-CSRF-Token")), []byte(d.csrfToken(actor))) {
 			writeJSON(w, http.StatusForbidden, apiError{Error: "same-origin CSRF validation failed", Code: "forbidden"})
@@ -69,6 +110,19 @@ func (d *dashboard) alertThread(w http.ResponseWriter, r *http.Request, actor st
 	}
 	if err != nil {
 		status, code := actionError(err)
+		if r.Method == http.MethodGet {
+			var refreshError *opsalerts.ThreadRefreshError
+			if errors.As(err, &refreshError) {
+				retry := max(time.Second, refreshError.RetryAfter)
+				seconds := int64(retry / time.Second)
+				if retry%time.Second != 0 {
+					seconds++
+				}
+				w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+			}
+			writeJSON(w, status, apiError{Error: "Slack discussion could not be loaded (" + code + "); displayed messages may be stale", Code: code})
+			return
+		}
 		var referenceError *opsalerts.ThreadReferenceError
 		if errors.As(err, &referenceError) {
 			writeJSON(w, status, apiError{Error: referenceError.Error(), Code: code})

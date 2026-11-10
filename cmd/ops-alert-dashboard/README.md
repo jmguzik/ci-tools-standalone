@@ -249,14 +249,26 @@ dashboard actions. Message HTML is never executed. Remote images are restricted
 to approved public Slack image hosts and the approved avatar host; arbitrary
 external images are not fetched through a server proxy.
 
-Thread reads and pagination reuse the complete shared Slack cache already used
-for workflow recovery. They do not introduce per-browser thread-history reads
-or continuous discussion polling. **Refresh cached conversation** reads the
-latest published cache and displays its source sync time. Messages arriving
-outside the dashboard appear after the regular shared Slack sync and an explicit
-refresh. This is not live Slack replication: reply edits or reactions that do
-not change the thread's reply count or latest-reply timestamp can wait until a
-later shared thread refetch. User profiles and relevant custom emoji are resolved lazily through a
+Opening or reopening a discussion requests a fresh Slack read. While the panel
+is open in a visible browser tab, it refreshes automatically every 15 seconds.
+**Refresh Slack conversation** requests the same targeted read immediately;
+neither operation waits for the next full channel sync or depends on changed
+reply-count metadata. Closing the panel, hiding the tab, or losing authentication
+stops automatic refreshes. Returning to a visible open panel requests fresh data.
+Drafts, loaded older pages, and pending delivery guards survive refreshes.
+
+Reads still share the complete Slack thread cache used for workflow recovery.
+Recent successful reads are reused across viewers for five seconds, and targeted
+reads share the active Chai conversation worker's read budget and Slack backoff.
+**Load older messages** remains cache-only. The panel shows the thread's actual
+last successful Slack read time. Failed or throttled refreshes retain displayed
+messages with an error instead of presenting them as newly synchronized, and
+automatic retries respect `Retry-After`. This is polling, not a streaming
+connection or a guarantee that every reply appears within 15 seconds: upstream
+rate limits, read failures, and contention can extend that delay. Refreshes never
+post Slack messages, reactions, or workflow commands.
+
+User profiles and relevant custom emoji are resolved lazily through a
 bounded shared directory cache, including cached failures, so reopening a thread
 does not repeat fresh directory lookups. Successful metadata is cached for one
 hour and failures for five minutes; Slack rate-limit backoff is shared across
@@ -522,7 +534,8 @@ While the popup is open in a visible tab, it checks the shared conversation cach
 every five seconds. A bounded background worker refreshes interested threads at
 most once per ten seconds each, with one Slack thread read at a time. Interest
 expires after 30 seconds and is limited to eight threads; rate limits postpone
-reads. Full channel discovery continues at `--sync-interval` (one minute by
+reads. Open alert discussions share this targeted-read budget and thread cache.
+Full channel discovery continues at `--sync-interval` (one minute by
 default). This is polling with a short delay, not a streaming connection or a
 guarantee of a fixed response time. Minimized and hidden tabs stop chat polling.
 
@@ -559,7 +572,9 @@ the scan covers at most 72 hours. Buffer occurrences are hidden and cannot recei
 new actions. Current-day rules still expire at the next 06:00 UTC reset.
 Reconciliation rescans this bounded history (default every minute), rereading
 threads when reply counts or latest-reply timestamps change. Browser refreshes
-read memory every 15 seconds, not Slack. Config changes require a process restart.
+of the main dashboard snapshot read memory every 15 seconds, not Slack. Open
+Slack discussions additionally request targeted Slack refreshes as described
+above. Config changes require a process restart.
 
 Incomplete replay or malformed trusted action records expose Catching up/Degraded
 coverage and pause actions. Verify channel retention and full rebuild time before

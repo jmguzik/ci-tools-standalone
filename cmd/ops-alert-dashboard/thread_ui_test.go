@@ -23,7 +23,7 @@ class Element {
   focus() { this.focused = true; }
 }
 const store = new Map(), timers = new Map(); let timerID = 0;
-const doc = {createElement: tag => new Element(tag), getElementById: () => null};
+const doc = {hidden: false, handlers: {}, createElement: tag => new Element(tag), getElementById: () => null, addEventListener(name, fn) {this.handlers[name] = fn;}, removeEventListener(name) {delete this.handlers[name];}};
 const sandbox = {URL, Date, TextEncoder, AbortController, Map, Set, console, document: doc, crypto: {randomUUID: () => '11111111-1111-4111-8111-111111111111'}, sessionStorage: {getItem: key => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: key => store.delete(key)}, window: {setTimeout: (fn, delay) => {timers.set(++timerID, {fn, delay}); return timerID;}, clearTimeout: id => timers.delete(id)}};
 const context = vm.createContext(sandbox); context.store = store; context.timers = timers;
 vm.runInContext(fs.readFileSync('web/threads.js', 'utf8'), context);
@@ -46,6 +46,7 @@ globalThis.content = node => node.textContent + node.children.map(content).join(
 globalThis.input = value => {find('thread-draft').value = value; find('thread-draft').handlers.input();};
 globalThis.click = className => find(className).handlers.click();
 globalThis.settle = async () => {for (let i = 0; i < 12; i++) await Promise.resolve();};
+globalThis.fireTimers = async () => {const pending = [...timers.values()]; timers.clear(); for (const timer of pending) timer.fn(); await settle();};
 globalThis.open = async (id = 'one') => {controller.open({occurrenceID: id, title: 'Alert ' + id, slackURL: 'https://workspace.slack.com/archives/C123/p1790000000000001'}); await settle();};
 globalThis.posts = () => calls.filter(call => call.method === 'POST');
 globalThis.messages = () => findAll('thread-message-body').map(content);
@@ -69,14 +70,94 @@ func TestSlackThreadController(t *testing.T) {
 		want       string
 	}{
 		{
-			name:       "mount nonmodal panel and fetch only on explicit first open",
-			expression: `setup(); const initial = [root.children.length, calls.length, find('thread-panel').hidden, find('thread-panel').attributes.role]; await open(); controller.close(); await open(); return [initial, calls.map(call => call.method), timers.size, find('thread-panel').hidden];`,
-			want:       `[[1,0,true,"region"],["GET"],0,false]`,
+			name:       "mount nonmodal panel and read fresh data on every explicit open",
+			expression: `setup(); const initial = [root.children.length, calls.length, find('thread-panel').hidden, find('thread-panel').attributes.role]; await open(); controller.close(); await open(); return [initial, calls.map(call => call.method), calls.map(call => call.body), timers.size, find('thread-panel').hidden];`,
+			want:       `[[1,0,true,"region"],["GET","GET"],[{"occurrence_id":"one","refresh":true},{"occurrence_id":"one","refresh":true}],1,false]`,
 		},
 		{
 			name:       "snapshot updates and draft edits never refresh or post",
 			expression: `setup(); await open(); input('Private draft'); const textarea = find('thread-draft'); textarea.focus(); for (let i = 0; i < 10; i++) controller.update({user: 'alice', status: {phase: 'ready'}}); controller.close(); await open(); return [calls.length, posts().length, find('thread-draft') === textarea, textarea.focused, textarea.value, timers.size];`,
-			want:       `[1,0,true,true,"Private draft",0]`,
+			want:       `[2,0,true,true,"Private draft",1]`,
+		},
+		{
+			name:       "automatic timer fires one fresh read updates the view and reschedules without posting",
+			expression: `setup(); await open(); const body = find('thread-body'); body.scrollTop = 0; body.scrollHeight = 200; body.clientHeight = 100; queue.push(reply(thread('one', [message(2, {text: 'Late reply'})]))); await fireTimers(); return [calls.length, calls[1].body, messages(), body.scrollTop, posts().length, timers.size, [...timers.values()][0].delay];`,
+			want:       `[2,{"occurrence_id":"one","refresh":true},["Root one","Late reply"],0,0,1,15000]`,
+		},
+		{
+			name:       "closing the panel stops the automatic refresh timer",
+			expression: `setup(); await open(); controller.close(); return [timers.size, find('thread-panel').hidden];`,
+			want:       `[0,true]`,
+		},
+		{
+			name:       "hidden tab suspends the timer and returning reads fresh data immediately",
+			expression: `setup(); await open(); document.hidden = true; document.handlers.visibilitychange(); const hidden = [timers.size, calls.length]; document.hidden = false; document.handlers.visibilitychange(); await settle(); return [hidden, calls.length, calls.at(-1).body, timers.size];`,
+			want:       `[[0,1],2,{"occurrence_id":"one","refresh":true},1]`,
+		},
+		{
+			name:       "auth pause stops the timer until a new explicit open",
+			expression: `setup(); await open(); controller.update({user: 'alice', authPaused: true}); const paused = timers.size; controller.update({user: 'alice', status: {phase: 'ready'}}); return [paused, timers.size, find('thread-refresh').disabled];`,
+			want:       `[0,0,true]`,
+		},
+		{
+			name:       "degraded snapshot reads once without arming the automatic timer",
+			expression: `setup(); controller.update({user: 'alice', status: {phase: 'degraded'}}); await open(); return [calls.length, calls[0].body, timers.size];`,
+			want:       `[1,{"occurrence_id":"one","refresh":true},0]`,
+		},
+		{
+			name:       "recovered readiness restarts the timer without resetting a pending one",
+			expression: `setup(); controller.update({user: 'alice', status: {phase: 'degraded'}}); await open(); const degraded = timers.size; controller.update({user: 'alice', status: {phase: 'ready'}}); const scheduled = [...timers.keys()]; controller.update({user: 'alice', status: {phase: 'ready'}}); return [degraded, timers.size, [...timers.keys()][0] === scheduled[0], [...timers.values()][0].delay];`,
+			want:       `[0,1,true,15000]`,
+		},
+		{
+			name:       "periodic snapshot updates never reset or defer the armed timer",
+			expression: `setup(); await open(); const before = [...timers.entries()].map(([id, timer]) => [id, timer.delay]); for (let i = 0; i < 10; i++) controller.update({user: 'alice', status: {phase: 'ready'}}); return [timers.size, JSON.stringify(before) === JSON.stringify([...timers.entries()].map(([id, timer]) => [id, timer.delay])), calls.length];`,
+			want:       `[1,true,1]`,
+		},
+		{
+			name:       "manual refresh requests fresh Slack data for the opened occurrence",
+			expression: `setup(); await open(); await controller.refresh(); return [calls.length, calls[1].body];`,
+			want:       `[2,{"occurrence_id":"one","refresh":true}]`,
+		},
+		{
+			name:       "failed refresh keeps the conversation draft and last synced time while delaying the retry",
+			expression: `setup(); queue.push(reply(thread('one', [message(2)], {fetched_at: '2026-11-05T09:00:00Z'}))); await open(); input('Keep'); const synced = find('thread-status').textContent; queue.push(reply({error: 'Slack discussion could not be loaded (not_ready); displayed messages may be stale'}, 503)); await controller.refresh(); return [[...timers.values()][0].delay, messages(), find('thread-draft').value, find('thread-error').textContent, find('thread-status').textContent === synced];`,
+			want:       `[15000,["Root one","Reply 2"],"Keep","Slack discussion could not be loaded (not_ready); displayed messages may be stale",true]`,
+		},
+		{
+			name:       "short server Retry-After is honored so shared budget retries are not starved",
+			expression: `setup(); await open(); queue.push({...reply({error: 'Busy'}, 503), retryAfter: 1}); await controller.refresh(); return [[...timers.values()][0].delay, messages(), find('thread-error').hidden];`,
+			want:       `[1000,["Root one"],false]`,
+		},
+		{
+			name:       "long or invalid Retry-After values stay within safe timer bounds",
+			expression: `setup(); await open(); queue.push({...reply({error: 'Busy'}, 503), retryAfter: '999999999999'}); await controller.refresh(); const huge = [...timers.values()][0].delay; queue.push({...reply({error: 'Busy'}, 503), retryAfter: Infinity}); await controller.refresh(); const infinite = [...timers.values()][0].delay; queue.push({...reply({error: 'Busy'}, 503), retryAfter: 'later'}); await controller.refresh(); const invalid = [...timers.values()][0].delay; queue.push({...reply({error: 'Busy'}, 503), retryAfter: '-5'}); await controller.refresh(); return [huge, infinite, invalid, [...timers.values()][0].delay];`,
+			want:       `[2147483647,15000,15000,15000]`,
+		},
+		{
+			name:       "retry after a throttled refresh recovers the normal cadence",
+			expression: `setup(); await open(); queue.push({...reply({error: 'Busy'}, 503), retryAfter: 1}); await fireTimers(); const retry = [...timers.values()][0].delay; await fireTimers(); return [retry, calls.length, calls.at(-1).body, [...timers.values()][0].delay];`,
+			want:       `[1000,3,{"occurrence_id":"one","refresh":true},15000]`,
+		},
+		{
+			name:       "late automatic read cannot re-arm polling after close hide auth failure or destroy",
+			expression: `setup(); await open(); const results = []; let resolve; queue.push(new Promise(done => {resolve = done;})); await fireTimers(); controller.close(); resolve(reply(thread('one', [message(2)]))); await settle(); results.push(['close', timers.size]); await open(); queue.push(new Promise(done => {resolve = done;})); await fireTimers(); document.hidden = true; document.handlers.visibilitychange(); resolve(reply(thread('one'))); await settle(); results.push(['hidden', timers.size]); document.hidden = false; document.handlers.visibilitychange(); await settle(); results.push(['visible', calls.length, timers.size]); queue.push(new Promise(done => {resolve = done;})); await fireTimers(); controller.update({user: 'alice', authPaused: true}); resolve(reply(thread('one'))); await settle(); results.push(['auth', timers.size]); controller.update({user: 'alice', status: {phase: 'ready'}}); await open(); queue.push(new Promise(done => {resolve = done;})); await fireTimers(); controller.destroy(); resolve(reply(thread('one'))); await settle(); results.push(['destroy', timers.size, root.children.length]); return results;`,
+			want:       `[["close",0],["hidden",0],["visible",5,1],["auth",0],["destroy",0,0]]`,
+		},
+		{
+			name:       "late auto refresh response cannot restore a previous occurrence view",
+			expression: `setup(); await open(); let resolve; queue.push(new Promise(done => {resolve = done;})); await fireTimers(); await open('two'); input('Second'); resolve(reply(thread('one', [message(2, {text: 'Stale secret'})]))); await settle(); return [calls.map(call => call.body.occurrence_id), messages(), find('thread-draft').value];`,
+			want:       `[["one","one","two"],["Root two"],"Second"]`,
+		},
+		{
+			name:       "reopening a cached occurrence replaces the view with fresh data",
+			expression: `setup(); await open(); controller.close(); queue.push(reply(thread('one', [message(2, {text: 'New reply'})]))); await open(); return [calls.length, messages()];`,
+			want:       `[2,["Root one","New reply"]]`,
+		},
+		{
+			name:       "automatic refresh reconciles a retained reply without any post",
+			expression: `setupRetained(); await open(); queue.push(confirmation()); await fireTimers(); return [posts().length, store.size, find('thread-retry').hidden, calls.length, calls[1].body];`,
+			want:       `[0,0,true,2,{"occurrence_id":"one","refresh":true}]`,
 		},
 		{
 			name:       "original root deduped and replies sorted chronologically",
@@ -111,12 +192,12 @@ func TestSlackThreadController(t *testing.T) {
 		{
 			name:       "per occurrence drafts and cached conversation survive switching",
 			expression: `setup(); await open(); input('First draft'); await open('two'); input('Second draft'); await open('one'); return [find('thread-draft').value, messages(), calls.length];`,
-			want:       `["First draft",["Root one"],2]`,
+			want:       `["First draft",["Root one"],3]`,
 		},
 		{
 			name:       "thread and draft caches evict oldest after eight occurrences",
 			expression: `setup(); for (let i = 0; i < 9; i++) {await open('item' + i); input('Draft ' + i);} await open('item1'); const kept = find('thread-draft').value; await open('item0'); return [calls.length, kept, find('thread-draft').value];`,
-			want:       `[10,"Draft 1",""]`,
+			want:       `[11,"Draft 1",""]`,
 		},
 		{
 			name:       "loading errors recover refresh controls and preserve draft",
@@ -585,6 +666,11 @@ func TestSlackThreadAppWiring(t *testing.T) {
 			name:       "thread GET encodes occurrence cursor and never targets Chai",
 			expression: `(async () => {UI.state.snapshot = {...snapshot([]), csrf_token: 'token'}; globalThis.sent = []; globalThis.fetch = async (url, options) => {sent.push({url, method: options.method, headers: options.headers, credentials: options.credentials, cache: options.cache}); return respond({user: 'operator', thread: {}});}; await UI.threadRequest('GET', {occurrence_id: 'C1:1.2', before: '1.1'}); return sent;})()`,
 			want:       `[{"url":"/api/alert-thread?occurrence_id=C1%3A1.2&before=1.1","method":"GET","headers":{"Accept":"application/json"},"credentials":"same-origin","cache":"no-store"}]`,
+		},
+		{
+			name:       "thread GET adds refresh true only for an explicit true flag",
+			expression: `(async () => {UI.state.snapshot = {...snapshot([]), csrf_token: 'token'}; globalThis.sent = []; globalThis.fetch = async url => {sent.push(url); return respond({user: 'operator', thread: {}});}; await UI.threadRequest('GET', {occurrence_id: 'C1:1.2', refresh: true}); await UI.threadRequest('GET', {occurrence_id: 'C1:1.2', refresh: false}); await UI.threadRequest('GET', {occurrence_id: 'C1:1.2'}); return sent;})()`,
+			want:       `["/api/alert-thread?occurrence_id=C1%3A1.2&refresh=true","/api/alert-thread?occurrence_id=C1%3A1.2","/api/alert-thread?occurrence_id=C1%3A1.2"]`,
 		},
 		{
 			name:       "thread POST sends strict caller payload with actor bound CSRF",

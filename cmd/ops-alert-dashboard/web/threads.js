@@ -7,6 +7,10 @@
   const maxRichNodes = 400;
   const maxInlineDepth = 6;
   const maxAliasDepth = 4;
+  const refreshInterval = 15000;
+  const minRetryDelay = 1000;
+  // setTimeout treats delays past 2^31-1 milliseconds as immediate, so automatic retries stay inside a safe range.
+  const maxRetryDelay = 2147483647;
   const bytes = value => new TextEncoder().encode(value).length;
   const storageKey = user => 'ops-alert-dashboard.thread.pending.v1.' + encodeURIComponent(user);
   const validPending = value => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 3 && typeof value.request_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.request_id) && typeof value.text === 'string' && !!value.text.trim() && bytes(value.text) <= 4000 && typeof value.occurrence_id === 'string' && !!value.occurrence_id;
@@ -36,7 +40,13 @@
   /** Accept only the documented thread and message envelopes before rendering untrusted data. */
   const validThread = value => !!value && typeof value === 'object' && !Array.isArray(value) && typeof value.occurrence_id === 'string' && !!value.occurrence_id && typeof value.root_ts === 'string' && !!value.root_ts && !!value.root && typeof value.root === 'object' && !Array.isArray(value.root) && Array.isArray(value.messages);
   const validMessage = value => !!value && typeof value === 'object' && !Array.isArray(value) && typeof value.timestamp === 'string' && !!value.timestamp;
-  /** Own one non-modal original-thread window without polling, workflow changes or Chai routing. */
+  /** Automatic retries follow a positive server Retry-After in seconds within safe timer bounds; anything else keeps the steady cadence. */
+  const nextRetryDelay = response => {
+    const seconds = Number(response?.retryAfter);
+    if (!Number.isFinite(seconds) || seconds <= 0) return refreshInterval;
+    return Math.min(maxRetryDelay, Math.max(minRetryDelay, seconds * 1000));
+  };
+  /** Own one non-modal original-thread window with open-only Slack refresh, no workflow changes and no Chai routing. */
   function create(options) {
     const root = options.root, doc = root.ownerDocument || document;
     const make = (tag, nodeText, className) => { const element = doc.createElement(tag); if (nodeText != null) element.textContent = String(nodeText); if (className) element.className = className; return element; };
@@ -46,11 +56,11 @@
     const channelNameNow = () => (typeof options.channelName === 'function' ? text(options.channelName()) : text(options.channelName)) || 'Operations channel';
     const usergroupsNow = () => (typeof options.usergroups === 'function' ? options.usergroups() : options.usergroups) || {};
     const botName = text(options.botName) || 'the dashboard bot';
-    const state = {user: '', snapshot: null, occurrence: null, threads: new Map(), drafts: new Map(), pending: null, pendingDraft: null, pendingUncertain: false, pendingRestored: false, sending: false, loading: false, loadingOlder: false, paused: false, error: '', storageError: '', generation: 0, threadRevision: 0, renderedKey: '', destroyed: false};
+    const state = {user: '', snapshot: null, occurrence: null, threads: new Map(), drafts: new Map(), pending: null, pendingDraft: null, pendingUncertain: false, pendingRestored: false, sending: false, loading: false, loadingOlder: false, paused: false, error: '', storageError: '', generation: 0, threadRevision: 0, renderedKey: '', timer: null, retryDelay: refreshInterval, destroyed: false};
     const panel = make('section', null, 'thread-panel'); panel.id = 'alert-thread-panel'; panel.hidden = true; panel.tabIndex = -1; panel.setAttribute('role', 'region'); panel.setAttribute('aria-label', 'Original Slack discussion');
     const header = make('div', null, 'thread-header'), heading = make('div', null, 'thread-heading'); heading.append(make('strong', '💬 Slack discussion'), make('span', 'Original alert thread · shared cached history', 'thread-subtitle'));
     const controls = make('div', null, 'thread-controls'), close = button('✕', closePanel); close.setAttribute('aria-label', 'Close discussion'); close.className = 'thread-close';
-    const refreshControl = button('↻ Refresh cached conversation', () => refresh(), 'thread-refresh'); controls.append(refreshControl, close); header.append(heading, controls);
+    const refreshControl = button('↻ Refresh Slack conversation', () => refresh(), 'thread-refresh'); controls.append(refreshControl, close); header.append(heading, controls);
     const context = make('div', null, 'thread-context');
     const toolbar = make('div', null, 'thread-toolbar');
     const status = make('div', null, 'thread-status'); status.setAttribute('role', 'status');
@@ -496,7 +506,7 @@
       const slackLink = anchor(view?.meta?.slack_url, '↗ Open in Slack', 'thread-link') || anchor(state.occurrence?.slackURL, '↗ Open in Slack', 'thread-link');
       if (slackLink) toolbar.append(slackLink);
       if (view && Number.isFinite(view.meta.total_replies)) toolbar.append(make('span', view.replies.length + ' of ' + view.meta.total_replies + ' replies shown', 'thread-subtitle'));
-      status.textContent = state.paused ? 'Session expired. Refresh the dashboard to sign in again.' : state.sending ? 'Posting your reply…' : state.pending ? 'Delivery is unconfirmed. Retry only checks for this exact reply; it cannot repost it. Check Slack before explicitly discarding an unresolved request.' : !state.user ? 'Waiting for your session…' : state.loading ? 'Loading the cached conversation…' : state.loadingOlder ? 'Loading earlier messages…' : view ? view.meta.fetched_at ? 'Cached conversation · synced ' + date(view.meta.fetched_at) + ' · Slack history is updated by the shared server cache.' : 'Cached conversation.' : 'Not loaded.';
+      status.textContent = state.paused ? 'Session expired. Refresh the dashboard to sign in again.' : state.sending ? 'Posting your reply…' : state.pending ? 'Delivery is unconfirmed. Retry only checks for this exact reply; it cannot repost it. Check Slack before explicitly discarding an unresolved request.' : !state.user ? 'Waiting for your session…' : state.loading ? 'Loading the cached conversation…' : state.loadingOlder ? 'Loading earlier messages…' : view ? view.meta.fetched_at ? 'Cached conversation · synced ' + date(view.meta.fetched_at) + ' · Auto-refreshes from Slack while open.' : 'Cached conversation.' : 'Not loaded.';
       errorBox.textContent = state.storageError || state.error;
       errorBox.hidden = !errorBox.textContent;
       refreshControl.disabled = state.loading || state.loadingOlder || state.sending || state.paused || !state.user || !state.occurrence;
@@ -516,6 +526,22 @@
       const controller = new AbortController(), timeout = window.setTimeout(() => controller.abort(), method === 'GET' ? 12000 : 25000);
       try { return await options.request(method, requestBody, controller.signal); } finally { window.clearTimeout(timeout); }
     }
+    /** Arm the one automatic refresh timer only while the panel is open, visible, authenticated and ready. */
+    function scheduleAuto() {
+      window.clearTimeout(state.timer); state.timer = null;
+      if (!state.destroyed && state.open && state.occurrence && state.user && !state.paused && !doc.hidden && state.snapshot?.status?.phase === 'ready') state.timer = window.setTimeout(autoRefresh, state.retryDelay);
+    }
+    /** One automatic fresh read per armed tick; the next read is never overlapping and never a post. */
+    function autoRefresh() {
+      state.timer = null;
+      if (state.destroyed || !state.open || state.paused || !state.user || !state.occurrence || doc.hidden || state.snapshot?.status?.phase !== 'ready') return;
+      load(state.occurrence.id, '');
+    }
+    /** Suspend automatic refreshes while the tab is hidden and read fresh data as soon as it is visible again. */
+    function visibility() {
+      if (doc.hidden) { window.clearTimeout(state.timer); state.timer = null; }
+      else if (state.open) refresh();
+    }
     /** Remove private display state when the authenticated identity is no longer verified. */
     function pause() {
       clearPrivate(); state.paused = true;
@@ -525,12 +551,13 @@
     /** Leave actor-bound durable guards in storage but remove all private in-memory display data. */
     function clearPrivate() {
       state.generation++; state.error = ''; state.storageError = '';
+      window.clearTimeout(state.timer); state.timer = null; state.retryDelay = refreshInterval;
       state.threads.clear(); state.drafts.clear(); state.occurrence = null; state.pending = null;
       state.pendingDraft = null; state.pendingUncertain = false; state.pendingRestored = false; state.snapshot = null;
       state.loading = false; state.loadingOlder = false; state.sending = false; state.renderedKey = '';
       body.replaceChildren();
     }
-    /** Read one page of the shared server cache; superseded reads can never overwrite confirmed state. */
+    /** Read the latest page as fresh Slack data, or one cache-only older page; superseded reads can never overwrite confirmed state. */
     async function load(occurrenceID, before = '') {
       if (state.destroyed || state.paused || !state.user || !occurrenceID || state.loading || state.loadingOlder || state.sending) return;
       const generation = state.generation, revision = state.threadRevision;
@@ -538,10 +565,14 @@
       if (older) state.loadingOlder = true; else state.loading = true;
       render();
       try {
-        const response = await transport('GET', {occurrence_id: occurrenceID, before});
+        const response = await transport('GET', older ? {occurrence_id: occurrenceID, before} : {occurrence_id: occurrenceID, refresh: true});
         if (state.destroyed || generation !== state.generation || revision !== state.threadRevision || state.occurrence?.id !== occurrenceID) return;
         if (response.status === 401 || response.status === 403) { pause(); return; }
-        if (!response.ok) { state.error = response.body?.error || 'The cached conversation could not be loaded.'; return; }
+        if (!response.ok) {
+          state.error = response.body?.error || 'The cached conversation could not be loaded.';
+          if (!older) state.retryDelay = nextRetryDelay(response);
+          return;
+        }
         const responseBody = response.body;
         if (responseBody?.user !== state.user) { pause(); return; }
         const thread = responseBody?.thread;
@@ -549,10 +580,14 @@
         mergeThread(thread, older);
         reconcile(thread);
         state.error = '';
+        if (!older) state.retryDelay = refreshInterval;
       } catch (err) {
-        if (generation === state.generation && revision === state.threadRevision) state.error = err.name === 'AbortError' ? 'Loading the cached conversation timed out. Your draft is preserved.' : err.message || 'The cached conversation is unavailable.';
+        if (generation === state.generation && revision === state.threadRevision) {
+          state.error = err.name === 'AbortError' ? 'Loading the cached conversation timed out. Your draft is preserved.' : err.message || 'The cached conversation is unavailable.';
+          if (!older) state.retryDelay = refreshInterval;
+        }
       } finally {
-        if (generation === state.generation) { state.loading = false; state.loadingOlder = false; }
+        if (generation === state.generation) { state.loading = false; state.loadingOlder = false; scheduleAuto(); }
         render();
       }
     }
@@ -562,7 +597,7 @@
       if (!view || view.complete || !view.cursor || state.loading || state.loadingOlder || state.sending) return;
       return load(state.occurrence.id, view.cursor);
     }
-    /** Manually refresh the cached view of the currently opened occurrence. */
+    /** Manually refresh the currently opened conversation with fresh Slack data. */
     function refresh() {
       if (state.destroyed || state.paused || !state.user || !state.occurrence || state.loading || state.loadingOlder || state.sending) return;
       return load(state.occurrence.id, '');
@@ -610,7 +645,7 @@
       } catch (err) {
         if (generation === state.generation) state.error = (err.name === 'AbortError' ? 'Request timed out.' : err.message || 'Request interrupted.') + ' Delivery is unconfirmed. The original request ID is retained for a reconcile retry.';
       } finally {
-        if (generation === state.generation) state.sending = false;
+        if (generation === state.generation) { state.sending = false; scheduleAuto(); }
         render();
       }
     }
@@ -624,7 +659,7 @@
       state.error = 'The unresolved request was discarded. Delivery stays unconfirmed; nothing was sent or undone. Send a new reply explicitly when ready.';
       render();
     }
-    /** Open the discussion for one occurrence, reusing cached pages without polling. */
+    /** Open the discussion for one occurrence; every open reads fresh Slack data while cached pages, drafts and guards survive. */
     function open(occurrence) {
       if (state.destroyed || state.paused || !state.user) return;
       state.open = true;
@@ -634,17 +669,17 @@
         const existing = state.threads.get(occurrenceID);
         if (existing) { state.threads.delete(occurrenceID); state.threads.set(occurrenceID, existing); }
         state.occurrence = {id: occurrenceID, title: text(occurrence.title).trim() || 'Selected alert', slackURL: text(occurrence.slackURL).trim()};
-        if (!existing) load(occurrenceID, '');
+        load(occurrenceID, '');
       }
       render(); panel.focus();
     }
-    /** Hide the panel while keeping cached pages, drafts and any retained request. */
+    /** Hide the panel and stop automatic refreshes while keeping cached pages, drafts and any retained request. */
     function closePanel() {
-      state.open = false; render();
+      state.open = false; window.clearTimeout(state.timer); state.timer = null; render();
       const control = doc.getElementById?.('thread-open-' + state.occurrence?.id);
       if (control) control.focus();
     }
-    /** Apply identity and readiness only; snapshot updates never fetch discussion or erase drafts. */
+    /** Apply identity and readiness only; snapshot updates never fetch discussion, erase drafts or reset an armed refresh timer. */
     function update(snapshot) {
       const user = typeof snapshot?.user === 'string' ? snapshot.user : '';
       const paused = !user || snapshot?.authPaused === true;
@@ -652,12 +687,14 @@
       if (reset) { clearPrivate(); state.user = user; }
       state.snapshot = paused ? null : snapshot; state.paused = paused;
       if (reset && !paused) restorePending();
+      if (!state.timer) scheduleAuto();
       render();
     }
-    /** Invalidate outstanding reads before removing this window and its listeners. */
-    function destroy() { state.destroyed = true; state.generation++; root.replaceChildren(); }
+    /** Invalidate outstanding reads before removing this window, its timer and its listeners. */
+    function destroy() { state.destroyed = true; state.generation++; window.clearTimeout(state.timer); state.timer = null; doc.removeEventListener('visibilitychange', visibility); root.replaceChildren(); }
     composer.append(label, draft, mentionHint, footer);
     root.append(panel);
+    doc.addEventListener('visibilitychange', visibility);
     render();
     return {update, open, close: closePanel, refresh, destroy};
   }

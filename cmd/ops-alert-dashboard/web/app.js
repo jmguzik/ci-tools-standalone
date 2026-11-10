@@ -35,7 +35,7 @@
     const headers = {Accept: 'application/json'};
     const options = {method, credentials: 'same-origin', cache: 'no-store', signal, headers};
     if (method === 'POST') { headers['Content-Type'] = 'application/json'; headers['X-CSRF-Token'] = state.snapshot?.csrf_token || ''; options.body = JSON.stringify(body); }
-    const query = method === 'GET' && body?.occurrence_id ? '?occurrence_id=' + encodeURIComponent(body.occurrence_id) + (body.before ? '&before=' + encodeURIComponent(body.before) : '') : '';
+    const query = method === 'GET' && body?.occurrence_id ? '?occurrence_id=' + encodeURIComponent(body.occurrence_id) + (body.before ? '&before=' + encodeURIComponent(body.before) : '') + (body.refresh === true ? '&refresh=true' : '') : '';
     const response = await fetch('/api/alert-thread' + query, options);
     const json = (response.headers.get('content-type') || '').includes('application/json');
     if (generation !== state.generation || response.redirected || !json || response.status === 401 || response.status === 403) return {ok: false, status: 401, body: {error: 'Your authenticated session could not be verified.'}};

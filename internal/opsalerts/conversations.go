@@ -613,14 +613,12 @@ func (s *Service) postConversation(ctx context.Context, actor string, req Conver
 	threads := maps.Clone(cache.Threads)
 	saved := slack.Message{Msg: slack.Msg{Timestamp: ts, ThreadTimestamp: root, User: s.cfg.Writer.UserID, BotID: s.cfg.Writer.BotID, Text: message.Text, Metadata: message.Metadata}}
 	if root == "" {
+		// A brand-new standalone root holds only the posted message, and no
+		// complete-thread read has happened yet.
 		root = ts
 		threads[root] = threadCache{Root: saved}
 	} else {
-		thread := threads[root]
-		thread.Replies = append(append([]slack.Message{}, thread.Replies...), saved)
-		thread.Root.ReplyCount++
-		thread.Root.LatestReply = ts
-		threads[root] = thread
+		saveThreadReply(threads, root, ts, saved)
 	}
 	updated, err := s.replay(threads, cache.Pending)
 	if err != nil {
@@ -734,6 +732,12 @@ func detachedConversation(c Conversation) Conversation {
 	return c
 }
 
+// conversationRefreshBudget is the shared global pause between any two targeted Slack reads.
+const conversationRefreshBudget = 5 * time.Second
+
+// conversationPollInterval is the per-thread pause between background refreshes.
+const conversationPollInterval = 10 * time.Second
+
 // conversationInterest bounds background refreshes to recently viewed threads.
 type conversationInterest struct {
 	Until time.Time
@@ -800,11 +804,38 @@ func (s *Service) nextConversationRefresh(now time.Time) string {
 	}
 	if selected != "" {
 		interest := s.activity.Threads[selected]
-		interest.Next = now.Add(10 * time.Second)
+		interest.Next = now.Add(conversationPollInterval)
 		s.activity.Threads[selected] = interest
-		s.activity.Next = now.Add(5 * time.Second)
+		s.activity.Next = now.Add(conversationRefreshBudget)
 	}
 	return selected
+}
+
+// claimRefreshBudget reserves the global targeted-read budget shared with
+// active conversation polling, returning the wait when it is already spent.
+func (s *Service) claimRefreshBudget(now time.Time) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.Before(s.activity.Next) {
+		return s.activity.Next.Sub(now)
+	}
+	s.activity.Next = now.Add(conversationRefreshBudget)
+	return 0
+}
+
+// deferConversationRefresh postpones background polling of one root until at least the given time.
+func (s *Service) deferConversationRefresh(root string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.cfg.ChannelID + ":" + root
+	interest, exists := s.activity.Threads[id]
+	if !exists {
+		return
+	}
+	if interest.Next.Before(until) {
+		interest.Next = until
+		s.activity.Threads[id] = interest
+	}
 }
 
 // SyncConversation refreshes at most one active thread from a background worker.
@@ -818,44 +849,26 @@ func (s *Service) SyncConversation(ctx context.Context) error {
 	if cache.Coverage.Phase != "ready" {
 		return ErrNotReady
 	}
-	id := s.nextConversationRefresh(s.clock.Now())
+	now := s.clock.Now()
+	id := s.nextConversationRefresh(now)
 	if id == "" {
 		return nil
 	}
 	conversation, exists := cache.Conversations[id]
-	if !exists || conversation.CreatedAt.Before(s.historyStart(s.clock.Now(), 0)) {
+	if !exists || conversation.CreatedAt.Before(s.historyStart(now, 0)) {
 		return nil
 	}
 	root := strings.TrimPrefix(id, s.cfg.ChannelID+":")
-	replies, err := s.archive.Replies(ctx, s.cfg.ChannelID, root)
+	if thread, exists := cache.Threads[root]; exists && now.Before(thread.RefreshAfter) {
+		// A recent targeted read or memoized failure already covers this root.
+		s.deferConversationRefresh(root, thread.RefreshAfter)
+		return nil
+	}
+	updated, err := s.reloadThread(ctx, cache, root)
 	if err != nil {
-		var limited *slack.RateLimitedError
-		if errors.As(err, &limited) {
-			s.mu.Lock()
-			until := s.clock.Now().Add(limited.RetryAfter)
-			if until.After(s.activity.Next) {
-				s.activity.Next = until
-			}
-			s.mu.Unlock()
-		}
+		s.memoizeThreadReadFailure(ctx, cache, root, err)
 		return fmt.Errorf("refreshing active conversation: %w", err)
 	}
-	threads := maps.Clone(cache.Threads)
-	thread := threads[root]
-	thread.Replies = replies
-	for _, message := range replies {
-		if message.Timestamp == root {
-			thread.Root = message
-			break
-		}
-	}
-	threads[root] = thread
-	updated, err := s.replay(threads, cache.Pending)
-	if err != nil {
-		return fmt.Errorf("replaying active conversation: %w", err)
-	}
-	updated.Coverage = cache.Coverage
-	updated.Decorations = cache.Decorations
 	s.publish(updated)
 	return nil
 }
