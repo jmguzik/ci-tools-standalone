@@ -533,7 +533,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 				},
 			}
 			var err error
-			firstStageComplete, err = checkFirstStageComplete(context.Background(), cw.pjLister, prowJob, presubmits)
+			firstStageComplete, err = checkFirstStageComplete(context.Background(), cw.pjLister, cw.ghc, prowJob, presubmits)
 			if err != nil {
 				logger.WithError(err).Error("failed to check first-stage test status")
 			}

@@ -31,6 +31,7 @@ type minimalGhClient interface {
 	CreateStatus(org, repo, ref string, s github.Status) error
 	AddLabel(org, repo string, number int, label string) error
 	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
+	GetCombinedStatus(org, repo, ref string) (*github.CombinedStatus, error)
 }
 
 // sendCommentWithMode plans and posts the second-stage scheduling comment.
@@ -340,8 +341,9 @@ func isFirstStageJob(presubmits presubmitTests, name string) bool {
 	return false
 }
 
-// Both paths trust the latest matching ProwJob, including successful overrides.
-func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
+// checkFirstStageComplete trusts live ProwJobs first and recovers missing
+// always-required results from GitHub statuses for the PR's current revision.
+func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, ghc minimalGhClient, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
 	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
 		return false, nil
 	}
@@ -376,17 +378,22 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 
 	repoBaseRef := pj.Spec.Refs.Repo + "-" + pj.Spec.Refs.BaseRef
 
-	// All always-required first-stage jobs must have succeeded
+	// All always-required first-stage jobs must have succeeded; ones missing
+	// from the cache may have been pruned after succeeding and are decided by
+	// the GitHub status fallback below.
+	var missing []config.Presubmit
 	for _, presubmit := range presubmits.alwaysRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
 		}
-		if job := latestBatch[presubmit.Name]; job == nil || job.Status.State != v1.SuccessState {
+		if job := latestBatch[presubmit.Name]; job == nil {
+			missing = append(missing, presubmit)
+		} else if job.Status.State != v1.SuccessState {
 			return false, nil
 		}
 	}
 
-	// Conditionally-required first-stage jobs, if present, must have succeeded
+	// Conditionally-required first-stage jobs, if present, must have succeeded.
 	for _, presubmit := range presubmits.conditionallyRequired {
 		if !strings.Contains(presubmit.Name, repoBaseRef) {
 			continue
@@ -396,5 +403,55 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		}
 	}
 
+	if len(missing) == 0 {
+		return true, nil
+	}
+
+	// A late LGTM or override can arrive after sinker deleted the successful
+	// runs. Only the missing jobs' exact contexts count; the aggregate combined
+	// state (pipeline gate, second-stage contexts) must not block.
+	if ghc == nil {
+		return false, fmt.Errorf("no github client to verify pruned first-stage jobs of %s", pj.Name)
+	}
+	if pj.Spec.Refs.Pulls[0].SHA == "" {
+		return false, nil
+	}
+	for _, presubmit := range missing {
+		if presubmit.SkipReport || presubmit.Context == "" || presubmit.Context == pipelineGate {
+			return false, nil // unreportable contexts cannot be verified on GitHub
+		}
+	}
+	// A stale ProwJob event says nothing about the current PR, so its statuses
+	// count only while it is open, not a draft, and on the same HEAD and base.
+	pr, err := ghc.GetPullRequest(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].Number)
+	if err != nil {
+		return false, fmt.Errorf("getting pull request for pruned first-stage jobs of %s: %w", pj.Name, err)
+	}
+	if pr == nil {
+		return false, fmt.Errorf("empty pull request response for pruned first-stage jobs of %s", pj.Name)
+	}
+	if pr.State != github.PullRequestStateOpen || pr.Draft ||
+		pr.Head.SHA != pj.Spec.Refs.Pulls[0].SHA || pr.Base.Ref != pj.Spec.Refs.BaseRef {
+		return false, nil
+	}
+	combined, err := ghc.GetCombinedStatus(pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.Pulls[0].SHA)
+	if err != nil {
+		return false, fmt.Errorf("getting combined status for pruned first-stage jobs of %s: %w", pj.Name, err)
+	}
+	if combined == nil {
+		return false, fmt.Errorf("empty combined status response for pruned first-stage jobs of %s", pj.Name)
+	}
+	if combined.SHA != pj.Spec.Refs.Pulls[0].SHA {
+		return false, nil
+	}
+	states := make(map[string]string, len(combined.Statuses))
+	for _, status := range combined.Statuses {
+		states[status.Context] = status.State
+	}
+	for _, presubmit := range missing {
+		if states[presubmit.Context] != github.StatusSuccess {
+			return false, nil
+		}
+	}
 	return true, nil
 }

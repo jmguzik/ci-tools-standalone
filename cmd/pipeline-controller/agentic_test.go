@@ -98,6 +98,13 @@ func (f *fakeAgenticGitHub) RemoveLabel(_, _ string, _ int, label string) error 
 func (f *fakeAgenticGitHub) GetIssueLabels(_, _ string, _ int) ([]github.Label, error) {
 	return f.pr.Labels, nil
 }
+
+// GetCombinedStatus reports no statuses for the requested SHA by default, so
+// pruned-job verification fails closed in tests that do not stub statuses.
+func (f *fakeAgenticGitHub) GetCombinedStatus(_, _, sha string) (*github.CombinedStatus, error) {
+	return &github.CombinedStatus{SHA: sha}, nil
+}
+
 func (f *fakeAgenticGitHub) ListCheckRuns(_, _, sha string) (*github.CheckRunList, error) {
 	result := &github.CheckRunList{}
 	for _, check := range f.checks {

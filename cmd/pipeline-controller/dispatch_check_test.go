@@ -202,7 +202,7 @@ func TestTraditionalDispatchFailuresAndRetry(t *testing.T) {
 				// the same check without another /test comment or waiting for results.
 				gh.failCheck, gh.afterCheckWrite = false, nil
 				reader = newFakePJLister(makeProwJob(job.Name, pj.Spec.Refs.Pulls[0].SHA))
-				ready, err := checkFirstStageComplete(context.Background(), reader, pj, presubmits)
+				ready, err := checkFirstStageComplete(context.Background(), reader, gh, pj, presubmits)
 				require.NoError(t, err)
 				require.True(t, ready)
 				require.NoError(t, sendCommentWithMode(presubmits, pj, gh, func() {}, reader, modeDelta, false, checks))

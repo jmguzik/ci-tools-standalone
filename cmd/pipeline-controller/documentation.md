@@ -132,6 +132,14 @@ The pipeline controller automatically detects which tests should run based on:
 
 The controller analyzes the files changed in your PR and determines which tests are relevant.
 
+### First-Stage Completion and Pruned Jobs
+
+Prow's sinker deletes completed ProwJobs once they age past its retention window, counted from job start rather than completion. When a late LGTM or override arrives after that, the finished first-stage runs are no longer in the controller's cache, and waiting for a live object would stall the pipeline.
+
+Live ProwJobs always decide first: a required or conditional first-stage job that is still present and has not succeeded blocks the second stage, with no GitHub traffic. Only always-required jobs that are entirely absent from the cache are decided differently: the controller reads the commit statuses those jobs reported on GitHub for the exact PR HEAD, after confirming the PR is still open, not a draft, and on that same HEAD and target branch. The aggregate combined status is ignored; every missing job's exact context must report success. Jobs that skip reporting, or use the `ci/pipeline-gate` context, cannot be verified this way and keep blocking. Agentic readiness and traditional dispatch use this same check.
+
+The fallback costs one pull request lookup plus one batched combined-status lookup; the status lookup may fetch additional pages. GitHub statuses are commit- and context-scoped: a green context proves only that the context succeeded on that commit, not which PR or base branch the original job ran for. The current PR, HEAD and base validation is therefore required before statuses are accepted.
+
 ## Always Required Second-Stage Tests
 
 Always required second-stage tests are tests that:
@@ -253,7 +261,9 @@ Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 (repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
 
 1. In automatic mode, applicable first-stage tests pass in the shared ProwJob cache
-   (including overrides). LGTM mode also requires the current `lgtm` or `pipeline-auto`
+   (including overrides; jobs pruned by sinker are verified from their commit
+   statuses on the current HEAD, see "First-Stage Completion and Pruned Jobs").
+   LGTM mode also requires the current `lgtm` or `pipeline-auto`
    label set by `/pipeline auto`; either prerequisite may arrive first.
    Manual mode waits for a trusted user's `/pipeline required` or `/pipeline remaining`.
    In any mode, these commands request handoff immediately without waiting for

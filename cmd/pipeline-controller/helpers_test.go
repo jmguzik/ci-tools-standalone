@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
@@ -18,13 +20,18 @@ import (
 
 // fakeGhClient implements minimalGhClient for testing.
 type fakeGhClient struct {
-	comments    []string
-	changes     []github.PullRequestChange
-	pullRequest *github.PullRequest
-	addedLabels []string
+	comments               []string
+	changes                []github.PullRequestChange
+	pullRequest            *github.PullRequest
+	addedLabels            []string
+	combinedStatus         *github.CombinedStatus
+	getCombinedStatusErr   error
+	getPullRequestCalls    int
+	getCombinedStatusCalls int
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
+	f.getPullRequestCalls++
 	if f.pullRequest != nil {
 		return f.pullRequest, nil
 	}
@@ -51,6 +58,18 @@ func (f *fakeGhClient) AddLabel(org, repo string, number int, label string) erro
 
 func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.Label, error) {
 	return nil, nil
+}
+
+// GetCombinedStatus records fallback lookups and returns the configured result.
+func (f *fakeGhClient) GetCombinedStatus(org, repo, ref string) (*github.CombinedStatus, error) {
+	f.getCombinedStatusCalls++
+	if f.getCombinedStatusErr != nil {
+		return nil, f.getCombinedStatusErr
+	}
+	if f.combinedStatus != nil {
+		return f.combinedStatus, nil
+	}
+	return &github.CombinedStatus{}, nil
 }
 
 func newFakePJLister(pjs ...v1.ProwJob) ctrlruntimeclient.Reader {
@@ -658,6 +677,149 @@ func TestExistsAtSHA(t *testing.T) {
 			}
 			if got != tc.wantExists {
 				t.Errorf("existsAtSHA() = %v, want %v", got, tc.wantExists)
+			}
+		})
+	}
+}
+
+// makeProwJobInState returns a first-stage ProwJob like makeProwJob with an
+// explicit running or terminal state.
+func makeProwJobInState(name, sha string, state v1.ProwJobState) v1.ProwJob {
+	pj := makeProwJob(name, sha)
+	pj.Status.State = state
+	return pj
+}
+
+// TestCheckFirstStageCompletePrunedJobFallback covers the commit-status
+// fallback for always-required jobs deleted from the ProwJob cache by sinker:
+// live ProwJobs stay authoritative and block without GitHub traffic, while
+// missing jobs are verified against the statuses of the exact current HEAD on
+// a still-current, open PR.
+func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	unitJob := fmt.Sprintf("pull-ci-%s-%s-%s-unit", org, repo, baseRef)
+	buildJob := fmt.Sprintf("pull-ci-%s-%s-%s-build", org, repo, baseRef)
+	imagesJob := fmt.Sprintf("pull-ci-%s-%s-%s-images", org, repo, baseRef)
+
+	unit := config.Presubmit{JobBase: config.JobBase{Name: unitJob}, Reporter: config.Reporter{Context: "ci/unit"}}
+	build := config.Presubmit{JobBase: config.JobBase{Name: buildJob}, Reporter: config.Reporter{Context: "ci/build"}}
+	images := config.Presubmit{JobBase: config.JobBase{Name: imagesJob}, Reporter: config.Reporter{Context: "ci/images"}}
+	standard := presubmitTests{
+		alwaysRequired:        []config.Presubmit{unit, build},
+		conditionallyRequired: []config.Presubmit{images},
+	}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef}}
+	// The aggregate state must be ignored; only the exact job contexts count.
+	passing := &github.CombinedStatus{SHA: sha, State: github.StatusFailure, Statuses: []github.Status{
+		{Context: "ci/unit", State: github.StatusSuccess},
+		{Context: "ci/build", State: github.StatusSuccess},
+	}}
+
+	tests := []struct {
+		name            string
+		live            []v1.ProwJob
+		pr              *github.PullRequest
+		combined        *github.CombinedStatus
+		statusErr       error
+		wantComplete    bool
+		wantErr         string
+		wantPRCalls     int
+		wantStatusCalls int
+	}{
+		{
+			name:         "all live successes need no github lookup",
+			live:         []v1.ProwJob{makeProwJob(unitJob, sha), makeProwJob(buildJob, sha)},
+			wantComplete: true,
+		},
+		{
+			name:            "pruned required jobs verified from commit statuses",
+			pr:              openPR,
+			combined:        passing,
+			wantComplete:    true, // the absent conditional job stays non-blocking
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name: "fresh live override wins over stale pruned statuses",
+			live: []v1.ProwJob{makeProwJob(unitJob, sha)},
+			pr:   openPR,
+			combined: &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+				{Context: "ci/unit", State: github.StatusFailure},
+				{Context: "ci/build", State: github.StatusSuccess},
+			}},
+			wantComplete:    true,
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name: "live pending job blocks without a github lookup",
+			live: []v1.ProwJob{makeProwJobInState(unitJob, sha, v1.PendingState)},
+		},
+		{
+			name: "live failed conditional job blocks without a github lookup",
+			live: []v1.ProwJob{makeProwJobInState(imagesJob, sha, v1.FailureState)},
+		},
+		{
+			name: "missing or failing status context is incomplete",
+			pr:   openPR,
+			combined: &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+				{Context: "ci/unit", State: github.StatusFailure},
+			}},
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name:            "combined status for another sha is rejected",
+			pr:              openPR,
+			combined:        &github.CombinedStatus{SHA: "deadbeefdeadbeef", Statuses: passing.Statuses},
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+		{
+			name: "moved pr head rejects the fallback",
+			pr: &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+				Head: github.PullRequestBranch{SHA: "deadbeefdeadbeef"}, Base: github.PullRequestBranch{Ref: baseRef}},
+			wantPRCalls: 1,
+		},
+		{
+			name:            "status lookup failure is wrapped",
+			pr:              openPR,
+			statusErr:       errors.New("boom"),
+			wantErr:         "getting combined status for pruned first-stage jobs of trigger-pj: boom",
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ghc := &fakeGhClient{pullRequest: tc.pr, combinedStatus: tc.combined, getCombinedStatusErr: tc.statusErr}
+			complete, err := checkFirstStageComplete(context.Background(), newFakePJLister(tc.live...), ghc, makeTriggerPJ(sha), standard)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got nil", tc.wantErr)
+				}
+				if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
+					t.Errorf("unexpected error (-want +got):\n%s", diff)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantComplete, complete); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantPRCalls, ghc.getPullRequestCalls); diff != "" {
+				t.Errorf("unexpected pull request calls (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantStatusCalls, ghc.getCombinedStatusCalls); diff != "" {
+				t.Errorf("unexpected combined status calls (-want +got):\n%s", diff)
 			}
 		})
 	}
