@@ -28,6 +28,7 @@ type fakeGhClient struct {
 	getCombinedStatusErr   error
 	getPullRequestCalls    int
 	getCombinedStatusCalls int
+	cancelStatusLookup     context.CancelFunc
 }
 
 func (f *fakeGhClient) GetPullRequest(org, repo string, number int) (*github.PullRequest, error) {
@@ -63,6 +64,9 @@ func (f *fakeGhClient) GetIssueLabels(org, repo string, number int) ([]github.La
 // GetCombinedStatus records fallback lookups and returns the configured result.
 func (f *fakeGhClient) GetCombinedStatus(org, repo, ref string) (*github.CombinedStatus, error) {
 	f.getCombinedStatusCalls++
+	if f.cancelStatusLookup != nil {
+		f.cancelStatusLookup()
+	}
 	if f.getCombinedStatusErr != nil {
 		return nil, f.getCombinedStatusErr
 	}
@@ -891,6 +895,7 @@ func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
 		wantErr         string
 		wantPRCalls     int
 		wantStatusCalls int
+		cancelLookup    bool
 	}{
 		{
 			name:         "all live successes need no github lookup",
@@ -955,12 +960,26 @@ func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
 			wantPRCalls:     1,
 			wantStatusCalls: 1,
 		},
+		{
+			name:            "cancellation during status lookup prevents readiness",
+			pr:              openPR,
+			combined:        passing,
+			cancelLookup:    true,
+			wantErr:         "checking first-stage completion after GitHub lookups: context canceled",
+			wantPRCalls:     1,
+			wantStatusCalls: 1,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			ghc := &fakeGhClient{pullRequest: tc.pr, combinedStatus: tc.combined, getCombinedStatusErr: tc.statusErr}
-			complete, err := checkFirstStageComplete(context.Background(), newFakePJLister(tc.live...), ghc, makeTriggerPJ(sha), standard)
+			if tc.cancelLookup {
+				ghc.cancelStatusLookup = cancel
+			}
+			complete, err := checkFirstStageComplete(ctx, newFakePJLister(tc.live...), ghc, makeTriggerPJ(sha), standard)
 			if tc.wantErr != "" {
 				if err == nil {
 					t.Fatalf("expected error %q, got nil", tc.wantErr)
@@ -970,6 +989,9 @@ func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
 				}
 			} else if err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.cancelLookup && !errors.Is(err, context.Canceled) {
+				t.Errorf("expected wrapped context cancellation, got: %v", err)
 			}
 			if diff := cmp.Diff(tc.wantComplete, complete); diff != "" {
 				t.Errorf("unexpected result (-want +got):\n%s", diff)

@@ -557,5 +557,9 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 			return false, nil
 		}
 	}
+	// The GitHub methods above do not accept ctx.
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("checking first-stage completion after GitHub lookups: %w", err)
+	}
 	return true, nil
 }
