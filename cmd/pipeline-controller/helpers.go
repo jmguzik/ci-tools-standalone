@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -115,7 +116,7 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	// the lister errors above. modeForce never consults statuses.
 	proven := sets.New[string]()
 	if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
-		proven, err = terminalReportedJobs(ghc, pj.Spec.Refs, append(protectedJobs, conditionalJobs...))
+		proven, err = terminalReportedJobs(ghc, pj.Spec.Refs, presubmits.statusContextOwners, append(protectedJobs, conditionalJobs...))
 		if err != nil {
 			return "", nil, err
 		}
@@ -228,17 +229,25 @@ func secondStageTriggeredAtSHA(ctx context.Context, pjLister ctrlruntimeclient.R
 	return false
 }
 
-// terminalReportedJobs returns the names of the candidates whose reporting
-// context GitHub holds in a terminal state (success, failure or error) on the
-// exact HEAD SHA: sinker prunes finished ProwJobs, so their commit statuses
-// are the only proof left that a second-stage job already ran at that HEAD,
-// and both the delta planner and the initial pending publisher need that
-// proof. Pending never counts (the controller publishes pending placeholders
-// itself), and the proof is trusted only after one live PR lookup confirms it
-// belongs to this open, non-draft PR on the same HEAD and base branch.
-// Lookup errors fail closed so a failed verification never mass-schedules
-// pruned jobs.
-func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, candidates []config.Presubmit) (sets.Set[string], error) {
+// canReuseStatus accepts only contexts uniquely owned in the complete static
+// inventory by a presubmit restricted to the literal target base.
+func canReuseStatus(presubmit config.Presubmit, base string, owners map[string]string) bool {
+	contextKey := strings.ToLower(presubmit.Context)
+	if base == "" || presubmit.SkipReport || contextKey == "" || contextKey == pipelineGate {
+		return false // unreportable contexts cannot be verified on GitHub
+	}
+	if owner := owners[contextKey]; owner == "" || owner != presubmit.Name {
+		return false // unknown or shared context ownership
+	}
+	return len(presubmit.Branches) == 1 &&
+		presubmit.Branches[0] == "^"+regexp.QuoteMeta(base)+"$" &&
+		len(presubmit.SkipBranches) == 0
+}
+
+// terminalReportedJobs recovers attempted second-stage jobs from terminal statuses.
+// Only unambiguous single-base contexts qualify, and the PR must still match refs.
+// Pending may be our own placeholder and is never evidence of an attempt.
+func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, owners map[string]string, candidates []config.Presubmit) (sets.Set[string], error) {
 	if ghc == nil || refs == nil || len(refs.Pulls) == 0 || refs.Pulls[0].SHA == "" {
 		return nil, nil
 	}
@@ -247,8 +256,8 @@ func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, candidates []confi
 
 	var reportable []config.Presubmit
 	for _, presubmit := range candidates {
-		if presubmit.SkipReport || presubmit.Context == "" || presubmit.Context == pipelineGate {
-			continue // unreportable contexts cannot be verified on GitHub
+		if !canReuseStatus(presubmit, refs.BaseRef, owners) {
+			continue // the context cannot be attributed to this base branch
 		}
 		reportable = append(reportable, presubmit)
 	}
@@ -447,6 +456,9 @@ func isFirstStageJob(presubmits presubmitTests, name string) bool {
 
 // checkFirstStageComplete trusts live ProwJobs first and recovers missing
 // always-required results from GitHub statuses for the PR's current revision.
+// Recovered statuses count only for jobs that pass the canReuseStatus
+// eligibility guard, so a context shared across base branches (or a repo with
+// an unknown reporting inventory) stays incomplete instead of guessing.
 func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Reader, ghc minimalGhClient, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {
 	if pj == nil || pj.Spec.Refs == nil || len(pj.Spec.Refs.Pulls) != 1 {
 		return false, nil
@@ -513,7 +525,10 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 
 	// A late LGTM or override can arrive after sinker deleted the successful
 	// runs. Only the missing jobs' exact contexts count; the aggregate combined
-	// state (pipeline gate, second-stage contexts) must not block.
+	// state (pipeline gate, second-stage contexts) must not block. A context
+	// that fails the canReuseStatus eligibility guard also stays incomplete:
+	// its status cannot be attributed to this PR's base branch, so the first
+	// stage must be proven again rather than guessed from an ambiguous green.
 	if ghc == nil {
 		return false, fmt.Errorf("no github client to verify pruned first-stage jobs of %s", pj.Name)
 	}
@@ -521,8 +536,8 @@ func checkFirstStageComplete(ctx context.Context, pjLister ctrlruntimeclient.Rea
 		return false, nil
 	}
 	for _, presubmit := range missing {
-		if presubmit.SkipReport || presubmit.Context == "" || presubmit.Context == pipelineGate {
-			return false, nil // unreportable contexts cannot be verified on GitHub
+		if !canReuseStatus(presubmit, pj.Spec.Refs.BaseRef, presubmits.statusContextOwners) {
+			return false, nil
 		}
 	}
 	// A stale ProwJob event says nothing about the current PR, so its statuses

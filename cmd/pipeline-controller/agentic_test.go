@@ -191,8 +191,13 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 		Head: github.PullRequestBranch{SHA: strings.Repeat("a", 40)},
 		Base: github.PullRequestBranch{Ref: "main", Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}}}}}
 	static := []config.Presubmit{
-		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-unit"}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/unit"}},
-		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-e2e"}, Reporter: config.Reporter{Context: "ci/e2e"}, RerunCommand: "/test e2e"},
+		// The canonical single-base brancher keeps these jobs eligible for
+		// the commit-status fallbacks, which attribute a context to a job
+		// only when it runs on exactly one base branch.
+		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-unit"},
+			Brancher: config.Brancher{Branches: []string{"^main$"}}, AlwaysRun: true, Reporter: config.Reporter{Context: "ci/unit"}},
+		{JobBase: config.JobBase{Name: "pull-ci-org-repo-main-e2e"},
+			Brancher: config.Brancher{Branches: []string{"^main$"}}, Reporter: config.Reporter{Context: "ci/e2e"}, RerunCommand: "/test e2e"},
 	}
 	f.cfg = &config.Config{}
 	require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))

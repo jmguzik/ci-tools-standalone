@@ -644,17 +644,23 @@ func TestPlanDispatchCommentTerminalReportedJobs(t *testing.T) {
 
 	protectedJob := fmt.Sprintf("pull-ci-%s-%s-%s-protected", org, repo, baseRef)
 	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	// The canonical single-base brancher and the unique context ownership
+	// below keep both jobs eligible for the status fallback this test covers.
+	canonical := config.Brancher{Branches: []string{"^" + baseRef + "$"}}
 	presubmits := presubmitTests{
 		protected: []config.Presubmit{{
 			JobBase:      config.JobBase{Name: protectedJob},
+			Brancher:     canonical,
 			Reporter:     config.Reporter{Context: "ci/protected"},
 			RerunCommand: "/test " + protectedJob,
 		}},
 		pipelineConditionallyRequired: []config.Presubmit{{
 			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Brancher:     canonical,
 			Reporter:     config.Reporter{Context: "ci/conditional"},
 			RerunCommand: "/test " + conditionalJob,
 		}},
+		statusContextOwners: map[string]string{"ci/protected": protectedJob, "ci/conditional": conditionalJob},
 	}
 	changes := []github.PullRequestChange{{Filename: "cmd/main.go"}}
 	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
@@ -870,15 +876,22 @@ func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
 	buildJob := fmt.Sprintf("pull-ci-%s-%s-%s-build", org, repo, baseRef)
 	imagesJob := fmt.Sprintf("pull-ci-%s-%s-%s-images", org, repo, baseRef)
 
-	unit := config.Presubmit{JobBase: config.JobBase{Name: unitJob}, Reporter: config.Reporter{Context: "ci/unit"}}
-	build := config.Presubmit{JobBase: config.JobBase{Name: buildJob}, Reporter: config.Reporter{Context: "ci/build"}}
-	images := config.Presubmit{JobBase: config.JobBase{Name: imagesJob}, Reporter: config.Reporter{Context: "ci/images"}}
+	// The canonical single-base brancher and the unique context ownership
+	// below keep the pruned jobs eligible for the status fallback; the PR's
+	// base SHA is deliberately ahead of anything the controller could have
+	// recorded, pinning that the proof is the context on the HEAD, not a
+	// comparison against the base branch's latest commit.
+	canonical := config.Brancher{Branches: []string{"^" + baseRef + "$"}}
+	unit := config.Presubmit{JobBase: config.JobBase{Name: unitJob}, Brancher: canonical, Reporter: config.Reporter{Context: "ci/unit"}}
+	build := config.Presubmit{JobBase: config.JobBase{Name: buildJob}, Brancher: canonical, Reporter: config.Reporter{Context: "ci/build"}}
+	images := config.Presubmit{JobBase: config.JobBase{Name: imagesJob}, Brancher: canonical, Reporter: config.Reporter{Context: "ci/images"}}
 	standard := presubmitTests{
 		alwaysRequired:        []config.Presubmit{unit, build},
 		conditionallyRequired: []config.Presubmit{images},
+		statusContextOwners:   map[string]string{"ci/unit": unitJob, "ci/build": buildJob, "ci/images": imagesJob},
 	}
 	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
-		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef}}
+		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
 	// The aggregate state must be ignored; only the exact job contexts count.
 	passing := &github.CombinedStatus{SHA: sha, State: github.StatusFailure, Statuses: []github.Status{
 		{Context: "ci/unit", State: github.StatusSuccess},
@@ -1001,6 +1014,204 @@ func TestCheckFirstStageCompletePrunedJobFallback(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.wantStatusCalls, ghc.getCombinedStatusCalls); diff != "" {
 				t.Errorf("unexpected combined status calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestFirstStageStatusFallbackRequiresAttributableContext covers the shared
+// eligibility guard of the first-stage commit-status fallback: GitHub statuses
+// recover a pruned always-required job only when its context is owned by
+// exactly one reportable definition that runs on exactly the PR's base
+// branch. Shared or unknown ownership and unrestricted, broad, multi-pattern
+// or skip-branch definitions stay incomplete without spending any GitHub
+// lookup, while the sole canonical owner still recovers after the base branch
+// moved on: the proof is the context on the HEAD, not a base SHA comparison.
+func TestFirstStageStatusFallbackRequiresAttributableContext(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	unitJob := fmt.Sprintf("pull-ci-%s-%s-%s-unit", org, repo, baseRef)
+	// Every row reports success for the exact context on the exact HEAD, so
+	// only the eligibility guard can keep a row incomplete.
+	passing := &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+		{Context: "ci/unit", State: github.StatusSuccess},
+	}}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha},
+		Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
+
+	tests := []struct {
+		name         string
+		branches     []string
+		skipBranches []string
+		owners       map[string]string
+		wantComplete bool
+	}{
+		{
+			name:     "context shared with another definition stays incomplete",
+			branches: []string{"^main$"},
+			owners:   map[string]string{"ci/unit": ""}, // a second claimant blanked the entry
+		},
+		{
+			name:     "unknown ownership inventory stays incomplete",
+			branches: []string{"^main$"},
+		},
+		{
+			name:     "job running on every branch stays incomplete",
+			branches: nil,
+			owners:   map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:     "prefix branch pattern stays incomplete",
+			branches: []string{"^main"},
+			owners:   map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:     "multiple branch patterns stay incomplete",
+			branches: []string{"^main$", "^release$"},
+			owners:   map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:         "skipped branches stay incomplete",
+			branches:     []string{"^main$"},
+			skipBranches: []string{"^feature$"},
+			owners:       map[string]string{"ci/unit": unitJob},
+		},
+		{
+			name:         "sole owner on the exact base recovers",
+			branches:     []string{"^main$"},
+			owners:       map[string]string{"ci/unit": unitJob},
+			wantComplete: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			presubmits := presubmitTests{
+				alwaysRequired: []config.Presubmit{{
+					JobBase:  config.JobBase{Name: unitJob},
+					Brancher: config.Brancher{Branches: tc.branches, SkipBranches: tc.skipBranches},
+					Reporter: config.Reporter{Context: "ci/unit"},
+				}},
+				statusContextOwners: tc.owners,
+			}
+			ghc := &fakeGhClient{pullRequest: openPR, combinedStatus: passing}
+
+			complete, err := checkFirstStageComplete(context.Background(), newFakePJLister(), ghc, makeTriggerPJ(sha), presubmits)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantComplete, complete); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
+			}
+			// An ineligible context must not spend GitHub lookups either: the
+			// stage just stays incomplete until a live ProwJob arrives.
+			wantLookups := 0
+			if tc.wantComplete {
+				wantLookups = 1
+			}
+			if diff := cmp.Diff(wantLookups, ghc.getPullRequestCalls); diff != "" {
+				t.Errorf("unexpected pull request calls (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(wantLookups, ghc.getCombinedStatusCalls); diff != "" {
+				t.Errorf("unexpected combined status calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestDeltaStatusFallbackRequiresAttributableContext covers the same guard on
+// the second-stage side: a terminal status of a context with shared or
+// unknown ownership is not proof, so the delta planner still schedules the
+// job and publishes its pending placeholder (an ambiguous history blocks, it
+// never fails the dispatch), while the sole owner of an exact single-base
+// context is suppressed as already run despite the advanced base SHA.
+func TestDeltaStatusFallbackRequiresAttributableContext(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	protectedJob := fmt.Sprintf("pull-ci-%s-%s-%s-protected", org, repo, baseRef)
+	terminal := &github.CombinedStatus{SHA: sha, Statuses: []github.Status{
+		{Context: "ci/protected", State: github.StatusSuccess},
+	}}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha},
+		Base: github.PullRequestBranch{Ref: baseRef, SHA: "advanced-base-000000"}}
+
+	tests := []struct {
+		name         string
+		owners       map[string]string
+		wantSchedule bool
+		wantReads    int
+		wantPRCalls  int
+	}{
+		{
+			name:         "shared context schedules and republishes pending",
+			owners:       map[string]string{"ci/protected": ""},
+			wantSchedule: true,
+		},
+		{
+			name:         "unknown ownership schedules without a status lookup",
+			wantSchedule: true,
+		},
+		{
+			name:        "sole owner on the exact base is suppressed",
+			owners:      map[string]string{"ci/protected": protectedJob},
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			presubmits := presubmitTests{
+				protected: []config.Presubmit{{
+					JobBase:      config.JobBase{Name: protectedJob},
+					Brancher:     config.Brancher{Branches: []string{"^" + baseRef + "$"}},
+					Reporter:     config.Reporter{Context: "ci/protected"},
+					RerunCommand: "/test " + protectedJob,
+				}},
+				statusContextOwners: tc.owners,
+			}
+			gh := &fakeAgenticGitHub{pr: *openPR, combinedStatus: terminal}
+
+			if err := sendCommentWithMode(presubmits, makeTriggerPJ(sha), gh, func() {}, newFakePJLister(), modeDelta, true, &dispatchChecks{gh: gh, appID: 101}); err != nil {
+				t.Fatalf("sendCommentWithMode returned error: %v", err)
+			}
+
+			if len(gh.comments) != 1 {
+				t.Fatalf("expected 1 comment, got %d", len(gh.comments))
+			}
+			if tc.wantSchedule {
+				if !strings.Contains(gh.comments[0].Body, "/test "+protectedJob) {
+					t.Errorf("expected the job to be scheduled, got: %q", gh.comments[0].Body)
+				}
+				want := []github.Status{{Context: "ci/protected", State: "pending", Description: PipelinePendingMessage}}
+				if diff := cmp.Diff(want, gh.statusUpdates); diff != "" {
+					t.Errorf("unexpected pending placeholders (-want +got):\n%s", diff)
+				}
+			} else {
+				if !strings.Contains(gh.comments[0].Body, "already been triggered") {
+					t.Errorf("expected the terminal proof to suppress scheduling, got: %q", gh.comments[0].Body)
+				}
+				if len(gh.statusUpdates) != 0 {
+					t.Errorf("expected no pending placeholders for a proven job, got: %v", gh.statusUpdates)
+				}
+			}
+			if diff := cmp.Diff(tc.wantReads, gh.statusReads); diff != "" {
+				t.Errorf("unexpected combined status reads (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantPRCalls, gh.getPullRequestCalls); diff != "" {
+				t.Errorf("unexpected pull request calls (-want +got):\n%s", diff)
 			}
 		})
 	}

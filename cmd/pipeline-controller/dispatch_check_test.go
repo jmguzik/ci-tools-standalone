@@ -87,16 +87,17 @@ func TestTraditionalOpeningGateRespectsLGTMTrigger(t *testing.T) {
 // branches on their no-legacy-side-effects path.
 func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		action      github.PullRequestEventAction
-		headSHA     string
-		agentic     bool
-		greenGate   bool
-		tokenAuth   bool
-		combined    *github.CombinedStatus
-		wantPending []string
-		wantReads   int
-		wantPRCalls int
+		name          string
+		action        github.PullRequestEventAction
+		headSHA       string
+		agentic       bool
+		greenGate     bool
+		tokenAuth     bool
+		sharedContext bool
+		combined      *github.CombinedStatus
+		wantPending   []string
+		wantReads     int
+		wantPRCalls   int
 	}{
 		{
 			name:        "reopen preserves terminal results, unproven jobs stay pending",
@@ -105,6 +106,13 @@ func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 			wantPending: []string{"ci/conditional"},
 			wantReads:   1,
 			wantPRCalls: 1,
+		},
+		{
+			name:          "shared context ownership cannot prove terminal results",
+			action:        github.PullRequestActionReopened,
+			sharedContext: true,
+			combined:      &github.CombinedStatus{SHA: strings.Repeat("a", 40), Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
+			wantPending:   []string{"ci/conditional", "ci/e2e"},
 		},
 		{
 			name:        "new head gets fresh pending contexts",
@@ -148,6 +156,21 @@ func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
+			if tc.sharedContext {
+				// An optional reporter on another base branch claims the same
+				// context (GitHub compares contexts case-insensitively), so
+				// the terminal status cannot be attributed to this base and
+				// must not suppress the pending placeholder.
+				static := f.cfg.GetPresubmitsStatic("org/repo")
+				static = append(static, config.Presubmit{
+					JobBase:  config.JobBase{Name: "pull-ci-org-repo-release-e2e"},
+					Optional: true,
+					Brancher: config.Brancher{Branches: []string{"^release$"}},
+					Reporter: config.Reporter{Context: "CI/E2E"},
+				})
+				require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
+				f.a.configDataProvider.gatherData()
+			}
 			f.gh.changes = []github.PullRequestChange{{Filename: "cmd/main.go"}}
 			f.gh.combinedStatus = tc.combined
 			presubmits := f.a.configDataProvider.updatedPresubmits["org/repo"]
