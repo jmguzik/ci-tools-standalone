@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/config"
@@ -107,6 +108,23 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		}
 		protectedJobs = append(protectedJobs, presubmit)
 	}
+
+	// Sinker may have pruned the finished second-stage ProwJobs, so the
+	// cache-only dedupe above can re-fire jobs that already completed at this
+	// HEAD: one batched status lookup recovers those runs, failing closed like
+	// the lister errors above. modeForce never consults statuses.
+	proven := sets.New[string]()
+	if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
+		proven, err = terminalReportedJobs(ghc, pj.Spec.Refs, append(protectedJobs, conditionalJobs...))
+		if err != nil {
+			return "", nil, err
+		}
+		if proven.Len() > 0 {
+			protectedJobs = withoutReportedJobs(protectedJobs, proven)
+			conditionalJobs = withoutReportedJobs(conditionalJobs, proven)
+		}
+	}
+
 	protectedCommands := testCommands(protectedJobs)
 	testContexts := testCommands(conditionalJobs)
 	if protectedCommands != "" {
@@ -130,7 +148,9 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 		if !explicit {
 			return "", nil, nil
 		}
-		if mode == modeDelta && secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits) {
+		// A recovered terminal proof already says the second stage ran at this
+		// HEAD; prefer it over repeating the cache lookup below.
+		if mode == modeDelta && (proven.Len() > 0 || secondStageTriggeredAtSHA(context.Background(), pjLister, pj, presubmits)) {
 			comment = fmt.Sprintf("**Pipeline controller notification**\n\nAll applicable second-stage tests for this HEAD have already been triggered. Nothing new to schedule.\n\nUse `/test ?` to see all available tests, or `/pipeline required` to re-run the full required set for the `%s` branch.", pj.Spec.Refs.BaseRef)
 		} else {
 			comment = fmt.Sprintf("**Pipeline controller notification**\n\nNo second-stage tests were triggered for this PR.\n\nThis can happen when:\n- The changed files don't match any `pipeline_run_if_changed` patterns\n- All files match `pipeline_skip_if_only_changed` patterns\n- No pipeline-controlled jobs are defined for the `%s` branch\n\nUse `/test ?` to see all available tests.", pj.Spec.Refs.BaseRef)
@@ -206,6 +226,90 @@ func secondStageTriggeredAtSHA(ctx context.Context, pjLister ctrlruntimeclient.R
 		}
 	}
 	return false
+}
+
+// terminalReportedJobs returns the names of the candidates whose reporting
+// context GitHub holds in a terminal state (success, failure or error) on the
+// exact HEAD SHA: sinker prunes finished ProwJobs, so their commit statuses
+// are the only proof left that a second-stage job already ran at that HEAD,
+// and both the delta planner and the initial pending publisher need that
+// proof. Pending never counts (the controller publishes pending placeholders
+// itself), and the proof is trusted only after one live PR lookup confirms it
+// belongs to this open, non-draft PR on the same HEAD and base branch.
+// Lookup errors fail closed so a failed verification never mass-schedules
+// pruned jobs.
+func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, candidates []config.Presubmit) (sets.Set[string], error) {
+	if ghc == nil || refs == nil || len(refs.Pulls) == 0 || refs.Pulls[0].SHA == "" {
+		return nil, nil
+	}
+	sha := refs.Pulls[0].SHA
+	prName := fmt.Sprintf("%s/%s#%d", refs.Org, refs.Repo, refs.Pulls[0].Number)
+
+	var reportable []config.Presubmit
+	for _, presubmit := range candidates {
+		if presubmit.SkipReport || presubmit.Context == "" || presubmit.Context == pipelineGate {
+			continue // unreportable contexts cannot be verified on GitHub
+		}
+		reportable = append(reportable, presubmit)
+	}
+	if len(reportable) == 0 {
+		return nil, nil
+	}
+
+	combined, err := ghc.GetCombinedStatus(refs.Org, refs.Repo, sha)
+	if err != nil {
+		return nil, fmt.Errorf("getting combined status for pruned second-stage jobs of %s: %w", prName, err)
+	}
+	if combined == nil {
+		return nil, fmt.Errorf("empty combined status response for pruned second-stage jobs of %s", prName)
+	}
+	if combined.SHA != sha {
+		return nil, fmt.Errorf("combined status response for pruned second-stage jobs of %s has sha %q, want %q", prName, combined.SHA, sha)
+	}
+
+	// GitHub reports the latest status of every context on the ref; the
+	// aggregate combined state is deliberately ignored.
+	states := make(map[string]string, len(combined.Statuses))
+	for _, status := range combined.Statuses {
+		states[status.Context] = status.State
+	}
+	terminal := sets.New[string]()
+	for _, presubmit := range reportable {
+		switch states[presubmit.Context] {
+		case github.StatusSuccess, github.StatusFailure, github.StatusError:
+			terminal.Insert(presubmit.Name)
+		}
+	}
+	if terminal.Len() == 0 {
+		return terminal, nil
+	}
+
+	pr, err := ghc.GetPullRequest(refs.Org, refs.Repo, refs.Pulls[0].Number)
+	if err != nil {
+		return nil, fmt.Errorf("getting pull request for pruned second-stage jobs of %s: %w", prName, err)
+	}
+	if pr == nil {
+		return nil, fmt.Errorf("empty pull request response for pruned second-stage jobs of %s", prName)
+	}
+	if pr.State != github.PullRequestStateOpen || pr.Draft ||
+		pr.Head.SHA != sha || pr.Base.Ref != refs.BaseRef {
+		return nil, fmt.Errorf("stale terminal statuses for pruned second-stage jobs of %s: pull request state %q draft %t head %q base %q", prName, pr.State, pr.Draft, pr.Head.SHA, pr.Base.Ref)
+	}
+	return terminal, nil
+}
+
+// withoutReportedJobs drops the presubmits whose names the reported set marks
+// as terminally reported at HEAD, keeping the ones still eligible for
+// scheduling or pending publication.
+func withoutReportedJobs(jobs []config.Presubmit, reported sets.Set[string]) []config.Presubmit {
+	var kept []config.Presubmit
+	for _, job := range jobs {
+		if reported.Has(job.Name) {
+			continue
+		}
+		kept = append(kept, job)
+	}
+	return kept
 }
 
 // pipelineAnnotationMatches gives run-if-changed precedence over skip-if-only-changed.

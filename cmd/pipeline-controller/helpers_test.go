@@ -69,7 +69,9 @@ func (f *fakeGhClient) GetCombinedStatus(org, repo, ref string) (*github.Combine
 	if f.combinedStatus != nil {
 		return f.combinedStatus, nil
 	}
-	return &github.CombinedStatus{}, nil
+	// Default to the requested ref with no statuses, so a first dispatch with
+	// nothing to prove keeps its normal behavior.
+	return &github.CombinedStatus{SHA: ref}, nil
 }
 
 func newFakePJLister(pjs ...v1.ProwJob) ctrlruntimeclient.Reader {
@@ -620,6 +622,163 @@ func TestSendCommentWithMode_ImplicitEmptyIsSilent(t *testing.T) {
 	}
 	if len(ghcExplicit.comments) != 1 || !strings.Contains(ghcExplicit.comments[0], "already been triggered") {
 		t.Errorf("expected an explicit command to still post the already-triggered ack, got: %v", ghcExplicit.comments)
+	}
+}
+
+// TestPlanDispatchCommentTerminalReportedJobs covers the commit-status proof
+// for second-stage jobs pruned from the ProwJob cache: terminal statuses
+// (success, failure and error all count as an attempt) suppress scheduling,
+// pending never counts, modeForce ignores the proof, cache coverage needs no
+// lookup, and lookup failures fail closed instead of mass-scheduling.
+func TestPlanDispatchCommentTerminalReportedJobs(t *testing.T) {
+	const (
+		org     = "openshift"
+		repo    = "myrepo"
+		baseRef = "main"
+		sha     = "abc1234567890"
+	)
+
+	protectedJob := fmt.Sprintf("pull-ci-%s-%s-%s-protected", org, repo, baseRef)
+	conditionalJob := fmt.Sprintf("pull-ci-%s-%s-%s-conditional", org, repo, baseRef)
+	presubmits := presubmitTests{
+		protected: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: protectedJob},
+			Reporter:     config.Reporter{Context: "ci/protected"},
+			RerunCommand: "/test " + protectedJob,
+		}},
+		pipelineConditionallyRequired: []config.Presubmit{{
+			JobBase:      config.JobBase{Name: conditionalJob, Annotations: map[string]string{"pipeline_run_if_changed": "^cmd/"}},
+			Reporter:     config.Reporter{Context: "ci/conditional"},
+			RerunCommand: "/test " + conditionalJob,
+		}},
+	}
+	changes := []github.PullRequestChange{{Filename: "cmd/main.go"}}
+	openPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: sha}, Base: github.PullRequestBranch{Ref: baseRef}}
+	movedPR := &github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+		Head: github.PullRequestBranch{SHA: "deadbeefdeadbeef"}, Base: github.PullRequestBranch{Ref: baseRef}}
+
+	tests := []struct {
+		name        string
+		force       bool
+		existingPJs []v1.ProwJob
+		pr          *github.PullRequest
+		statuses    []github.Status
+		wrongSHA    bool
+		statusErr   error
+		wantErr     string
+		wantJobs    []string
+		wantComment string
+		wantReads   int
+		wantPRCalls int
+	}{
+		{
+			name: "terminal success and failure suppress scheduling",
+			statuses: []github.Status{{Context: "ci/protected", State: github.StatusSuccess},
+				{Context: "ci/conditional", State: github.StatusFailure}},
+			wantComment: "already been triggered",
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+		{
+			name: "error and pending statuses filter partially",
+			statuses: []github.Status{{Context: "ci/protected", State: github.StatusError},
+				{Context: "ci/conditional", State: github.StatusPending}},
+			wantJobs:    []string{conditionalJob},
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+		{
+			name:      "pending or missing statuses schedule everything",
+			statuses:  []github.Status{{Context: "ci/protected", State: github.StatusPending}},
+			wantJobs:  []string{protectedJob, conditionalJob},
+			wantReads: 1,
+		},
+		{
+			name:  "force re-fires terminal jobs without a status lookup",
+			force: true,
+			statuses: []github.Status{{Context: "ci/protected", State: github.StatusSuccess},
+				{Context: "ci/conditional", State: github.StatusSuccess}},
+			wantJobs: []string{protectedJob, conditionalJob},
+		},
+		{
+			name: "cached prowjobs in any state need no lookup",
+			existingPJs: []v1.ProwJob{
+				makeProwJobInState(protectedJob, sha, v1.FailureState),
+				makeProwJob(conditionalJob, sha),
+			},
+			wantComment: "already been triggered",
+		},
+		{
+			name:      "status read error fails closed",
+			statusErr: errors.New("boom"),
+			wantErr:   "getting combined status for pruned second-stage jobs of openshift/myrepo#42: boom",
+			wantReads: 1,
+		},
+		{
+			name:      "combined status for another sha fails closed",
+			wrongSHA:  true,
+			statuses:  []github.Status{{Context: "ci/protected", State: github.StatusSuccess}},
+			wantErr:   `combined status response for pruned second-stage jobs of openshift/myrepo#42 has sha "deadbeefdeadbeef", want "abc1234567890"`,
+			wantReads: 1,
+		},
+		{
+			name:        "moved head rejects the stale proof",
+			pr:          movedPR,
+			statuses:    []github.Status{{Context: "ci/protected", State: github.StatusSuccess}},
+			wantErr:     `stale terminal statuses for pruned second-stage jobs of openshift/myrepo#42: pull request state "open" draft false head "deadbeefdeadbeef" base "main"`,
+			wantReads:   1,
+			wantPRCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := tc.pr
+			if pr == nil {
+				pr = openPR
+			}
+			combined := &github.CombinedStatus{SHA: sha, Statuses: tc.statuses}
+			if tc.wrongSHA {
+				combined.SHA = "deadbeefdeadbeef"
+			}
+			ghc := &fakeGhClient{changes: changes, pullRequest: pr, combinedStatus: combined, getCombinedStatusErr: tc.statusErr}
+
+			mode := modeDelta
+			if tc.force {
+				mode = modeForce
+			}
+			comment, jobs, err := planDispatchComment(presubmits, makeTriggerPJ(sha), ghc, newFakePJLister(tc.existingPJs...), mode, true)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got nil", tc.wantErr)
+				}
+				if diff := cmp.Diff(tc.wantErr, err.Error()); diff != "" {
+					t.Errorf("unexpected error (-want +got):\n%s", diff)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var names []string
+			for _, job := range jobs {
+				names = append(names, job.Name)
+			}
+			if diff := cmp.Diff(tc.wantJobs, names); diff != "" {
+				t.Errorf("unexpected jobs (-want +got):\n%s", diff)
+			}
+			if tc.wantComment != "" && !strings.Contains(comment, tc.wantComment) {
+				t.Errorf("expected substring %q in comment, got: %q", tc.wantComment, comment)
+			}
+			if ghc.getCombinedStatusCalls != tc.wantReads {
+				t.Errorf("expected %d combined status calls, got %d", tc.wantReads, ghc.getCombinedStatusCalls)
+			}
+			if ghc.getPullRequestCalls != tc.wantPRCalls {
+				t.Errorf("expected %d pull request calls, got %d", tc.wantPRCalls, ghc.getPullRequestCalls)
+			}
+		})
 	}
 }
 

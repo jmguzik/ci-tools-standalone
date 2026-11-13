@@ -239,11 +239,15 @@ Add the annotation to your test configuration in the ci-operator config file:
 
 If you manually trigger some second-stage tests (using `/test <job-name>`) in Automatic or LGTM mode before the automatic trigger occurs, the controller **complements** your work instead of latching into manual control. When it next schedules the second stage, it:
 
-1. Detects, from its in-cluster ProwJob cache, which second-stage jobs already have a run at the current HEAD (no extra GitHub calls are made for this check)
+1. Detects which second-stage jobs already have a run at the current HEAD: from its in-cluster ProwJob cache first, and then, for the remaining reportable candidates, with one batched GitHub combined-status read on that exact HEAD
 2. Schedules only the remaining required jobs — the "delta" — skipping the ones already triggered
 3. Re-evaluates from scratch whenever the PR HEAD changes
 
 This complements manual triggers without re-running jobs that already started. If nothing remains to schedule because every applicable job already ran for the current HEAD, the controller says so rather than claiming no tests were triggered. To re-run a specific job that already ran, use `/test <job>`; to run the delta on demand, use `/pipeline remaining`.
+
+The status read also covers second-stage jobs pruned by sinker (see "First-Stage Completion and Pruned Jobs"): a terminal status (success, failure or error) for a job's context on the exact current HEAD proves the job already ran there and counts as triggered. Pending never counts, because the controller itself publishes pending placeholders before dispatching. The proof says an attempt happened, not that it passed: a failed or errored context is skipped just like a successful one, and re-running it needs `/test <job>` or `/pipeline required`, the same as for a job whose ProwJob is still in the cache. `/pipeline required` ignores this proof and re-fires the whole required set. When a proof is found, the live PR is validated once (open, not a draft, same HEAD and base branch) before the statuses are trusted, and failed or stale lookups block scheduling instead of re-running completed tests. There is no polling: a delta costs at most one batched status read plus the optional PR validation, and jobs already covered by the cache need no GitHub call.
+
+Opening, pushing or reopening a PR publishes pending placeholders for the selected second-stage jobs the same way, but a context whose terminal result was verified on that HEAD keeps it. If the verification lookup fails, pending placeholders are published for every selected job instead, so an API outage cannot leave required contexts absent while a green pipeline gate would let the PR merge.
 
 ## Agentic Handoff (Chai)
 
