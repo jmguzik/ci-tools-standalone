@@ -116,13 +116,13 @@ func planDispatchComment(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	// the lister errors above. modeForce never consults statuses.
 	proven := sets.New[string]()
 	if mode == modeDelta && pjLister != nil && pj.Spec.Refs.Pulls[0].SHA != "" {
-		proven, err = terminalReportedJobs(ghc, pj.Spec.Refs, presubmits.statusContextOwners, append(protectedJobs, conditionalJobs...))
+		proven, err = terminalReportedContexts(ghc, pj.Spec.Refs, presubmits.statusContextOwners, append(protectedJobs, conditionalJobs...))
 		if err != nil {
 			return "", nil, err
 		}
 		if proven.Len() > 0 {
-			protectedJobs = withoutReportedJobs(protectedJobs, proven)
-			conditionalJobs = withoutReportedJobs(conditionalJobs, proven)
+			protectedJobs = withoutReportedJobs(protectedJobs, proven, pj.Spec.Refs.BaseRef, presubmits.statusContextOwners)
+			conditionalJobs = withoutReportedJobs(conditionalJobs, proven, pj.Spec.Refs.BaseRef, presubmits.statusContextOwners)
 		}
 	}
 
@@ -244,10 +244,10 @@ func canReuseStatus(presubmit config.Presubmit, base string, owners map[string]s
 		len(presubmit.SkipBranches) == 0
 }
 
-// terminalReportedJobs recovers attempted second-stage jobs from terminal statuses.
+// terminalReportedContexts recovers attempted second-stage contexts from terminal statuses.
 // Only unambiguous single-base contexts qualify, and the PR must still match refs.
 // Pending may be our own placeholder and is never evidence of an attempt.
-func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, owners map[string]string, candidates []config.Presubmit) (sets.Set[string], error) {
+func terminalReportedContexts(ghc minimalGhClient, refs *v1.Refs, owners map[string]string, candidates []config.Presubmit) (sets.Set[string], error) {
 	if ghc == nil || refs == nil || len(refs.Pulls) == 0 || refs.Pulls[0].SHA == "" {
 		return nil, nil
 	}
@@ -286,7 +286,7 @@ func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, owners map[string]
 	for _, presubmit := range reportable {
 		switch states[presubmit.Context] {
 		case github.StatusSuccess, github.StatusFailure, github.StatusError:
-			terminal.Insert(presubmit.Name)
+			terminal.Insert(presubmit.Context)
 		}
 	}
 	if terminal.Len() == 0 {
@@ -307,13 +307,12 @@ func terminalReportedJobs(ghc minimalGhClient, refs *v1.Refs, owners map[string]
 	return terminal, nil
 }
 
-// withoutReportedJobs drops the presubmits whose names the reported set marks
-// as terminally reported at HEAD, keeping the ones still eligible for
-// scheduling or pending publication.
-func withoutReportedJobs(jobs []config.Presubmit, reported sets.Set[string]) []config.Presubmit {
+// withoutReportedJobs removes only eligible definitions with a reported context;
+// another definition sharing a job name must remain schedulable.
+func withoutReportedJobs(jobs []config.Presubmit, reported sets.Set[string], base string, owners map[string]string) []config.Presubmit {
 	var kept []config.Presubmit
 	for _, job := range jobs {
-		if reported.Has(job.Name) {
+		if canReuseStatus(job, base, owners) && reported.Has(job.Context) {
 			continue
 		}
 		kept = append(kept, job)

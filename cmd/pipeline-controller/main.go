@@ -744,12 +744,12 @@ func (cw *clientWrapper) handlePipelineContextCreation(l *logrus.Entry, event gi
 	// every selected job anyway: an unknown history must keep blocking
 	// merges, and the pipeline gate is either absent (token auth) or already
 	// preserved green by checks.pending, so only these contexts hold the PR.
-	proven, err := terminalReportedJobs(cw.ghc, refs, presubmits.statusContextOwners, selected)
+	proven, err := terminalReportedContexts(cw.ghc, refs, presubmits.statusContextOwners, selected)
 	if err != nil {
 		logger.WithError(err).Error("failed to verify terminal job contexts")
 	}
 
-	for _, presubmit := range withoutReportedJobs(selected, proven) {
+	for _, presubmit := range withoutReportedJobs(selected, proven, baseBranch, presubmits.statusContextOwners) {
 		if err := cw.createContext(org, repo, sha, presubmit.Context, "pending", PipelinePendingMessage); err != nil {
 			logger.WithError(err).WithField("test", presubmit.Name).Error("failed to create context")
 			continue

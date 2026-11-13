@@ -94,8 +94,10 @@ func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 		greenGate     bool
 		tokenAuth     bool
 		sharedContext bool
+		sharedJobName bool
 		combined      *github.CombinedStatus
 		wantPending   []string
+		wantScheduled []string
 		wantReads     int
 		wantPRCalls   int
 	}{
@@ -113,6 +115,19 @@ func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 			sharedContext: true,
 			combined:      &github.CombinedStatus{SHA: strings.Repeat("a", 40), Statuses: []github.Status{{Context: "ci/e2e", State: github.StatusSuccess}}},
 			wantPending:   []string{"ci/conditional", "ci/e2e"},
+		},
+		{
+			name:          "same job name cannot transfer proof to a broad definition",
+			action:        github.PullRequestActionReopened,
+			sharedJobName: true,
+			combined: &github.CombinedStatus{SHA: strings.Repeat("a", 40), Statuses: []github.Status{
+				{Context: "ci/e2e", State: github.StatusSuccess},
+				{Context: "ci/multi-base", State: github.StatusSuccess},
+			}},
+			wantPending:   []string{"ci/conditional", "ci/multi-base"},
+			wantScheduled: []string{"ci/multi-base", "ci/conditional"},
+			wantReads:     1,
+			wantPRCalls:   1,
 		},
 		{
 			name:        "new head gets fresh pending contexts",
@@ -156,6 +171,17 @@ func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
+			if tc.sharedJobName {
+				static := f.cfg.GetPresubmitsStatic("org/repo")
+				static = append(static, config.Presubmit{
+					JobBase:      config.JobBase{Name: "pull-ci-org-repo-main-e2e"},
+					Brancher:     config.Brancher{Branches: []string{"^(main|release)$"}},
+					Reporter:     config.Reporter{Context: "ci/multi-base"},
+					RerunCommand: "/test multi-base",
+				})
+				require.NoError(t, f.cfg.SetPresubmits(map[string][]config.Presubmit{"org/repo": static}))
+				f.a.configDataProvider.gatherData()
+			}
 			if tc.sharedContext {
 				// An optional reporter on another base branch claims the same
 				// context (GitHub compares contexts case-insensitively), so
@@ -207,6 +233,16 @@ func TestPipelineContextCreationPreservesTerminalResults(t *testing.T) {
 			require.Equal(t, tc.wantPRCalls, f.gh.getPullRequestCalls)
 			if tc.greenGate {
 				require.Equal(t, "success", f.gh.checks[0].Conclusion, "a green gate must survive the failed lookup")
+			}
+			if tc.wantScheduled != nil {
+				_, jobs, err := planDispatchComment(presubmits, &v1.ProwJob{Spec: v1.ProwJobSpec{
+					Refs: pullRefs("org", "repo", &f.gh.pr)}}, f.gh, newFakePJLister(), modeDelta, false)
+				require.NoError(t, err)
+				var contexts []string
+				for _, job := range jobs {
+					contexts = append(contexts, job.Context)
+				}
+				require.Equal(t, tc.wantScheduled, contexts)
 			}
 		})
 	}
