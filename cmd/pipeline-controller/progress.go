@@ -221,6 +221,11 @@ func (a *agenticController) publishProgress(work agenticWork, pr *github.PullReq
 	a.progress.submitProgress(cfg, pullRefs(work.org, work.repo, pr), v, true, false)
 }
 
+// progressEnabled rechecks local policy so a queued update cannot undo a configuration pause.
+func (cw *clientWrapper) progressEnabled(work agenticWork, revision progressRevision) bool {
+	return pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, work.org, work.repo, revision.base).ProgressComment
+}
+
 // handleProgressRevision resets the traditional display on pushes or retargets.
 // The agentic worker independently projects its live revision.
 func (cw *clientWrapper) handleProgressRevision(logger *logrus.Entry, event github.PullRequestEvent) {

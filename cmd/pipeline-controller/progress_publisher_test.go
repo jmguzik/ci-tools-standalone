@@ -120,6 +120,7 @@ func TestProgressDispatchSafety(t *testing.T) {
 		known       string
 		draft       bool
 		pause       bool
+		disabled    bool
 		editErr     error
 		miss        bool
 		wantEdits   int
@@ -129,6 +130,7 @@ func TestProgressDispatchSafety(t *testing.T) {
 		{name: "old dispatch cannot replace a known newer revision", liveHead: "new", known: "new"},
 		{name: "cold draft cannot edit", liveHead: "old", draft: true, wantQueries: 1},
 		{name: "confirmed draft pause blocks dispatch until resume", liveHead: "old", pause: true, wantEdits: 1, wantQueries: 1},
+		{name: "late Chai observation cannot resume disabled progress", liveHead: "old", disabled: true},
 		{name: "unchanged body retries failed edit after backoff", liveHead: "old", editErr: errors.New("temporary test edit failure"), wantEdits: 2, wantQueries: 1},
 		{name: "unchanged body retries missing comment after TTL", liveHead: "old", miss: true, wantEdits: 1, wantQueries: 2},
 	} {
@@ -144,6 +146,12 @@ func TestProgressDispatchSafety(t *testing.T) {
 			}
 			refs := &v1.Refs{Org: work.org, Repo: work.repo, BaseRef: "main", Pulls: []v1.Pull{{Number: work.number, SHA: "old"}}}
 			rev := progressRevision{head: "old", base: "main"}
+			if tc.disabled {
+				cw := &clientWrapper{}
+				p.enabled = cw.progressEnabled
+				p.prs[work] = &progressEntry{verified: rev, paused: true}
+				p.submit(refs, "late dispatch", true, false)
+			}
 			p.submit(refs, "dispatch", false, false)
 			if tc.pause {
 				generation, _ := p.lifecycleGeneration(work, rev, true)
@@ -173,6 +181,9 @@ func TestProgressDispatchSafety(t *testing.T) {
 			}
 			if len(gh.edits) != tc.wantEdits || gh.queries != tc.wantQueries {
 				t.Errorf("got %d edits and %d queries, want %d and %d", len(gh.edits), gh.queries, tc.wantEdits, tc.wantQueries)
+			}
+			if tc.disabled && !p.prs[work].paused {
+				t.Error("late Chai observation cleared the verified pause")
 			}
 		})
 	}

@@ -108,11 +108,12 @@ type progressGeneration struct {
 
 // progressPublisher keeps GitHub comment I/O off the scheduling workers.
 type progressPublisher struct {
-	gh     progressCommentClient
-	logger *logrus.Entry
-	wake   chan struct{}
-	mu     sync.Mutex
-	prs    map[agenticWork]*progressEntry
+	gh      progressCommentClient
+	logger  *logrus.Entry
+	enabled func(agenticWork, progressRevision) bool
+	wake    chan struct{}
+	mu      sync.Mutex
+	prs     map[agenticWork]*progressEntry
 }
 
 // newProgressPublisher starts with an empty cache and no GitHub reads.
@@ -212,7 +213,8 @@ func (p *progressPublisher) lifecycleGeneration(work agenticWork, revision progr
 	if e == nil {
 		return progressGeneration{}, !inactive
 	}
-	return progressGeneration{e, e.generation}, !e.comment.gone && (e.verified != revision || e.paused != inactive)
+	return progressGeneration{e, e.generation}, !e.comment.gone &&
+		(e.verified != revision || e.paused != inactive || (!inactive && e.request.revision != revision))
 }
 
 // applyLifecycle changes the verified revision or pause state only if no newer submission intervened.
@@ -294,7 +296,7 @@ func (p *progressPublisher) publishNext(ctx context.Context) bool {
 	entry.dirty = false
 	entry.retryAt = time.Now().Add(progressRetryDelay)
 	p.mu.Unlock()
-	if comment.gone {
+	if comment.gone || (p.enabled != nil && !p.enabled(work, request.revision)) {
 		return true
 	}
 	if comment.id == 0 && time.Since(comment.looked) < progressMissTTL {
@@ -323,7 +325,8 @@ func (p *progressPublisher) publishNext(ctx context.Context) bool {
 		entry.verified, entry.paused = verified, paused
 	}
 	p.mu.Unlock()
-	if !current || paused || verified != request.revision || comment.id == 0 || comment.hash == hash {
+	if !current || paused || verified != request.revision || comment.id == 0 || comment.hash == hash ||
+		(p.enabled != nil && !p.enabled(work, request.revision)) {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(ctx, progressAPITimeout)

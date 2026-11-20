@@ -1000,6 +1000,9 @@ func main() {
 		checks:             checks,
 		progress:           progress,
 	}
+	if progress != nil {
+		progress.enabled = cw.progressEnabled
+	}
 
 	// Evict stale per-SHA idempotency keys from the LGTM / /pipeline remaining
 	// guard, mirroring the reconciler's ids cleanup.

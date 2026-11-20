@@ -56,12 +56,14 @@ func TestProgressRevision(t *testing.T) {
 		name, live, base string
 		enabled, tracked bool
 		active, draft    bool
+		coldStale        bool
 		action           github.PullRequestEventAction
 		wantEdit         bool
 		wantQueries      int
 	}{
 		{name: "current opt-in revision", live: "new", base: "main", enabled: true, active: true, wantEdit: true, wantQueries: 1},
 		{name: "delayed push", live: "newer", base: "main", enabled: true, active: true, wantQueries: 1},
+		{name: "current push after rejecting stale cold dispatch", live: "new", base: "main", enabled: true, active: true, coldStale: true, wantEdit: true, wantQueries: 2},
 		{name: "no opt-in", live: "new", base: "main", active: true},
 		{name: "delayed ineligible retarget", live: "old", base: "main", tracked: true, active: true, action: github.PullRequestActionEdited, wantQueries: 1},
 		{name: "delayed draft event", live: "new", base: "main", enabled: true, tracked: true, active: true, action: github.PullRequestActionConvertedToDraft, wantQueries: 1},
@@ -84,6 +86,15 @@ func TestProgressRevision(t *testing.T) {
 			p := newProgressPublisher(gh, logger)
 			cw := &clientWrapper{ghc: f.gh, lgtmWatcher: w, progress: p}
 			work := agenticWork{org: pr.Base.Repo.Owner.Login, repo: pr.Base.Repo.Name, number: pr.Number}
+			if tc.coldStale {
+				stale := pr
+				stale.Head.SHA = "old"
+				p.submit(pullRefs(work.org, work.repo, &stale), "stale dispatch", false, false)
+				p.publishNext(t.Context())
+				if len(gh.edits) != 0 {
+					t.Fatal("cold stale dispatch edited the comment")
+				}
+			}
 			oldHead := "new"
 			if tc.action == github.PullRequestActionEdited {
 				oldHead, pr.Base.Ref = "old", "release"
