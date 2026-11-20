@@ -44,7 +44,6 @@ type agenticState struct {
 	waitingUntil time.Time
 	publishedAt  time.Time
 	progress     agenticProgress
-	lastProgress progressView
 }
 
 func (s *agenticState) traditionalMode() bool {
@@ -75,7 +74,7 @@ func (a *agenticController) repoConfig(org, repo, branch string) (RepoConfig, bo
 	if a == nil {
 		return RepoConfig{}, false
 	}
-	cfg, _ := pipelineBranchConfig(a.watcher, a.lgtmWatcher, org, repo, branch)
+	cfg := pipelineBranchConfig(a.watcher, a.lgtmWatcher, org, repo, branch)
 	return cfg, cfg.Agentic.enabled()
 }
 
@@ -198,7 +197,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 		}
 		a.states[work] = s
 	}
-	if a.progress != nil {
+	if a.progress != nil && cfg.ProgressComment {
 		defer a.publishProgress(work, pr, cfg, s)
 	}
 	optOut := hasAgenticLabel(pr, agenticSkipLabel)

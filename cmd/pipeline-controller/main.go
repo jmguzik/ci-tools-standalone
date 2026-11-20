@@ -213,7 +213,7 @@ func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github
 		return
 	}
 	body := pullRequestInfoComment
-	progressCfg, _ := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, baseBranch)
+	progressCfg := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, baseBranch)
 	pr := &event.PullRequest
 	if cw.progress != nil && progressCfg.ProgressComment && pr.Head.SHA != "" {
 		chai := progressCfg.Agentic.enabled() && !hasAgenticLabel(pr, agenticSkipLabel)
@@ -346,7 +346,8 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 		var phase progressPhase
 		err := sendCommentWithMode(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister, modeDelta, false, cw.checks, &phase)
 		if event.PullRequest.State == github.PullRequestStateOpen && !event.PullRequest.Draft {
-			cw.progress.submitProgress(repoConfig, prowJob.Spec.Refs, progressView{trigger: progressLGTM, satisfied: true, phase: phase}, false, false)
+			progressCfg := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, baseBranch)
+			cw.progress.submitProgress(progressCfg, prowJob.Spec.Refs, progressView{trigger: progressLGTM, satisfied: true, phase: phase}, false, false)
 		}
 		if err != nil {
 			logger.WithError(err).Error("failed to send a comment")
@@ -462,7 +463,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	if _, enabled := cw.agentic.repoConfig(org, repo, pr.Base.Ref); enabled {
 		return
 	}
-	progressCfg, _ := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, pr.Base.Ref)
+	progressCfg := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, pr.Base.Ref)
 	if pr.State != github.PullRequestStateOpen || pr.Draft {
 		progressCfg.ProgressComment = false
 	}
@@ -515,7 +516,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		}
 		v := waitingProgress(progressCfg, pr, false)
 		v.phase = progressMarked
-		cw.progress.submitProgress(progressCfg, refs, v, true, false)
+		cw.progress.submitProgress(progressCfg, refs, v, false, false)
 		return
 	}
 
@@ -572,7 +573,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			}
 		}
 		if !firstStageComplete {
-			cw.progress.submitProgress(progressCfg, pullRefs(org, repo, pr), progressView{trigger: progressAuto, satisfied: true}, true, true)
+			cw.progress.submitProgress(progressCfg, pullRefs(org, repo, pr), progressView{trigger: progressAuto, satisfied: true}, false, true)
 			logger.Info("First-stage tests not yet complete, reconciler will trigger second-stage when ready")
 			return
 		}
@@ -631,7 +632,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	if !matchesRequired && !matchesRemaining && matchesAuto {
 		trigger = progressAuto
 	}
-	cw.progress.submitProgress(progressCfg, prowJob.Spec.Refs, progressView{trigger: trigger, satisfied: true, phase: phase}, true, false)
+	cw.progress.submitProgress(progressCfg, prowJob.Spec.Refs, progressView{trigger: trigger, satisfied: true, phase: phase}, false, false)
 	if err != nil {
 		logger.WithError(err).Error("failed to send comment in response to pipeline command")
 	}

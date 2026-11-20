@@ -184,7 +184,7 @@ func (w *watcher) getConfig() map[string]map[string]RepoConfig {
 }
 
 // pipelineBranchConfig uses the same branch precedence as agentic enrollment.
-func pipelineBranchConfig(main, lgtm *watcher, org, repo, branch string) (RepoConfig, bool) {
+func pipelineBranchConfig(main, lgtm *watcher, org, repo, branch string) RepoConfig {
 	for i, w := range []*watcher{main, lgtm} {
 		if w == nil {
 			continue
@@ -193,8 +193,8 @@ func pipelineBranchConfig(main, lgtm *watcher, org, repo, branch string) (RepoCo
 			if i == 1 {
 				cfg.Trigger = "lgtm"
 			}
-			return cfg, true
+			return cfg
 		}
 	}
-	return RepoConfig{}, false
+	return RepoConfig{}
 }

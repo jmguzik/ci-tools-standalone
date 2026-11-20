@@ -10,6 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
+	"sigs.k8s.io/prow/pkg/interrupts"
 	"sigs.k8s.io/prow/pkg/labels"
 )
 
@@ -130,7 +131,7 @@ func (v progressView) copy() (now, next, hint string) {
 		if v.chai {
 			hint += " To switch to Traditional, a trusted user can run `/pipeline skip-agentic-mode`."
 		}
-		return "Chai marked dispatch complete.", results, hint
+		return "Chai marked dispatch complete. The gate doesn't confirm that jobs started.", results, hint
 	}
 	if v.chai {
 		if v.phase == progressChai {
@@ -217,10 +218,6 @@ func (a *agenticController) publishProgress(work agenticWork, pr *github.PullReq
 	if s.progress.trigger != "" && v.phase != progressWaiting {
 		v.trigger, v.satisfied = s.progress.trigger, true
 	}
-	if v == s.lastProgress {
-		return
-	}
-	s.lastProgress = v
 	a.progress.submitProgress(cfg, pullRefs(work.org, work.repo, pr), v, true, false)
 }
 
@@ -233,36 +230,55 @@ func (cw *clientWrapper) handleProgressRevision(logger *logrus.Entry, event gith
 	pr := &event.PullRequest
 	org, repo := event.Repo.Owner.Login, event.Repo.Name
 	switch event.Action {
-	case github.PullRequestActionSynchronize:
+	case github.PullRequestActionSynchronize, github.PullRequestActionReopened, github.PullRequestActionReadyForReview,
+		github.PullRequestActionClosed, github.PullRequestActionConvertedToDraft:
 	case github.PullRequestActionEdited:
 		var change struct{ Base json.RawMessage }
 		if err := json.Unmarshal(event.Changes, &change); err != nil || len(change.Base) == 0 {
 			return
 		}
-	case github.PullRequestActionClosed, github.PullRequestActionConvertedToDraft:
-		cw.progress.submit(pullRefs(org, repo, pr), "", true, false)
-		return
 	default:
 		return
 	}
-	cfg, _ := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, pr.Base.Ref)
-	refs := pullRefs(org, repo, pr)
-	if !cfg.ProgressComment || pr.Draft || pr.State != github.PullRequestStateOpen {
-		cw.progress.submit(refs, "", true, false)
+	cfg := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, pr.Base.Ref)
+	active := pr.State == github.PullRequestStateOpen && !pr.Draft
+	inactive := !cfg.ProgressComment || !active
+	if !inactive && cfg.Agentic.enabled() {
 		return
 	}
-	if cfg.Agentic.enabled() || cw.progress.knowsRevision(refs) {
-		return
+	work := agenticWork{org: org, repo: repo, number: pr.Number}
+	rev := progressRevision{head: pr.Head.SHA, base: pr.Base.Ref}
+	// Reverify once if another observation superseded this lookup. Do not trust
+	// old pushes, draft/close events, or out-of-date ineligible target branches.
+	for range 2 {
+		generation, verify := cw.progress.lifecycleGeneration(work, rev, inactive)
+		if !verify {
+			return
+		}
+		findComment := !inactive && generation.entry == nil
+		current, err := cw.progress.lookup(interrupts.Context(), work, findComment)
+		if err != nil {
+			logger.WithError(err).Debug("Could not verify pipeline progress revision")
+			return
+		}
+		liveRev, liveActive := current.progressSnapshot()
+		if liveRev != rev || liveActive != active {
+			return
+		}
+		liveCfg := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, liveRev.base)
+		if liveCfg.ProgressComment != cfg.ProgressComment || liveCfg.Agentic.enabled() != cfg.Agentic.enabled() {
+			return
+		}
+		body := ""
+		if !inactive {
+			body = renderProgress(pullRefs(org, repo, pr), waitingProgress(liveCfg, pr, false))
+		}
+		var comment progressComment
+		if findComment {
+			comment = originalProgressComment(current.Repository.PullRequest.Comments.Nodes, time.Now())
+		}
+		if cw.progress.applyLifecycle(work, generation, rev, body, comment) {
+			return
+		}
 	}
-	// Only an opt-in change of revision needs verification. A delayed webhook
-	// must not replace a dispatched view with Waiting for an obsolete commit.
-	current, err := cw.ghc.GetPullRequest(org, repo, pr.Number)
-	if err != nil {
-		logger.WithError(err).Debug("Could not verify pipeline progress revision")
-		return
-	}
-	if current == nil || current.State != github.PullRequestStateOpen || current.Draft || current.Head.SHA != pr.Head.SHA || current.Base.Ref != pr.Base.Ref {
-		return
-	}
-	cw.progress.submitProgress(cfg, refs, waitingProgress(cfg, current, false), true, true)
 }

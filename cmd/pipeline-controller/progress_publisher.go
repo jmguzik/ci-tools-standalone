@@ -20,6 +20,12 @@ const (
 	progressBot = "openshift-merge-bot"
 	// progressCacheLimit bounds idle PR bookkeeping in long-lived controllers.
 	progressCacheLimit = 2048
+	// progressRetryDelay bounds retries from noisy events after an API failure.
+	progressRetryDelay = 30 * time.Second
+	// progressMissTTL avoids repeatedly looking for a missing opening comment.
+	progressMissTTL = 5 * time.Minute
+	// progressAPITimeout bounds optional display I/O.
+	progressAPITimeout = 15 * time.Second
 )
 
 // progressCommentClient deliberately cannot create or delete a comment.
@@ -42,15 +48,28 @@ type progressCommentNode struct {
 	Author         progressCommentAuthor
 }
 
-// progressCommentQuery reads the opening comments in creation order without pagination.
+// progressCommentQuery verifies the PR and optionally reads its first ten comments.
 type progressCommentQuery struct {
 	Repository struct {
 		PullRequest struct {
-			Comments struct {
+			HeadRefOID  string `graphql:"headRefOid"`
+			BaseRefName string
+			State       string
+			IsDraft     bool
+			Comments    struct {
 				Nodes []progressCommentNode
-			} `graphql:"comments(first: 10)"`
+			} `graphql:"comments(first: 10) @include(if: $comments)"`
 		} `graphql:"pullRequest(number: $number)"`
 	} `graphql:"repository(owner: $owner, name: $name)"`
+}
+
+// progressRevision identifies a rendering cycle independently of the comment ID.
+type progressRevision struct{ head, base string }
+
+// progressSnapshot returns authoritative revision metadata without a second request.
+func (q *progressCommentQuery) progressSnapshot() (progressRevision, bool) {
+	pr := q.Repository.PullRequest
+	return progressRevision{head: pr.HeadRefOID, base: pr.BaseRefName}, pr.State == "OPEN" && !pr.IsDraft
 }
 
 // progressComment is the last known original comment, or a short-lived negative lookup.
@@ -63,13 +82,28 @@ type progressComment struct {
 
 // progressEntry coalesces events for one PR rather than adding one API request per event.
 type progressEntry struct {
-	base, head string
-	baseline   bool
+	verified   progressRevision
+	paused     bool
+	request    progressRequest
 	dirty      bool
-	body       string
+	generation uint64
 	touched    time.Time
 	welcome    time.Time
 	comment    progressComment
+	retryAt    time.Time
+}
+
+// progressRequest is a pending render, not proof that its revision is current.
+type progressRequest struct {
+	revision progressRevision
+	body     string
+	baseline bool
+}
+
+// progressGeneration prevents an in-flight lookup from rolling back a more recent observation.
+type progressGeneration struct {
+	entry   *progressEntry
+	version uint64
 }
 
 // progressPublisher keeps GitHub comment I/O off the scheduling workers.
@@ -86,57 +120,72 @@ func newProgressPublisher(gh progressCommentClient, logger *logrus.Entry) *progr
 	return &progressPublisher{gh: gh, logger: logger, wake: make(chan struct{}, 1), prs: make(map[agenticWork]*progressEntry)}
 }
 
-// submit accepts a current revision from a PR event or live read (follow=true).
-// Dispatch observations alone cannot replace a different known revision.
-// A baseline waiting view must not replace progress for the same revision.
+// submit queues a render. Only an observation from the live Chai worker may
+// follow a different known revision, which still requires verification before editing.
 func (p *progressPublisher) submit(refs *v1.Refs, body string, follow, baseline bool) {
-	if p == nil || refs == nil || len(refs.Pulls) != 1 || refs.Pulls[0].SHA == "" {
+	if p == nil || refs == nil || len(refs.Pulls) != 1 || refs.Pulls[0].SHA == "" || body == "" {
 		return
 	}
 	work := agenticWork{org: refs.Org, repo: refs.Repo, number: refs.Pulls[0].Number}
-	head := refs.Pulls[0].SHA
+	rev := progressRevision{head: refs.Pulls[0].SHA, base: refs.BaseRef}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := p.prs[work]
+	if e != nil && !follow {
+		if e.paused || (e.verified.head != "" && e.verified != rev) ||
+			(e.dirty && e.request.revision != rev) {
+			return
+		}
+	}
+	p.queue(work, e, progressRequest{revision: rev, body: body, baseline: baseline})
+}
+
+// newEntry makes room for a PR without evicting an update waiting to be published. Caller holds mu.
+func (p *progressPublisher) newEntry(work agenticWork) *progressEntry {
+	if len(p.prs) >= progressCacheLimit {
+		var oldest agenticWork
+		var when time.Time
+		for key, entry := range p.prs {
+			if entry.dirty || (!when.IsZero() && !entry.touched.Before(when)) {
+				continue
+			}
+			oldest, when = key, entry.touched
+		}
+		if when.IsZero() {
+			return nil // A saturated display queue never delays scheduling.
+		}
+		delete(p.prs, oldest)
+	}
+	e := &progressEntry{}
+	p.prs[work] = e
+	return e
+}
+
+// queue coalesces pending renders but lets a later event retry an unsuccessful one. Caller holds mu.
+func (p *progressPublisher) queue(work agenticWork, e *progressEntry, request progressRequest) {
 	if e == nil {
-		if body == "" {
+		e = p.newEntry(work)
+		if e == nil {
 			return
 		}
-		if len(p.prs) >= progressCacheLimit {
-			var oldest agenticWork
-			var when time.Time
-			for key, entry := range p.prs {
-				if entry.dirty || (!when.IsZero() && !entry.touched.Before(when)) {
-					continue
-				}
-				oldest, when = key, entry.touched
-			}
-			if when.IsZero() {
-				return // A saturated display queue never delays scheduling.
-			}
-			delete(p.prs, oldest)
-		}
-		e = &progressEntry{head: head, base: refs.BaseRef, baseline: true}
-		p.prs[work] = e
 	}
-	if e.head != head || e.base != refs.BaseRef {
-		if !follow {
-			return
-		}
-		e.head, e.base, e.baseline = head, refs.BaseRef, true
-	}
-	if baseline && !e.baseline {
+	if request.baseline && e.request.revision == request.revision && e.request.body != "" && !e.request.baseline {
 		return
 	}
-	if e.body == body && e.baseline == baseline {
+	if e.comment.gone {
 		return
 	}
-	e.body, e.baseline, e.dirty, e.touched = body, baseline, body != "", time.Now()
-	if e.dirty {
-		select {
-		case p.wake <- struct{}{}:
-		default:
-		}
+	now := time.Now()
+	if e.request == request && (e.dirty || now.Before(e.retryAt) ||
+		(e.verified == request.revision && !e.paused && e.comment.hash == sha256.Sum256([]byte(request.body))) ||
+		(e.comment.id == 0 && now.Sub(e.comment.looked) < progressMissTTL)) {
+		return
+	}
+	e.request, e.dirty, e.touched = request, true, now
+	e.generation++
+	select {
+	case p.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -144,9 +193,9 @@ func (p *progressPublisher) submit(refs *v1.Refs, body string, follow, baseline 
 func (p *progressPublisher) welcomeCreated(work agenticWork) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e := p.prs[work]; e != nil && e.comment.id == 0 && e.body != "" {
+	if e := p.prs[work]; e != nil && e.comment.id == 0 && !e.comment.gone && e.request.body != "" {
 		e.welcome = time.Now()
-		e.comment.looked = time.Time{}
+		e.comment.looked, e.retryAt = time.Time{}, time.Time{}
 		e.dirty = true
 		select {
 		case p.wake <- struct{}{}:
@@ -155,12 +204,60 @@ func (p *progressPublisher) welcomeCreated(work agenticWork) {
 	}
 }
 
-// knowsRevision skips verification for repeated legacy PR deliveries.
-func (p *progressPublisher) knowsRevision(refs *v1.Refs) bool {
+// lifecycleGeneration decides whether a lifecycle event is worth verifying and captures a guard for its result.
+func (p *progressPublisher) lifecycleGeneration(work agenticWork, revision progressRevision, inactive bool) (progressGeneration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e := p.prs[agenticWork{org: refs.Org, repo: refs.Repo, number: refs.Pulls[0].Number}]
-	return e != nil && e.body != "" && e.head == refs.Pulls[0].SHA && e.base == refs.BaseRef
+	e := p.prs[work]
+	if e == nil {
+		return progressGeneration{}, !inactive
+	}
+	return progressGeneration{e, e.generation}, !e.comment.gone && (e.verified != revision || e.paused != inactive)
+}
+
+// applyLifecycle changes the verified revision or pause state only if no newer submission intervened.
+// A false return asks the caller to recheck rather than apply a stale lookup result.
+func (p *progressPublisher) applyLifecycle(work agenticWork, generation progressGeneration, revision progressRevision, body string, comment progressComment) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.prs[work]
+	if e != generation.entry || (e != nil && e.generation != generation.version) {
+		return false
+	}
+	if e == nil {
+		if body == "" {
+			return true
+		}
+		e = p.newEntry(work)
+		if e == nil {
+			return true
+		}
+		e.comment = comment
+	}
+	request := progressRequest{revision: revision, body: body, baseline: true}
+	if body != "" && e.request.revision == revision && e.request.body != "" && !e.request.baseline {
+		request = e.request // Keep a more informative observation for this revision.
+	}
+	e.verified, e.paused = revision, body == ""
+	if body == "" {
+		e.request, e.dirty = progressRequest{}, false
+		e.generation++
+		return true
+	}
+	p.queue(work, e, request)
+	return true
+}
+
+// lookup bounds a progress-only query, optionally finding the original comment in the same request.
+func (p *progressPublisher) lookup(ctx context.Context, work agenticWork, comments bool) (progressCommentQuery, error) {
+	ctx, cancel := context.WithTimeout(ctx, progressAPITimeout)
+	defer cancel()
+	var query progressCommentQuery
+	err := p.gh.QueryWithGitHubAppsSupport(ctx, &query, map[string]interface{}{
+		"owner": githubql.String(work.org), "name": githubql.String(work.repo), "number": githubql.Int(work.number),
+		"comments": githubql.Boolean(comments),
+	}, work.org)
+	return query, err
 }
 
 // run publishes the newest available snapshots; there is no polling or replay on startup.
@@ -191,39 +288,47 @@ func (p *progressPublisher) publishNext(ctx context.Context) bool {
 		p.mu.Unlock()
 		return false
 	}
-	body, comment := entry.body, entry.comment
-	welcome := entry.welcome
+	request, comment := entry.request, entry.comment
+	verified, welcome, generation := entry.verified, entry.welcome, entry.generation
+	paused := entry.paused
 	entry.dirty = false
+	entry.retryAt = time.Now().Add(progressRetryDelay)
 	p.mu.Unlock()
 	if comment.gone {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if comment.id == 0 {
-		if time.Since(comment.looked) < 5*time.Minute {
-			return true
-		}
-		var query progressCommentQuery
-		if err := p.gh.QueryWithGitHubAppsSupport(ctx, &query, map[string]interface{}{
-			"owner": githubql.String(work.org), "name": githubql.String(work.repo), "number": githubql.Int(work.number),
-		}, work.org); err != nil {
+	if comment.id == 0 && time.Since(comment.looked) < progressMissTTL {
+		return true
+	}
+	if comment.id == 0 || verified != request.revision || paused {
+		query, err := p.lookup(ctx, work, comment.id == 0)
+		if err != nil {
 			p.logFailure(work, err)
 			return true
 		}
-		comment = originalProgressComment(query.Repository.PullRequest.Comments.Nodes, time.Now())
+		var active bool
+		verified, active = query.progressSnapshot()
+		paused = !active
+		if comment.id == 0 {
+			comment = originalProgressComment(query.Repository.PullRequest.Comments.Nodes, time.Now())
+		}
 	}
-	hash := sha256.Sum256([]byte(body))
+	hash := sha256.Sum256([]byte(request.body))
 	p.mu.Lock()
-	current := p.prs[work] == entry && entry.body == body
+	current := p.prs[work] == entry && entry.generation == generation
 	if comment.id != 0 || entry.welcome.Equal(welcome) {
 		entry.comment = comment
 	}
+	if current {
+		entry.verified, entry.paused = verified, paused
+	}
 	p.mu.Unlock()
-	if !current || comment.id == 0 || comment.hash == hash {
+	if !current || paused || verified != request.revision || comment.id == 0 || comment.hash == hash {
 		return true
 	}
-	if err := p.gh.EditCommentWithContext(ctx, work.org, work.repo, comment.id, body); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, progressAPITimeout)
+	defer cancel()
+	if err := p.gh.EditCommentWithContext(ctx, work.org, work.repo, comment.id, request.body); err != nil {
 		p.logFailure(work, err)
 		if strings.HasPrefix(err.Error(), "status code 404 ") {
 			// The original was deleted or is no longer writable. Do not adopt a later comment.

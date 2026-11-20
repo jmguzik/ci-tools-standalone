@@ -275,9 +275,9 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 	var phase progressPhase
 	err = sendCommentWithMode(presubmits, &pj, r.ghc, func() { r.ids.Delete(composeKey(pj.Spec.Refs)) }, r.lister, modeDelta, false, r.checks, &phase)
 	if r.progress != nil {
-		cfg, _ := pipelineBranchConfig(r.watcher, r.lgtmWatcher, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.BaseRef)
+		cfg := pipelineBranchConfig(r.watcher, r.lgtmWatcher, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.BaseRef)
 		trigger := progressStageOne
-		if !(isInMainConfig && repoConfig.Trigger == "auto") {
+		if !isInMainConfig || repoConfig.Trigger != "auto" {
 			trigger = progressAuto
 		}
 		r.progress.submitProgress(cfg, pj.Spec.Refs, progressView{trigger: trigger, satisfied: true, phase: phase}, false, false)

@@ -24,7 +24,7 @@ func TestProgressCopy(t *testing.T) {
 		{name: "auto override still needs stage one", view: waitingProgress(RepoConfig{Trigger: "lgtm"}, &github.PullRequest{Labels: []github.Label{{Name: PipelineAutoLabel}}}, true), want: []string{"Auto enabled", "class trigger done", "class wait here", "Waiting for stage 1", "**PR status table** below"}},
 		{name: "live Chai deadline", view: progressView{trigger: progressManual, satisfied: true, phase: progressChai, chai: true, deadline: time.Unix(1, 0)}, want: []string{"class handoff here", "before the timeout", "**If you're stuck:**", "/pipeline skip-agentic-mode"}},
 		{name: "Chai replied without finishing", view: progressView{trigger: progressLGTM, phase: progressChai, chai: true, replied: true}, want: []string{"no automatic fallback after a reply", "/pipeline skip-agentic-mode"}},
-		{name: "Chai mark not a test result", view: progressView{trigger: progressManual, satisfied: true, phase: progressChaiMarked, chai: true}, want: []string{"Chai marked dispatch complete", "which jobs started", "**PR status table** below", "Tests dispatched"}, omit: "passed"},
+		{name: "Chai mark not a test result", view: progressView{trigger: progressManual, satisfied: true, phase: progressChaiMarked, chai: true}, want: []string{"Chai marked dispatch complete", "The gate doesn't confirm that jobs started", "**PR status table** below", "Tests dispatched"}, omit: "passed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := renderProgress(refs, tc.view)
@@ -53,19 +53,24 @@ func TestProgressCopy(t *testing.T) {
 // TestProgressRevision keeps delayed push events from replacing the current comment.
 func TestProgressRevision(t *testing.T) {
 	for _, tc := range []struct {
-		name, live string
-		enabled    bool
-		want       bool
+		name, live, base string
+		enabled, tracked bool
+		active, draft    bool
+		action           github.PullRequestEventAction
+		wantEdit         bool
+		wantQueries      int
 	}{
-		{name: "current opt-in revision", live: "new", enabled: true, want: true},
-		{name: "delayed push", live: "newer", enabled: true},
-		{name: "no opt-in", live: "new"},
+		{name: "current opt-in revision", live: "new", base: "main", enabled: true, active: true, wantEdit: true, wantQueries: 1},
+		{name: "delayed push", live: "newer", base: "main", enabled: true, active: true, wantQueries: 1},
+		{name: "no opt-in", live: "new", base: "main", active: true},
+		{name: "delayed ineligible retarget", live: "old", base: "main", tracked: true, active: true, action: github.PullRequestActionEdited, wantQueries: 1},
+		{name: "delayed draft event", live: "new", base: "main", enabled: true, tracked: true, active: true, action: github.PullRequestActionConvertedToDraft, wantQueries: 1},
+		{name: "current draft event", live: "new", base: "main", enabled: true, tracked: true, active: true, draft: true, action: github.PullRequestActionConvertedToDraft, wantQueries: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
 			pr := f.gh.pr
 			pr.Head.SHA = "new"
-			f.gh.pr.Head.SHA = tc.live
 			w := &watcher{}
 			config := "orgs:\n- org: org\n  repos:\n  - name: repo\n    mode: {progress_comment: true}\n"
 			if !tc.enabled {
@@ -74,15 +79,32 @@ func TestProgressRevision(t *testing.T) {
 			if err := yaml.Unmarshal([]byte(config), &w.config); err != nil {
 				t.Fatal(err)
 			}
-			gh := &progressCommentFake{comments: []progressCommentNode{{FullDatabaseID: "10", Body: pullRequestInfoComment, Author: progressCommentAuthor{Login: progressBot, Type: "Bot"}}}}
+			gh := &progressCommentFake{head: tc.live, base: tc.base, closed: !tc.active, draft: tc.draft, comments: []progressCommentNode{{FullDatabaseID: "10", Body: pullRequestInfoComment, Author: progressCommentAuthor{Login: progressBot, Type: "Bot"}}}}
 			logger := logrus.NewEntry(logrus.New())
 			p := newProgressPublisher(gh, logger)
 			cw := &clientWrapper{ghc: f.gh, lgtmWatcher: w, progress: p}
-			cw.handleProgressRevision(logger, github.PullRequestEvent{Action: github.PullRequestActionSynchronize, Repo: pr.Base.Repo, PullRequest: pr})
-			if got := p.publishNext(t.Context()); got != tc.want {
-				t.Errorf("published progress = %t, want %t", got, tc.want)
+			work := agenticWork{org: pr.Base.Repo.Owner.Login, repo: pr.Base.Repo.Name, number: pr.Number}
+			oldHead := "new"
+			if tc.action == github.PullRequestActionEdited {
+				oldHead, pr.Base.Ref = "old", "release"
 			}
-			if tc.want && (len(gh.bodies) != 1 || !strings.Contains(gh.bodies[0], "Waiting for `/lgtm`")) {
+			if tc.tracked {
+				p.prs[work] = &progressEntry{verified: progressRevision{head: oldHead, base: "main"}}
+			}
+			action := tc.action
+			if action == "" {
+				action = github.PullRequestActionSynchronize
+			}
+			pr.Draft = action == github.PullRequestActionConvertedToDraft
+			cw.handleProgressRevision(logger, github.PullRequestEvent{Action: action, Repo: pr.Base.Repo, PullRequest: pr, Changes: []byte(`{"base":{"ref":{"from":"main"}}}`)})
+			if e := p.prs[work]; tc.tracked && (e.verified.head != oldHead || e.verified.base != "main" || e.paused != tc.draft) {
+				t.Fatalf("lifecycle event unexpectedly changed the tracked state: revision=%+v paused=%t", e.verified, e.paused)
+			}
+			p.publishNext(t.Context())
+			if (len(gh.edits) != 0) != tc.wantEdit || gh.queries != tc.wantQueries {
+				t.Errorf("got %d edits and %d queries, want edit=%t and %d queries", len(gh.edits), gh.queries, tc.wantEdit, tc.wantQueries)
+			}
+			if tc.wantEdit && (len(gh.bodies) != 1 || !strings.Contains(gh.bodies[0], "Waiting for `/lgtm`")) {
 				t.Error("LGTM config did not project an LGTM waiting comment")
 			}
 		})
