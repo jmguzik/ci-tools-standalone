@@ -37,8 +37,9 @@ func (a *AgenticConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 type RepoMode struct {
-	Trigger string        `yaml:"trigger,omitempty"`
-	Agentic AgenticConfig `yaml:"agentic,omitempty"`
+	Trigger         string        `yaml:"trigger,omitempty"`
+	Agentic         AgenticConfig `yaml:"agentic,omitempty"`
+	ProgressComment bool          `yaml:"progress_comment,omitempty"`
 }
 
 // RepoItem represents a repository configuration that can be either a string or an object
@@ -91,9 +92,10 @@ type enabledConfig struct {
 
 // RepoConfig contains configuration for a single repository
 type RepoConfig struct {
-	Trigger  string
-	Branches []string // If empty, all branches are enabled
-	Agentic  AgenticConfig
+	Trigger         string
+	Branches        []string // If empty, all branches are enabled
+	Agentic         AgenticConfig
+	ProgressComment bool
 }
 
 // watcher struct encapsulates the file watcher and configuration
@@ -170,12 +172,29 @@ func (w *watcher) getConfig() map[string]map[string]RepoConfig {
 		repoConfigs := map[string]RepoConfig{}
 		for _, repo := range org.Repos {
 			repoConfigs[repo.Name] = RepoConfig{
-				Trigger:  repo.Mode.Trigger,
-				Branches: repo.Branches,
-				Agentic:  repo.Mode.Agentic,
+				Trigger:         repo.Mode.Trigger,
+				Branches:        repo.Branches,
+				Agentic:         repo.Mode.Agentic,
+				ProgressComment: repo.Mode.ProgressComment,
 			}
 		}
 		ret[org.Org] = repoConfigs
 	}
 	return ret
+}
+
+// pipelineBranchConfig uses the same branch precedence as agentic enrollment.
+func pipelineBranchConfig(main, lgtm *watcher, org, repo, branch string) (RepoConfig, bool) {
+	for i, w := range []*watcher{main, lgtm} {
+		if w == nil {
+			continue
+		}
+		if cfg, ok := w.getConfig()[org][repo]; ok && isBranchEnabled(cfg.Branches, branch) {
+			if i == 1 {
+				cfg.Trigger = "lgtm"
+			}
+			return cfg, true
+		}
+	}
+	return RepoConfig{}, false
 }

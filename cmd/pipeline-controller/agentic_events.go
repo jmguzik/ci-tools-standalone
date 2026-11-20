@@ -35,6 +35,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 		if !s.traditionalMode() {
 			created := false
 			if !s.ready {
+				s.progress.trigger = progressManual
 				created, err = a.publishReadiness(work, s, pr, true)
 			}
 			if err == nil && !created {
@@ -51,7 +52,8 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			mode = modeDelta
 		}
 		pj := &v1.ProwJob{Spec: v1.ProwJobSpec{Refs: pullRefs(work.org, work.repo, pr)}}
-		err = sendCommentWithMode(a.configDataProvider.GetPresubmits(work.org+"/"+work.repo), pj, a.gh, func() {}, a.reader, mode, true, a.checks)
+		s.progress.trigger = progressManual
+		err = sendCommentWithMode(a.configDataProvider.GetPresubmits(work.org+"/"+work.repo), pj, a.gh, func() {}, a.reader, mode, true, a.checks, &s.progress.outcome)
 		if err == nil {
 			s.dispatched = true
 		}
@@ -72,6 +74,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 				break
 			}
 			s.dispatched = false
+			s.progress = agenticProgress{}
 		}
 		if !s.optOut {
 			err = a.gh.AddLabel(work.org, work.repo, work.number, agenticSkipLabel)
@@ -113,6 +116,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			err = a.checks.markGateWithTitle(pullRefs(work.org, work.repo, pr), comment.ID, traditionalCheckTitle)
 			if err == nil {
 				s.dispatched = true
+				s.progress.outcome = progressMarked
 			}
 			break
 		}
@@ -149,6 +153,10 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 		if err == nil {
 			s.gate, s.ready, s.dispatched, s.fresh = *gate, true, true, false
 			s.waitingUntil = time.Time{} // This is a response timeout, not a dispatch deadline.
+			s.progress.outcome = progressMarked
+			if chai {
+				s.progress.outcome = progressChaiMarked
+			}
 		}
 	}
 	if err == nil {

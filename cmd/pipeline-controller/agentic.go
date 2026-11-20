@@ -43,6 +43,8 @@ type agenticState struct {
 	lastCommand  int
 	waitingUntil time.Time
 	publishedAt  time.Time
+	progress     agenticProgress
+	lastProgress progressView
 }
 
 func (s *agenticState) traditionalMode() bool {
@@ -66,24 +68,15 @@ type agenticController struct {
 	queueMu            sync.Mutex
 	queue              workqueue.TypedRateLimitingInterface[agenticWork]
 	inputs             map[agenticWork]*agenticInput
+	progress           *progressPublisher
 }
 
 func (a *agenticController) repoConfig(org, repo, branch string) (RepoConfig, bool) {
 	if a == nil {
 		return RepoConfig{}, false
 	}
-	for i, w := range []*watcher{a.watcher, a.lgtmWatcher} {
-		if w == nil {
-			continue
-		}
-		if cfg, ok := w.getConfig()[org][repo]; ok && isBranchEnabled(cfg.Branches, branch) {
-			if i == 1 {
-				cfg.Trigger = "lgtm"
-			}
-			return cfg, cfg.Agentic.enabled()
-		}
-	}
-	return RepoConfig{}, false
+	cfg, _ := pipelineBranchConfig(a.watcher, a.lgtmWatcher, org, repo, branch)
+	return cfg, cfg.Agentic.enabled()
 }
 
 func (a *agenticController) hasRepo(org, repo string) bool {
@@ -147,6 +140,7 @@ func (a *agenticController) cancelResponseTimeout(s *agenticState, comment *gith
 	if comment != nil && a.trustedChai(comment.User.Login) && comment.ID > 0 && s.ready && !s.traditionalMode() &&
 		!s.waitingUntil.IsZero() && !comment.CreatedAt.Before(s.publishedAt) && !comment.CreatedAt.After(s.waitingUntil) {
 		s.waitingUntil = time.Time{} // Any new Chai comment is a response, not dispatch completion.
+		s.progress.replied = true
 	}
 }
 
@@ -204,6 +198,9 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 		}
 		a.states[work] = s
 	}
+	if a.progress != nil {
+		defer a.publishProgress(work, pr, cfg, s)
+	}
 	optOut := hasAgenticLabel(pr, agenticSkipLabel)
 	if s.optOut && !optOut {
 		if _, err := a.restoreAgenticMode(work, s, pr, false); err != nil {
@@ -235,6 +232,7 @@ func (a *agenticController) reconcilePull(ctx context.Context, work agenticWork,
 			if err != nil || !complete {
 				return err
 			}
+			s.progress.trigger = waitingProgress(cfg, pr, true).trigger
 		}
 		created, err := a.publishReadiness(work, s, pr, automatic)
 		if err != nil {
@@ -291,6 +289,9 @@ func (a *agenticController) restoreAgenticMode(work agenticWork, s *agenticState
 	s.optOut, s.timedOut, s.dispatched = false, false, completed
 	s.traditional = current && traditionalRevisionOwner(gate)
 	s.ready, s.fresh, s.waitingUntil = completed, !deferred, time.Time{}
+	if !deferred {
+		s.progress = agenticProgress{}
+	}
 	if deferred {
 		s.gate, s.publishedAt = *gate, time.Time{}
 	}
@@ -370,7 +371,8 @@ func (a *agenticController) dispatchTraditional(ctx context.Context, work agenti
 	if err != nil || !complete {
 		return err
 	}
-	if err := sendCommentWithMode(presubmits, pj, a.gh, func() {}, a.reader, modeDelta, false, a.checks); err != nil {
+	s.progress.trigger = waitingProgress(cfg, pr, false).trigger
+	if err := sendCommentWithMode(presubmits, pj, a.gh, func() {}, a.reader, modeDelta, false, a.checks, &s.progress.outcome); err != nil {
 		return err
 	}
 	s.dispatched = true

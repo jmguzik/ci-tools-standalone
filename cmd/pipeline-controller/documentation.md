@@ -34,6 +34,24 @@ A supplied full HEAD SHA must match the current PR HEAD; without it, the command
 targets the current HEAD when processed. It does not run tests or override their results.
 A new push starts a fresh pipeline.
 
+## Opt-in PR progress comment
+
+Set `mode.progress_comment: true` on a repository entry in either `config.yaml` or `lgtm-config.yaml`. It defaults to off and applies to the entry's `branches`. In the LGTM config the trigger is still LGTM. This setting does not enable Chai or change when tests are requested.
+
+```yaml
+orgs:
+  - org: openshift
+    repos:
+      - name: example
+        branches: [main]
+        mode:
+          progress_comment: true
+```
+
+The comment shows the current route and trigger, the next action, and a visible recovery hint. Traditional mode moves straight from waiting to its dispatch outcome. Chai adds an intermediate handoff step and reports the accepted gate mark; job starts and results are shown in **Checks**, not inferred by the graph.
+
+The normal opening comment is the only progress comment created. On an older PR the first relevant pipeline event can update the original **Pipeline controller notification** from `openshift-merge-bot[bot]`. If it is missing or cannot be edited, the controller does not post a replacement. Test commands and existing command replies remain separate. Updates use existing scheduling events, cache the comment ID, and skip unchanged text. On the traditional path, the controller verifies a new revision from a push or retarget event before editing to avoid showing an old commit. The comment is best effort; it does not start jobs or affect the pipeline gate.
+
 ## Three Operating Modes
 
 ### 1. Manual Mode

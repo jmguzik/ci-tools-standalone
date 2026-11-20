@@ -88,6 +88,7 @@ type reconciler struct {
 	pipelineAutoCache  *PipelineAutoCache
 	agentic            *agenticController
 	checks             *dispatchChecks
+	progress           *progressPublisher
 }
 
 func NewReconciler(
@@ -271,7 +272,17 @@ func (r *reconciler) reconcile(ctx context.Context, req reconcile.Request) error
 		return err
 	}
 
-	return sendCommentWithMode(presubmits, &pj, r.ghc, func() { r.ids.Delete(composeKey(pj.Spec.Refs)) }, r.lister, modeDelta, false, r.checks)
+	var phase progressPhase
+	err = sendCommentWithMode(presubmits, &pj, r.ghc, func() { r.ids.Delete(composeKey(pj.Spec.Refs)) }, r.lister, modeDelta, false, r.checks, &phase)
+	if r.progress != nil {
+		cfg, _ := pipelineBranchConfig(r.watcher, r.lgtmWatcher, pj.Spec.Refs.Org, pj.Spec.Refs.Repo, pj.Spec.Refs.BaseRef)
+		trigger := progressStageOne
+		if !(isInMainConfig && repoConfig.Trigger == "auto") {
+			trigger = progressAuto
+		}
+		r.progress.submitProgress(cfg, pj.Spec.Refs, progressView{trigger: trigger, satisfied: true, phase: phase}, false, false)
+	}
+	return err
 }
 
 func (r *reconciler) reportSuccessOnPR(ctx context.Context, pj *v1.ProwJob, presubmits presubmitTests) (bool, error) {

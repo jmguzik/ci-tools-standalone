@@ -118,6 +118,7 @@ type clientWrapper struct {
 	pipelineAutoCache  *PipelineAutoCache
 	agentic            *agenticController
 	checks             *dispatchChecks
+	progress           *progressPublisher
 	// ids provides a per-SHA idempotency guard for the LGTM and /pipeline
 	// remaining scheduling paths, which do not run under the reconciler's own
 	// ids cache. Keyed by composeKey (org/repo/pr/baseRef/SHA).
@@ -204,8 +205,19 @@ func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github
 	if !hasPipelineJobs {
 		return
 	}
-	if err := cw.ghc.CreateComment(org, repo, number, pullRequestInfoComment); err != nil {
+	body := pullRequestInfoComment
+	progressCfg, _ := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, baseBranch)
+	pr := &event.PullRequest
+	if cw.progress != nil && progressCfg.ProgressComment && pr.Head.SHA != "" {
+		chai := progressCfg.Agentic.enabled() && !hasAgenticLabel(pr, agenticSkipLabel)
+		body = renderProgress(pullRefs(org, repo, pr), waitingProgress(progressCfg, pr, chai))
+	}
+	if err := cw.ghc.CreateComment(org, repo, number, body); err != nil {
 		logger.WithError(err).Error("failed to create pipeline info comment")
+		return
+	}
+	if cw.progress != nil && progressCfg.ProgressComment {
+		cw.progress.welcomeCreated(agenticWork{org: org, repo: repo, number: number})
 	}
 }
 
@@ -324,7 +336,12 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 		}
 
 		logger.Info("Sending comment for LGTM label addition")
-		if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister, modeDelta, false, cw.checks); err != nil {
+		var phase progressPhase
+		err := sendCommentWithMode(presubmits, prowJob, cw.ghc, func() { cw.ids.Delete(key) }, cw.pjLister, modeDelta, false, cw.checks, &phase)
+		if event.PullRequest.State == github.PullRequestStateOpen && !event.PullRequest.Draft {
+			cw.progress.submitProgress(repoConfig, prowJob.Spec.Refs, progressView{trigger: progressLGTM, satisfied: true, phase: phase}, false, false)
+		}
+		if err != nil {
 			logger.WithError(err).Error("failed to send a comment")
 		} else {
 			logger.Info("Successfully sent comment for LGTM label addition")
@@ -438,6 +455,10 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	if _, enabled := cw.agentic.repoConfig(org, repo, pr.Base.Ref); enabled {
 		return
 	}
+	progressCfg, _ := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, pr.Base.Ref)
+	if pr.State != github.PullRequestStateOpen || pr.Draft {
+		progressCfg.ProgressComment = false
+	}
 
 	// Check if branch is enabled for this repo
 	baseBranch := pr.Base.Ref
@@ -483,7 +504,11 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		refs := &v1.Refs{Org: org, Repo: repo, BaseRef: pr.Base.Ref, Pulls: []v1.Pull{{Number: number, SHA: pr.Head.SHA}}}
 		if err := cw.checks.markGate(refs, event.Comment.ID); err != nil {
 			logger.WithError(err).Error("failed to mark pipeline gate")
+			return
 		}
+		v := waitingProgress(progressCfg, pr, false)
+		v.phase = progressMarked
+		cw.progress.submitProgress(progressCfg, refs, v, true, false)
 		return
 	}
 
@@ -540,6 +565,7 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			}
 		}
 		if !firstStageComplete {
+			cw.progress.submitProgress(progressCfg, pullRefs(org, repo, pr), progressView{trigger: progressAuto, satisfied: true}, true, true)
 			logger.Info("First-stage tests not yet complete, reconciler will trigger second-stage when ready")
 			return
 		}
@@ -592,7 +618,14 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 
 	// Generate the comment with test/override commands. explicit=true: a human
 	// /pipeline command always gets a response, even when nothing needs scheduling.
-	if err := sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode, true, cw.checks); err != nil {
+	var phase progressPhase
+	err = sendCommentWithMode(presubmits, prowJob, cw.ghc, deleteIds, cw.pjLister, mode, true, cw.checks, &phase)
+	trigger := progressManual
+	if !matchesRequired && !matchesRemaining && matchesAuto {
+		trigger = progressAuto
+	}
+	cw.progress.submitProgress(progressCfg, prowJob.Spec.Refs, progressView{trigger: trigger, satisfied: true, phase: phase}, true, false)
+	if err != nil {
 		logger.WithError(err).Error("failed to send comment in response to pipeline command")
 	}
 }
@@ -937,6 +970,11 @@ func main() {
 	watcher.setOnChange(agentic.configurationChanged)
 	lgtmWatcher.setOnChange(agentic.configurationChanged)
 	reconciler.agentic = agentic
+	var progress *progressPublisher
+	if !o.dryrun {
+		progress = newProgressPublisher(githubClient, logger)
+		agentic.progress, reconciler.progress = progress, progress
+	}
 
 	if err = secret.Add(o.webhookSecretFile); err != nil {
 		logger.WithError(err).Fatal("error starting secrets agent")
@@ -952,6 +990,7 @@ func main() {
 		pipelineAutoCache:  pipelineAutoCache,
 		agentic:            agentic,
 		checks:             checks,
+		progress:           progress,
 	}
 
 	// Evict stale per-SHA idempotency keys from the LGTM / /pipeline remaining
@@ -967,6 +1006,7 @@ func main() {
 	eventServer.RegisterHandlePullRequestEvent(cw.handlePipelineContextCreation)
 	eventServer.RegisterHandleIssueCommentEvent(cw.handleIssueComment)
 	eventServer.RegisterHandlePullRequestEvent(agentic.handlePullRequest)
+	eventServer.RegisterHandlePullRequestEvent(cw.handleProgressRevision)
 
 	logger.Info("All event handlers registered successfully")
 
@@ -975,6 +1015,9 @@ func main() {
 	})
 
 	interrupts.ListenAndServe(eventServer, time.Second*30)
+	if progress != nil {
+		interrupts.Run(progress.run)
+	}
 	interrupts.Run(func(ctx context.Context) {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return
