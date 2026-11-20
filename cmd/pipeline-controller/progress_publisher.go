@@ -3,28 +3,54 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	githubql "github.com/shurcooL/githubv4"
 	"github.com/sirupsen/logrus"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
-	"sigs.k8s.io/prow/pkg/github"
 )
 
 const (
 	// progressPrefix identifies a dashboard owned by the original notification author.
 	progressPrefix = pipelineNotificationHeading + "\n\n<!-- pipeline-controller:progress:v1 -->\n"
-	// progressBot is the account that owns the opening pipeline notification in production.
-	progressBot = "openshift-merge-bot[bot]"
+	// progressBot is the GraphQL login of the bot that owns the opening notification.
+	progressBot = "openshift-merge-bot"
 	// progressCacheLimit bounds idle PR bookkeeping in long-lived controllers.
 	progressCacheLimit = 2048
 )
 
 // progressCommentClient deliberately cannot create or delete a comment.
 type progressCommentClient interface {
-	ListIssueCommentsWithContext(context.Context, string, string, int) ([]github.IssueComment, error)
+	QueryWithGitHubAppsSupport(context.Context, interface{}, map[string]interface{}, string) error
 	EditCommentWithContext(context.Context, string, string, int, string) error
+}
+
+// progressCommentAuthor distinguishes the bot from users with a similar login.
+type progressCommentAuthor struct {
+	Login string
+	Type  string `graphql:"__typename"`
+}
+
+// progressCommentNode contains only the fields needed to identify and edit the original comment.
+type progressCommentNode struct {
+	// fullDatabaseId is a string on the wire and can exceed the GraphQL Int range.
+	FullDatabaseID string `graphql:"fullDatabaseId"`
+	Body           string
+	Author         progressCommentAuthor
+}
+
+// progressCommentQuery reads the opening comments in creation order without pagination.
+type progressCommentQuery struct {
+	Repository struct {
+		PullRequest struct {
+			Comments struct {
+				Nodes []progressCommentNode
+			} `graphql:"comments(first: 10)"`
+		} `graphql:"pullRequest(number: $number)"`
+	} `graphql:"repository(owner: $owner, name: $name)"`
 }
 
 // progressComment is the last known original comment, or a short-lived negative lookup.
@@ -178,12 +204,14 @@ func (p *progressPublisher) publishNext(ctx context.Context) bool {
 		if time.Since(comment.looked) < 5*time.Minute {
 			return true
 		}
-		comments, err := p.gh.ListIssueCommentsWithContext(ctx, work.org, work.repo, work.number)
-		if err != nil {
+		var query progressCommentQuery
+		if err := p.gh.QueryWithGitHubAppsSupport(ctx, &query, map[string]interface{}{
+			"owner": githubql.String(work.org), "name": githubql.String(work.repo), "number": githubql.Int(work.number),
+		}, work.org); err != nil {
 			p.logFailure(work, err)
 			return true
 		}
-		comment = originalProgressComment(comments, time.Now())
+		comment = originalProgressComment(query.Repository.PullRequest.Comments.Nodes, time.Now())
 	}
 	hash := sha256.Sum256([]byte(body))
 	p.mu.Lock()
@@ -212,15 +240,19 @@ func (p *progressPublisher) publishNext(ctx context.Context) bool {
 }
 
 // originalProgressComment finds the earliest welcome comment, not a scheduling or help reply.
-func originalProgressComment(comments []github.IssueComment, now time.Time) progressComment {
+func originalProgressComment(comments []progressCommentNode, now time.Time) progressComment {
 	result := progressComment{looked: now}
 	for _, comment := range comments {
-		if comment.ID <= 0 || !strings.EqualFold(comment.User.Login, progressBot) || (result.id != 0 && comment.ID >= result.id) {
+		if comment.Author.Type != "Bot" || !strings.EqualFold(comment.Author.Login, progressBot) {
+			continue
+		}
+		id, err := strconv.Atoi(comment.FullDatabaseID)
+		if err != nil || id <= 0 || (result.id != 0 && id >= result.id) {
 			continue
 		}
 		body := normalizePipelineComment(comment.Body)
 		if body == pullRequestInfoComment || strings.HasPrefix(body, progressPrefix) {
-			result.id, result.hash = comment.ID, sha256.Sum256([]byte(body))
+			result.id, result.hash = id, sha256.Sum256([]byte(body))
 		}
 	}
 	return result

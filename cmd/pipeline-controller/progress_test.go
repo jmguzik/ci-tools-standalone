@@ -74,7 +74,7 @@ func TestProgressRevision(t *testing.T) {
 			if err := yaml.Unmarshal([]byte(config), &w.config); err != nil {
 				t.Fatal(err)
 			}
-			gh := &progressCommentFake{comments: []github.IssueComment{{ID: 10, Body: pullRequestInfoComment, User: github.User{Login: progressBot}}}}
+			gh := &progressCommentFake{comments: []progressCommentNode{{FullDatabaseID: "10", Body: pullRequestInfoComment, Author: progressCommentAuthor{Login: progressBot, Type: "Bot"}}}}
 			logger := logrus.NewEntry(logrus.New())
 			p := newProgressPublisher(gh, logger)
 			cw := &clientWrapper{ghc: f.gh, lgtmWatcher: w, progress: p}
