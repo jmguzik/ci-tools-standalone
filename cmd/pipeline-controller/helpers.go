@@ -44,7 +44,7 @@ type minimalGhClient interface {
 // duplicate "already triggered"/"no tests" notes that otherwise recur on every
 // reconcile/LGTM pass and across restarts (the per-handler dedup caches are
 // separate and in-memory).
-func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode, explicit bool, checks *dispatchChecks) error {
+func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalGhClient, deleteIds func(), pjLister ctrlruntimeclient.Reader, mode scheduleMode, explicit bool, checks *dispatchChecks, outcome ...*progressPhase) error {
 	if checks != nil {
 		checks.mu.Lock()
 		defer checks.mu.Unlock()
@@ -65,6 +65,16 @@ func sendCommentWithMode(presubmits presubmitTests, pj *v1.ProwJob, ghc minimalG
 	}
 	if err != nil {
 		deleteIds() // Check publication failures must also release dispatch retries.
+	}
+	if len(outcome) != 0 {
+		phase := progressPosted
+		if len(jobs) == 0 {
+			phase = progressEmpty
+		}
+		if err != nil {
+			phase = progressFailed
+		}
+		*outcome[0] = phase
 	}
 	return err
 }
