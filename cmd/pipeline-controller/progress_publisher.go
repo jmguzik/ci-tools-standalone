@@ -14,7 +14,7 @@ import (
 
 const (
 	// progressPrefix identifies a dashboard owned by the original notification author.
-	progressPrefix = "**Pipeline controller notification**\n\n<!-- pipeline-controller:progress:v1 -->\n"
+	progressPrefix = pipelineNotificationHeading + "\n\n<!-- pipeline-controller:progress:v1 -->\n"
 	// progressBot is the account that owns the opening pipeline notification in production.
 	progressBot = "openshift-merge-bot[bot]"
 	// progressCacheLimit bounds idle PR bookkeeping in long-lived controllers.

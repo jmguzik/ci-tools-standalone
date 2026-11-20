@@ -48,7 +48,7 @@ orgs:
           progress_comment: true
 ```
 
-The comment shows the current route and trigger, the next action, and a visible recovery hint. Traditional mode moves straight from waiting to its dispatch outcome. Chai adds an intermediate handoff step and reports the accepted gate mark; job starts and results are shown in **Checks**, not inferred by the graph.
+The comment shows the current route and trigger, the next action, and a visible recovery hint. Traditional mode moves straight from waiting to its dispatch outcome. Chai adds an intermediate handoff step and reports the accepted gate mark; the graph points to the **PR status table** below for job runs and results. The original explanation and help commands are under **About the pipeline controller**, collapsed by default.
 
 The normal opening comment is the only progress comment created. On an older PR the first relevant pipeline event can update the original **Pipeline controller notification** from `openshift-merge-bot[bot]`. If it is missing or cannot be edited, the controller does not post a replacement. Test commands and existing command replies remain separate. Updates use existing scheduling events, cache the comment ID, and skip unchanged text. On the traditional path, the controller verifies a new revision from a push or retarget event before editing to avoid showing an old commit. The comment is best effort; it does not start jobs or affect the pipeline gate.
 

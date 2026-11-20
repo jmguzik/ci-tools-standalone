@@ -31,7 +31,14 @@ import (
 	"sigs.k8s.io/prow/pkg/logrusutil"
 )
 
-const pullRequestInfoComment = "**Pipeline controller notification**\n\nThis PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs and `/pipeline help` for commands."
+// pipelineNotificationHeading identifies the controller's opening comment.
+const pipelineNotificationHeading = "**Pipeline controller notification**"
+
+// pipelineNotificationHelp is shared by the legacy comment and the progress comment.
+const pipelineNotificationHelp = "This PR uses the [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) for second-stage tests. Selection and triggering follow the repository configuration.\n\nUse `/test ?` to list jobs and `/pipeline help` for commands."
+
+// pullRequestInfoComment preserves the original body so existing notifications can be found and edited.
+const pullRequestInfoComment = pipelineNotificationHeading + "\n\n" + pipelineNotificationHelp
 
 const RepoNotConfiguredMessage = "This repository is not currently configured for [pipeline controller](https://docs.ci.openshift.org/how-tos/creating-a-pipeline/) support."
 

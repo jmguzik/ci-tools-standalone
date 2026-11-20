@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"net/url"
 	"strings"
 	"time"
 
@@ -85,8 +84,6 @@ func renderProgress(refs *v1.Refs, v progressView) string {
 	if v.recovery != "" && !v.chai {
 		hint += " A trusted user can re-enable Chai with `/pipeline agentic-mode`. If Traditional owns this commit and has already dispatched, Chai starts on the next push."
 	}
-	checks := fmt.Sprintf("[**Checks**](https://github.com/%s/%s/pull/%d/checks)", url.PathEscape(refs.Org), url.PathEscape(refs.Repo), refs.Pulls[0].Number)
-	next = strings.ReplaceAll(next, "**Checks**", checks)
 	owner, middle := "Traditional", ""
 	if v.chai {
 		owner, middle = "Chai", ` --> handoff["Agentic dispatching"]`
@@ -111,28 +108,29 @@ func renderProgress(refs *v1.Refs, v progressView) string {
 		"```mermaid\nflowchart LR\n  wait[\"Waiting\"] --> trigger[%q]%s --> outcome[%q]\n"+
 		"  classDef here fill:#1757a6,stroke:#1757a6,color:#fff,stroke-width:3px\n"+
 		"  classDef done fill:#dafbe1,stroke:#1a7f37,color:#116329,stroke-width:2px\n"+
-		"  class %s here\n%s```\n\n**If you're stuck:** %s\n\nUse `/test ?` to list jobs and `/pipeline help` for commands.",
-		progressPrefix, owner, sha, now, next, v.trigger, middle, end, current, milestone, hint)
+		"  class %s here\n%s```\n\n**If you're stuck:** %s\n\n<details>\n<summary>About the pipeline controller</summary>\n\n%s\n\n</details>",
+		progressPrefix, owner, sha, now, next, v.trigger, middle, end, current, milestone, hint, pipelineNotificationHelp)
 }
 
 // copy keeps the usual next action separate from the always-visible recovery path.
 func (v progressView) copy() (now, next, hint string) {
-	checks := "Open **Checks** to see which jobs started and how they finished."
+	results := "See which jobs started and how they finished in the **PR status table** below."
+	pending := "See the **PR status table** below for pending or failed jobs."
 	if v.phase == progressFailed {
-		return "The controller couldn't confirm dispatch.", "Check for existing runs before retrying.", "Use `/test <job>` to request one missing job."
+		return "The controller couldn't confirm dispatch.", "Look for existing runs in the **PR status table** below before retrying.", "Use `/test <job>` to request one missing job."
 	}
 	if v.phase == progressEmpty {
-		return "No new jobs needed to be requested.", "Open **Checks** for any existing runs.", "Use `/test <job>` if you need to run a specific job."
+		return "No new jobs needed to be requested.", "See the **PR status table** below for existing runs.", "Use `/test <job>` if you need to run a specific job."
 	}
 	if v.phase == progressMarked || v.phase == progressComplete {
-		return "The dispatch gate is complete. This does not confirm that jobs started.", checks, "Use `/test <job>` to request one missing job."
+		return "The dispatch gate is complete. This does not confirm that jobs started.", results, "Use `/test <job>` to request one missing job."
 	}
 	if v.phase == progressChaiMarked {
 		hint = "Use `/test <job>` for one missing run."
 		if v.chai {
 			hint += " To switch to Traditional, a trusted user can run `/pipeline skip-agentic-mode`."
 		}
-		return "Chai marked dispatch complete.", checks, hint
+		return "Chai marked dispatch complete.", results, hint
 	}
 	if v.chai {
 		if v.phase == progressChai {
@@ -141,9 +139,9 @@ func (v progressView) copy() (now, next, hint string) {
 				return "Waiting for Chai to reply.", "If Chai doesn't reply before the timeout, Traditional takes over.", hint
 			}
 			if v.replied {
-				return "Chai replied, but the gate is still pending. There is no automatic fallback after a reply.", "Check Chai's latest comment and look for runs in **Checks**.", hint
+				return "Chai replied, but the gate is still pending. There is no automatic fallback after a reply.", "Check Chai's latest comment and look for runs in the **PR status table** below.", hint
 			}
-			return "The Chai gate is pending. No response deadline was recovered.", "Check Chai's latest comment and **Checks**.", hint
+			return "The Chai gate is pending. No response deadline was recovered.", "Check Chai's latest comment and the **PR status table** below.", hint
 		}
 		hint = "A trusted user can notify Chai now with `/pipeline required`."
 		if v.trigger == progressManual {
@@ -152,17 +150,17 @@ func (v progressView) copy() (now, next, hint string) {
 		if v.trigger == progressLGTM && !v.satisfied {
 			return "Waiting for `/lgtm`.", "Ask a reviewer for `/lgtm`.", "A trusted user can use `/pipeline auto` to wait only for stage 1, or `/pipeline required` to notify Chai now."
 		}
-		return "Waiting for stage 1 before notifying Chai.", "Open **Checks** to see what's pending or failed.", hint
+		return "Waiting for stage 1 before notifying Chai.", pending, hint
 	}
 	switch {
 	case v.phase == progressPosted:
-		return "The controller posted stage-2 test requests.", checks, "Use `/test <job>` for one failed or missing run."
+		return "The controller posted stage-2 test requests.", results, "Use `/test <job>` for one failed or missing run."
 	case v.trigger == progressManual:
 		return "Waiting for a request to run stage 2.", "Use `/pipeline remaining` to request missing jobs.", "Use `/pipeline required` for the full applicable set, or `/test <job>` for one job."
 	case v.trigger == progressLGTM && !v.satisfied:
 		return "Waiting for `/lgtm`.", "Ask a reviewer for `/lgtm`.", "Use `/pipeline auto` to wait for stage 1 instead, or `/pipeline remaining` for missing jobs now."
 	default:
-		return "Waiting for stage 1.", "Open **Checks** to see what's pending or failed.", "Use `/pipeline remaining` to request missing stage-2 jobs now."
+		return "Waiting for stage 1.", pending, "Use `/pipeline remaining` to request missing stage-2 jobs now."
 	}
 }
 

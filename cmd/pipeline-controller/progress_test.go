@@ -20,11 +20,11 @@ func TestProgressCopy(t *testing.T) {
 		want []string
 		omit string
 	}{
-		{name: "traditional no fake intermediate step", view: progressView{trigger: progressStageOne, satisfied: true, phase: progressPosted}, want: []string{"class trigger done", "class outcome here", "posted stage-2 test requests"}, omit: "Agentic dispatching"},
-		{name: "auto override still needs stage one", view: waitingProgress(RepoConfig{Trigger: "lgtm"}, &github.PullRequest{Labels: []github.Label{{Name: PipelineAutoLabel}}}, true), want: []string{"Auto enabled", "class trigger done", "class wait here", "Waiting for stage 1"}},
+		{name: "traditional no fake intermediate step", view: progressView{trigger: progressStageOne, satisfied: true, phase: progressPosted}, want: []string{"class trigger done", "class outcome here", "posted stage-2 test requests", "**PR status table** below"}, omit: "Agentic dispatching"},
+		{name: "auto override still needs stage one", view: waitingProgress(RepoConfig{Trigger: "lgtm"}, &github.PullRequest{Labels: []github.Label{{Name: PipelineAutoLabel}}}, true), want: []string{"Auto enabled", "class trigger done", "class wait here", "Waiting for stage 1", "**PR status table** below"}},
 		{name: "live Chai deadline", view: progressView{trigger: progressManual, satisfied: true, phase: progressChai, chai: true, deadline: time.Unix(1, 0)}, want: []string{"class handoff here", "before the timeout", "**If you're stuck:**", "/pipeline skip-agentic-mode"}},
 		{name: "Chai replied without finishing", view: progressView{trigger: progressLGTM, phase: progressChai, chai: true, replied: true}, want: []string{"no automatic fallback after a reply", "/pipeline skip-agentic-mode"}},
-		{name: "Chai mark not a test result", view: progressView{trigger: progressManual, satisfied: true, phase: progressChaiMarked, chai: true}, want: []string{"Chai marked dispatch complete", "see which jobs started", "Tests dispatched"}, omit: "passed"},
+		{name: "Chai mark not a test result", view: progressView{trigger: progressManual, satisfied: true, phase: progressChaiMarked, chai: true}, want: []string{"Chai marked dispatch complete", "which jobs started", "**PR status table** below", "Tests dispatched"}, omit: "passed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := renderProgress(refs, tc.view)
@@ -35,6 +35,13 @@ func TestProgressCopy(t *testing.T) {
 			}
 			if tc.omit != "" && strings.Contains(body, tc.omit) {
 				t.Errorf("progress comment unexpectedly contains %q", tc.omit)
+			}
+			visible, help, found := strings.Cut(body, "\n\n<details>\n<summary>About the pipeline controller</summary>\n\n")
+			if !found || help != pipelineNotificationHelp+"\n\n</details>" || strings.Contains(visible, pipelineNotificationHelp) {
+				t.Error("the original help must appear only inside the collapsed section")
+			}
+			if !strings.Contains(visible, "**If you're stuck:**") || strings.Contains(body, "**Checks**") || strings.Contains(body, "/checks)") {
+				t.Error("recovery guidance must be visible and must not point to the Checks tab")
 			}
 			if _, executable := parsePipelineCommand(body); executable || strings.Contains(body, "\n/test ") {
 				t.Error("progress comment contains an executable command")
