@@ -53,12 +53,15 @@ func agenticRetryFor(err error) agenticRetryInfo {
 			}
 		}
 	}
-	// Prow's paginated reads expose only this status-line envelope instead.
-	if statusLine, ok := strings.CutPrefix(err.Error(), "return code not 2XX: "); ok {
-		if code, _, ok := strings.Cut(statusLine, " "); ok && len(code) == 3 {
-			status, _ := strconv.Atoi(code)
-			result.transient = retryableAgenticHTTPStatus(status)
-			result.githubRateLimit = status == http.StatusTooManyRequests
+	// Prow's paginated REST and GraphQL reads expose status-line errors instead.
+	for _, prefix := range []string{"return code not 2XX: ", "non-200 OK status code: "} {
+		if statusLine, ok := strings.CutPrefix(err.Error(), prefix); ok {
+			if code, _, ok := strings.Cut(statusLine, " "); ok && len(code) == 3 {
+				if status, err := strconv.Atoi(code); err == nil {
+					result.transient = retryableAgenticHTTPStatus(status)
+					result.githubRateLimit = status == http.StatusTooManyRequests
+				}
+			}
 		}
 	}
 	if wait := agenticGitHubWait(err.Error()); wait > 0 {
@@ -68,6 +71,8 @@ func agenticRetryFor(err error) agenticRetryInfo {
 	switch wrapped := err.(type) {
 	case interface{ Unwrap() []error }:
 		causes = wrapped.Unwrap()
+	case interface{ Errors() []error }:
+		causes = wrapped.Errors()
 	case interface{ Unwrap() error }:
 		causes = []error{wrapped.Unwrap()}
 	}

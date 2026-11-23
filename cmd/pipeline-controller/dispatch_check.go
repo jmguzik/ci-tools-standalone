@@ -92,10 +92,11 @@ func writePipelineCheck(gh pipelineCheckClient, appID int64, org, repo string, g
 type dispatchChecks struct {
 	gh interface {
 		pipelineCheckClient
-		pipelineCommandClient
+		gateAuthorizationClient
 	}
-	appID int64
-	mu    sync.Mutex
+	appID         int64
+	authorization gateAuthorization
+	mu            sync.Mutex
 }
 
 func traditionalCheck(refs *v1.Refs, status, conclusion, summary string) github.CheckRun {
@@ -163,6 +164,14 @@ func (c *dispatchChecks) dispatch(refs *v1.Refs, hasJobs bool, post func() error
 	return writePipelineCheck(c.gh, c.appID, refs.Org, refs.Repo, gate, next, false)
 }
 
+// authorizeMarkGate is shared by the traditional and agentic command handlers.
+func (c *dispatchChecks) authorizeMarkGate(org, repo, user, base string) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	return c.authorization.authorized(c.gh, org, repo, user, base)
+}
+
 func (c *dispatchChecks) markGate(refs *v1.Refs, commentID int) error {
 	return c.markGateWithTitle(refs, commentID, "")
 }
@@ -172,7 +181,7 @@ func (c *dispatchChecks) markGateWithTitle(refs *v1.Refs, commentID int, title s
 	return err
 }
 
-// Only trusted humans may backfill a missing gate. Chai must complete the
+// An authorized user not configured as Chai may backfill a missing gate. Chai must complete the
 // existing readiness check for the current revision.
 func (c *dispatchChecks) markGateCheck(refs *v1.Refs, commentID int, title string, allowCreate bool) (*github.CheckRun, error) {
 	c.mu.Lock()

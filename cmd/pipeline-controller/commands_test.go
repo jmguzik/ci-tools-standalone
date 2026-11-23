@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"strings"
 	"testing"
 
@@ -83,30 +84,57 @@ func TestAgenticModeCRLFCommentEvents(t *testing.T) {
 	}
 }
 
+// gatePermissionProbe verifies the handler lock is available during permission lookup.
+type gatePermissionProbe struct {
+	*fakeAgenticGitHub
+	t      *testing.T
+	cw     *clientWrapper
+	repush bool
+}
+
+func (g gatePermissionProbe) HasPermission(org, repo, user string, roles ...string) (bool, error) {
+	require.True(g.t, g.cw.mu.TryLock(), "permission lookups must not hold the webhook lock")
+	defer g.cw.mu.Unlock()
+	if g.repush {
+		g.pr.Head.SHA = strings.Repeat("b", 40)
+	}
+	return g.fakeAgenticGitHub.HasPermission(org, repo, user, roles...)
+}
+
+// TestTraditionalMarkPipelineGate constrains gate mutation to authorized commands on the current PR.
 func TestTraditionalMarkPipelineGate(t *testing.T) {
-	for _, scenario := range []string{"member", "collaborator", "untrusted", "stale-head", "explicit-head", "missing-gate", "disabled", "edited", "suffix", "multiple", "no-app", "write-error"} {
+	for _, scenario := range []string{"admin", "member", "collaborator", "untrusted", "stale-head", "explicit-head", "missing-gate", "disabled", "edited", "suffix", "multiple", "no-app", "write-error", "allowlisted", "repush-during-authorization"} {
 		t.Run(scenario, func(t *testing.T) {
 			refs := makeTriggerPJ(strings.Repeat("a", 40)).Spec.Refs
 			foreign := traditionalCheck(refs, "completed", "success", "another app")
 			foreign.ID, foreign.App.ID = 900, 202
-			gh := &fakeAgenticGitHub{member: true, checks: []github.CheckRun{foreign},
+			gh := &fakeAgenticGitHub{repoPermission: github.RoleAdmin, checks: []github.CheckRun{foreign},
 				pr: github.PullRequest{Number: refs.Pulls[0].Number, State: github.PullRequestStateOpen,
 					Head: github.PullRequestBranch{SHA: refs.Pulls[0].SHA},
 					Base: github.PullRequestBranch{Ref: refs.BaseRef, Repo: github.Repo{Name: refs.Repo, Owner: github.User{Login: refs.Org}}}}}
-			checks := &dispatchChecks{gh: gh, appID: 101}
+			var options gateAuthorizationOptions
+			options.addFlags(flag.NewFlagSet("test", flag.ContinueOnError))
+			require.NoError(t, options.validate())
+			checks := &dispatchChecks{gh: gh, appID: 101, authorization: gateAuthorization{allowedUsers: options.parsedAllowedUsers}}
 			if scenario != "missing-gate" {
 				require.NoError(t, checks.pending(refs))
 			}
 			cw := &clientWrapper{ghc: gh, checks: checks, watcher: &watcher{config: mustEnabledConfig(t)}, lgtmWatcher: &watcher{},
 				configDataProvider: &ConfigDataProvider{updatedPresubmits: map[string]presubmitTests{}}}
+			checks.gh = gatePermissionProbe{fakeAgenticGitHub: gh, t: t, cw: cw, repush: scenario == "repush-during-authorization"}
 			event := github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: gh.pr.Base.Repo,
 				Issue:   github.Issue{Number: gh.pr.Number, PullRequest: &struct{}{}},
 				Comment: github.IssueComment{ID: 500, Body: "/pipeline mark-pipeline-gate", User: github.User{Login: "maintainer"}}}
 			switch scenario {
+			case "member":
+				gh.member, gh.repoPermission = true, "read"
 			case "collaborator":
-				gh.member, gh.collaborator = false, true
+				gh.collaborator, gh.repoPermission = true, "write"
 			case "untrusted":
-				gh.member = false
+				gh.repoPermission = ""
+			case "allowlisted":
+				gh.repoPermission = ""
+				event.Comment.User.Login = "RedHat-Chai-Bot"
 			case "stale-head":
 				event.Comment.Body += " " + strings.Repeat("b", 40)
 			case "explicit-head":
@@ -127,7 +155,7 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 			cw.handleIssueComment(logrus.NewEntry(logrus.New()), event)
 			require.Equal(t, foreign, gh.checks[0])
 			switch scenario {
-			case "member", "collaborator", "explicit-head", "missing-gate":
+			case "admin", "allowlisted", "explicit-head", "missing-gate":
 				require.Len(t, gh.checks, 2)
 				require.Equal(t, traditionalCheckTitle, gh.checks[1].Output.Title)
 				require.Equal(t, pipelineExternalID(refs), gh.checks[1].ExternalID)
@@ -136,6 +164,7 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 				require.Equal(t, "success", gh.checks[1].Conclusion)
 				require.Contains(t, gh.checks[1].Output.Summary, "comment 500")
 			default:
+				require.Len(t, gh.checks, 2, "a rejected command must not create a check")
 				require.NotEqual(t, "success", gh.checks[1].Conclusion)
 			}
 			require.Zero(t, gh.statusWrites)

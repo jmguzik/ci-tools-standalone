@@ -62,10 +62,14 @@ type options struct {
 	dryrun                   bool
 	webhookSecretFile        string
 	agentic                  agenticOptions
+	gateAuthorization        gateAuthorizationOptions
 }
 
 func (o *options) validate() error {
 	if err := o.agentic.validate(); err != nil {
+		return err
+	}
+	if err := o.gateAuthorization.validate(); err != nil {
 		return err
 	}
 	for _, opt := range []interface{ Validate(bool) error }{&o.client, &o.config} {
@@ -83,6 +87,7 @@ func (o *options) parseArgs(fs *flag.FlagSet, args []string) error {
 	fs.StringVar(&o.lgtmConfigFile, "lgtm-config-file", "", "Config file with list of enabled orgs and repos with second stage triggered by lgtm label.")
 	fs.StringVar(&o.webhookSecretFile, "hmac-secret-file", "/etc/webhook/hmac", "Path to the file containing the GitHub HMAC secret.")
 	o.agentic.addFlags(fs)
+	o.gateAuthorization.addFlags(fs)
 
 	o.config.AddFlags(fs)
 	o.github.AddFlags(fs)
@@ -358,8 +363,13 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 }
 
 func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueCommentEvent) {
-	cw.mu.Lock()
-	defer cw.mu.Unlock()
+	command, commandValid := parsePipelineCommand(event.Comment.Body)
+	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 && commandValid && command.name == "mark-pipeline-gate"
+	// A slow permission lookup must not hold up other webhook handlers.
+	if !matchesDispatched {
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+	}
 	if event.Action == github.IssueCommentActionCreated && event.Issue.IsPullRequest() && pipelineHelpRE.MatchString(normalizePipelineComment(event.Comment.Body)) {
 		if cw.agentic != nil && cw.agentic.trustedChai(event.Comment.User.Login) {
 			cw.agentic.handleIssueComment(l, event)
@@ -396,8 +406,6 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	matchesRequired := pipelineRequiredRegex.MatchString(event.Comment.Body)
 	matchesRemaining := pipelineRemainingRegex.MatchString(event.Comment.Body)
 	matchesAuto := pipelineAutoRegex.MatchString(event.Comment.Body)
-	command, commandValid := parsePipelineCommand(event.Comment.Body)
-	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 && commandValid && command.name == "mark-pipeline-gate"
 	matchesMode := event.Action == github.IssueCommentActionCreated && commandValid && (command.name == "agentic-mode" || command.name == "skip-agentic-mode")
 
 	if !matchesRequired && !matchesRemaining && !matchesAuto && !matchesDispatched && !matchesMode {
@@ -496,13 +504,39 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			}
 			return
 		}
-		trusted, err := trustedPipelineCommandAuthor(cw.checks.gh, org, repo, event.Comment.User.Login)
-		if err != nil || !trusted || pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" {
-			if err != nil {
-				logger.WithError(err).Error("failed to authorize dispatch override")
-			}
+		if pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" {
 			return
 		}
+		allowed, err := cw.checks.authorizeMarkGate(org, repo, event.Comment.User.Login, pr.Base.Ref)
+		if err != nil {
+			logger.WithError(err).Error("Failed to authorize pipeline gate command")
+			return
+		}
+		if !allowed {
+			return
+		}
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+		// Do not apply an authorization for a revision that changed during the lookup.
+		latest, err := cw.ghc.GetPullRequest(org, repo, number)
+		if err != nil {
+			logger.WithError(err).Error("Failed to verify PR after pipeline gate authorization")
+			return
+		}
+		if latest.State != github.PullRequestStateOpen || latest.Base.Ref != pr.Base.Ref || latest.Head.SHA != pr.Head.SHA {
+			logger.Info("PR changed during pipeline gate authorization; ignoring command")
+			return
+		}
+		pr = latest
+		cfg, enrolled := cw.watcher.getConfig()[org][repo]
+		if !enrolled {
+			cfg, enrolled = cw.lgtmWatcher.getConfig()[org][repo]
+			cfg.Trigger = "lgtm"
+		}
+		if !enrolled || !isBranchEnabled(cfg.Branches, pr.Base.Ref) || cfg.Agentic.enabled() {
+			return
+		}
+		cfg.ProgressComment = cfg.ProgressComment && !pr.Draft
 		if command.head != "" && command.head != pr.Head.SHA {
 			if err := cw.ghc.CreateComment(org, repo, number, fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA)); err != nil {
 				logger.WithError(err).Error("failed to explain outdated completion command")
@@ -514,9 +548,9 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			logger.WithError(err).Error("failed to mark pipeline gate")
 			return
 		}
-		v := waitingProgress(progressCfg, pr, false)
+		v := waitingProgress(cfg, pr, false)
 		v.phase = progressMarked
-		cw.progress.submitProgress(progressCfg, refs, v, false, false)
+		cw.progress.submitProgress(cfg, refs, v, false, false)
 		return
 	}
 
@@ -967,7 +1001,10 @@ func main() {
 	}
 	var checks *dispatchChecks
 	if appID > 0 {
-		checks = &dispatchChecks{gh: githubClient, appID: appID}
+		checks = &dispatchChecks{gh: githubClient, appID: appID, authorization: gateAuthorization{
+			allowedUsers: o.gateAuthorization.parsedAllowedUsers, pluginConfigPath: o.gateAuthorization.pluginConfigPath,
+			owners: githubClient, prowConfig: cfg,
+		}}
 	}
 	reconciler.checks = checks
 	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), configDataProvider: configDataProvider, checks: checks,

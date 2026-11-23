@@ -25,11 +25,12 @@ Empty retries leave successful checks unchanged. No additional flags, storage
 or startup scan are needed for traditional mode.
 
 `/pipeline help` lists all commands with short descriptions.
-`/pipeline mark-pipeline-gate [<HEAD>]` makes `ci/pipeline-gate` green, including
-an existing running gate. Organization members and repository collaborators can
-also create a missing successful gate for older PRs on enrolled branches.
-Configured Chai in agentic mode can only complete an existing active readiness gate,
-subject to its response timing and revision ownership checks.
+`/pipeline mark-pipeline-gate [<HEAD>]` marks `ci/pipeline-gate` green. Repository
+admins qualify; `--plugin-config` enables Prow's configured `/override` teams and
+top-level OWNERS rules. `--mark-pipeline-gate-allowed-users` adds a comma-separated
+list of GitHub logins (default `redhat-chai-bot` only; empty disables it).
+Authorized users can backfill a missing gate, except configured Chai authors in
+agentic mode, who must complete an active readiness gate.
 A supplied full HEAD SHA must match the current PR HEAD; without it, the command
 targets the current HEAD when processed. It does not run tests or override their results.
 A new push starts a fresh pipeline.
@@ -285,6 +286,7 @@ Enable Chai in the main or LGTM enrollment configuration:
 
 Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 (repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
+Custom Chai logins also need separate gate-marking permission.
 
 1. In automatic mode, applicable first-stage tests pass in the shared ProwJob cache
    (including overrides; jobs pruned by sinker are verified from their commit
