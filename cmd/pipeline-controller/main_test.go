@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 
@@ -53,6 +54,49 @@ func TestPullRequestNotificationIsUniversal(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestDraftOpeningNotification verifies that a draft gets help without starting a Chai handoff.
+func TestDraftOpeningNotification(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		traditional bool
+		stale       bool
+		want        []github.IssueComment
+	}{
+		{name: "Chai draft", want: []github.IssueComment{{Body: pullRequestInfoComment}}},
+		{name: "traditional draft", traditional: true, want: []github.IssueComment{{Body: pullRequestInfoComment}}},
+		{name: "stale Chai draft opening", stale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "auto")
+			mode := &f.a.watcher.config.Orgs[0].Repos[0].Mode
+			mode.ProgressComment = true
+			if tc.traditional {
+				mode.Agentic = AgenticConfig{}
+			}
+			f.gh.pr.Draft = true
+			event := github.PullRequestEvent{Action: github.PullRequestActionOpened, Repo: f.gh.pr.Base.Repo, PullRequest: f.gh.pr}
+			if tc.stale {
+				event.PullRequest.Head.SHA = strings.Repeat("b", 40)
+			}
+			cw := &clientWrapper{
+				ghc: f.gh, agentic: f.a, watcher: f.a.watcher, lgtmWatcher: f.a.lgtmWatcher,
+				configDataProvider: f.a.configDataProvider, progress: newProgressPublisher(&progressCommentFake{}, f.a.logger),
+			}
+			cw.handlePullRequestCreation(f.a.logger, event)
+			f.passFirstStage()
+			if err := f.a.reconcilePull(t.Context(), f.work, nil); err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.want, f.gh.comments); diff != "" {
+				t.Errorf("unexpected draft notifications (-want +got):\n%s", diff)
+			}
+			if f.gh.checkAttempts != 0 || f.gh.statusWrites != 0 {
+				t.Error("draft notification must not start scheduling")
+			}
+		})
 	}
 }
 

@@ -220,7 +220,7 @@ func (cw *clientWrapper) handlePullRequestCreation(l *logrus.Entry, event github
 	body := pullRequestInfoComment
 	progressCfg := pipelineBranchConfig(cw.watcher, cw.lgtmWatcher, org, repo, baseBranch)
 	pr := &event.PullRequest
-	if cw.progress != nil && progressCfg.ProgressComment && pr.Head.SHA != "" {
+	if cw.progress != nil && progressCfg.ProgressComment && pr.Head.SHA != "" && !pr.Draft {
 		chai := progressCfg.Agentic.enabled() && !hasAgenticLabel(pr, agenticSkipLabel)
 		body = renderProgress(pullRefs(org, repo, pr), waitingProgress(progressCfg, pr, chai))
 	}
