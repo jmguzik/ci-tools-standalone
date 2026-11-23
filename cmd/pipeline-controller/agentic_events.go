@@ -15,7 +15,7 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 		return nil
 	}
 	chai := a.trustedChai(comment.User.Login)
-	if !chai || command.name != "mark-pipeline-gate" {
+	if command.name != "mark-pipeline-gate" {
 		trusted, err := trustedPipelineCommandAuthor(a.gh, work.org, work.repo, comment.User.Login)
 		if err != nil || !trusted {
 			return err
@@ -104,6 +104,9 @@ func (a *agenticController) applyCommand(work agenticWork, s *agenticState, pr *
 			}
 		}
 	case "mark-pipeline-gate":
+		if !a.checks.authorizeMarkGate(a.logger, work.org, work.repo, comment.User.Login, pr.Base.Ref) {
+			return nil
+		}
 		if chai && s.traditionalMode() {
 			reply("Agentic command rejected: traditional scheduling owns this revision. Do not start agentic dispatch unless agentic mode is restored.")
 			break

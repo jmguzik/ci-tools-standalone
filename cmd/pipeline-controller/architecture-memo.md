@@ -32,7 +32,8 @@ agentic mode. Chai owns second-stage execution unless a response timeout or
   contexts block merging before marking the gate; success does not mean
   tests passed. Pipeline-controller neither reads plans nor verifies job lists.
 - `/pipeline mark-pipeline-gate [<HEAD>]` completes the active check, including
-  running checks. Trusted organization members and repository collaborators may
+  running checks. Authorization follows Prow's `/override` rules, plus the
+  controller's allowlist (`redhat-chai-bot` by default). Authorized users may
   also create a missing completed/success gate for older enrolled PRs. Agentic
   completion persists with agentic ownership and suppresses fresh readiness or
   timeout fallback for that revision, including after restart. Marking neither

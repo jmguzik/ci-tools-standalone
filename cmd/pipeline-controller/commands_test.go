@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"strings"
 	"testing"
 
@@ -83,17 +84,30 @@ func TestAgenticModeCRLFCommentEvents(t *testing.T) {
 	}
 }
 
+// TestTraditionalMarkPipelineGate constrains gate mutation to authorized commands on the current PR.
 func TestTraditionalMarkPipelineGate(t *testing.T) {
-	for _, scenario := range []string{"member", "collaborator", "untrusted", "stale-head", "explicit-head", "missing-gate", "disabled", "edited", "suffix", "multiple", "no-app", "write-error"} {
+	for _, scenario := range []string{"admin", "member", "collaborator", "untrusted", "stale-head", "explicit-head", "missing-gate", "disabled", "edited", "suffix", "multiple", "no-app", "write-error", "allowlisted", "default-replaced", "replacement-user", "allowlist-disabled", "closed"} {
 		t.Run(scenario, func(t *testing.T) {
 			refs := makeTriggerPJ(strings.Repeat("a", 40)).Spec.Refs
 			foreign := traditionalCheck(refs, "completed", "success", "another app")
 			foreign.ID, foreign.App.ID = 900, 202
-			gh := &fakeAgenticGitHub{member: true, checks: []github.CheckRun{foreign},
+			gh := &fakeAgenticGitHub{repoPermission: github.RoleAdmin, checks: []github.CheckRun{foreign},
 				pr: github.PullRequest{Number: refs.Pulls[0].Number, State: github.PullRequestStateOpen,
 					Head: github.PullRequestBranch{SHA: refs.Pulls[0].SHA},
 					Base: github.PullRequestBranch{Ref: refs.BaseRef, Repo: github.Repo{Name: refs.Repo, Owner: github.User{Login: refs.Org}}}}}
-			checks := &dispatchChecks{gh: gh, appID: 101}
+			var options gateAuthorizationOptions
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			options.addFlags(fs)
+			var args []string
+			switch scenario {
+			case "default-replaced", "replacement-user":
+				args = []string{"--mark-pipeline-gate-allowed-users=other-user"}
+			case "allowlist-disabled":
+				args = []string{"--mark-pipeline-gate-allowed-users="}
+			}
+			require.NoError(t, fs.Parse(args))
+			require.NoError(t, options.validate())
+			checks := &dispatchChecks{gh: gh, appID: 101, authorization: gateAuthorization{allowedUsers: options.parsedAllowedUsers}}
 			if scenario != "missing-gate" {
 				require.NoError(t, checks.pending(refs))
 			}
@@ -103,10 +117,20 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 				Issue:   github.Issue{Number: gh.pr.Number, PullRequest: &struct{}{}},
 				Comment: github.IssueComment{ID: 500, Body: "/pipeline mark-pipeline-gate", User: github.User{Login: "maintainer"}}}
 			switch scenario {
+			case "member":
+				gh.member, gh.repoPermission = true, "read"
 			case "collaborator":
-				gh.member, gh.collaborator = false, true
+				gh.collaborator, gh.repoPermission = true, "write"
 			case "untrusted":
-				gh.member = false
+				gh.repoPermission = ""
+			case "allowlisted", "default-replaced", "allowlist-disabled":
+				gh.repoPermission = ""
+				event.Comment.User.Login = "RedHat-Chai-Bot"
+			case "replacement-user":
+				gh.repoPermission = ""
+				event.Comment.User.Login = "other-user"
+			case "closed":
+				gh.pr.State = github.PullRequestStateClosed
 			case "stale-head":
 				event.Comment.Body += " " + strings.Repeat("b", 40)
 			case "explicit-head":
@@ -127,7 +151,7 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 			cw.handleIssueComment(logrus.NewEntry(logrus.New()), event)
 			require.Equal(t, foreign, gh.checks[0])
 			switch scenario {
-			case "member", "collaborator", "explicit-head", "missing-gate":
+			case "admin", "allowlisted", "replacement-user", "explicit-head", "missing-gate":
 				require.Len(t, gh.checks, 2)
 				require.Equal(t, traditionalCheckTitle, gh.checks[1].Output.Title)
 				require.Equal(t, pipelineExternalID(refs), gh.checks[1].ExternalID)

@@ -62,10 +62,14 @@ type options struct {
 	dryrun                   bool
 	webhookSecretFile        string
 	agentic                  agenticOptions
+	gateAuthorization        gateAuthorizationOptions
 }
 
 func (o *options) validate() error {
 	if err := o.agentic.validate(); err != nil {
+		return err
+	}
+	if err := o.gateAuthorization.validate(); err != nil {
 		return err
 	}
 	for _, opt := range []interface{ Validate(bool) error }{&o.client, &o.config} {
@@ -83,6 +87,7 @@ func (o *options) parseArgs(fs *flag.FlagSet, args []string) error {
 	fs.StringVar(&o.lgtmConfigFile, "lgtm-config-file", "", "Config file with list of enabled orgs and repos with second stage triggered by lgtm label.")
 	fs.StringVar(&o.webhookSecretFile, "hmac-secret-file", "/etc/webhook/hmac", "Path to the file containing the GitHub HMAC secret.")
 	o.agentic.addFlags(fs)
+	o.gateAuthorization.addFlags(fs)
 
 	o.config.AddFlags(fs)
 	o.github.AddFlags(fs)
@@ -496,11 +501,8 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			}
 			return
 		}
-		trusted, err := trustedPipelineCommandAuthor(cw.checks.gh, org, repo, event.Comment.User.Login)
-		if err != nil || !trusted || pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" {
-			if err != nil {
-				logger.WithError(err).Error("failed to authorize dispatch override")
-			}
+		if pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" ||
+			!cw.checks.authorizeMarkGate(logger, org, repo, event.Comment.User.Login, pr.Base.Ref) {
 			return
 		}
 		if command.head != "" && command.head != pr.Head.SHA {
@@ -894,6 +896,10 @@ func main() {
 	if err != nil {
 		logger.WithError(err).Fatal("error getting GitHub client")
 	}
+	gatePolicy, err := o.newGateAuthorization(githubClient, cfg)
+	if err != nil {
+		logger.WithError(err).Fatal("failed to configure pipeline gate authorization")
+	}
 
 	watcher := newWatcher(o.configFile, logger)
 	if err := watcher.reloadConfig(); err != nil {
@@ -967,7 +973,7 @@ func main() {
 	}
 	var checks *dispatchChecks
 	if appID > 0 {
-		checks = &dispatchChecks{gh: githubClient, appID: appID}
+		checks = &dispatchChecks{gh: githubClient, appID: appID, authorization: gatePolicy}
 	}
 	reconciler.checks = checks
 	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), configDataProvider: configDataProvider, checks: checks,

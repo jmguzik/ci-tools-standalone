@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ type fakeAgenticGitHub struct {
 	changes               []github.PullRequestChange
 	member                bool
 	collaborator          bool
+	repoPermission        string
 	statusWrites          int
 	statusUpdates         []github.Status
 	failStatus            bool
@@ -176,6 +178,19 @@ func (f *fakeAgenticGitHub) IsCollaborator(_, _, _ string) (bool, error) {
 	return f.collaborator, nil
 }
 
+// HasPermission keeps repository roles independent of general command trust.
+func (f *fakeAgenticGitHub) HasPermission(_, _, _ string, roles ...string) (bool, error) {
+	return f.repoPermission != "" && slices.Contains(roles, f.repoPermission), nil
+}
+
+// ListTeams returns no teams unless the test uses a team-aware fake.
+func (f *fakeAgenticGitHub) ListTeams(_ string) ([]github.Team, error) { return nil, nil }
+
+// ListTeamMembersBySlug returns no members unless the test uses a team-aware fake.
+func (f *fakeAgenticGitHub) ListTeamMembersBySlug(_, _, _ string) ([]github.TeamMember, error) {
+	return nil, nil
+}
+
 type agenticFixture struct {
 	a    *agenticController
 	gh   *fakeAgenticGitHub
@@ -187,7 +202,7 @@ type agenticFixture struct {
 func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	t.Helper()
 	f := &agenticFixture{now: time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC), work: agenticWork{org: "org", repo: "repo", number: 42}}
-	f.gh = &fakeAgenticGitHub{member: true, pr: github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
+	f.gh = &fakeAgenticGitHub{member: true, repoPermission: github.RoleAdmin, pr: github.PullRequest{Number: 42, State: github.PullRequestStateOpen,
 		Head: github.PullRequestBranch{SHA: strings.Repeat("a", 40)},
 		Base: github.PullRequestBranch{Ref: "main", Repo: github.Repo{Name: "repo", Owner: github.User{Login: "org"}}}}}
 	static := []config.Presubmit{
@@ -210,7 +225,8 @@ func newAgenticFixture(t *testing.T, mode string) *agenticFixture {
 	logger := logrus.NewEntry(logrus.New())
 	f.a = &agenticController{gh: f.gh, reader: newFakePJLister(), watcher: w, lgtmWatcher: lgtm, logger: logger,
 		configDataProvider: NewConfigDataProvider(func() *config.Config { return f.cfg }, func() []string { return []string{"org/repo"} }, logger),
-		checks:             &dispatchChecks{gh: f.gh, appID: 101}, appID: 101, now: func() time.Time { return f.now },
+		checks:             &dispatchChecks{gh: f.gh, appID: 101, authorization: gateAuthorization{allowedUsers: []string{"chai[bot]", "redhat-chai-bot"}}},
+		appID:              101, now: func() time.Time { return f.now },
 		options: agenticOptions{timeout: defaultAgenticTimeout, trustedAuthors: flagutil.NewStrings("chai[bot]")}}
 	return f
 }
@@ -235,6 +251,38 @@ func (f *agenticFixture) reconcile(t *testing.T, comment *github.IssueComment) {
 }
 
 func (f *agenticFixture) state() *agenticState { return f.a.states[f.work] }
+
+// TestAgenticGateAllowlistDoesNotAuthorizeOtherCommands checks that the extra permission is gate-only.
+func TestAgenticGateAllowlistDoesNotAuthorizeOtherCommands(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trigger string
+	}{
+		{name: "required", trigger: "manual"},
+		{name: "remaining", trigger: "manual"},
+		{name: "skip-agentic-mode", trigger: "manual"},
+		{name: "agentic-mode", trigger: "manual"},
+		{name: "auto", trigger: "lgtm"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, tc.trigger)
+			f.gh.member, f.gh.repoPermission = false, ""
+			if tc.name == "agentic-mode" {
+				f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
+			}
+			f.reconcile(t, nil)
+			before := slices.Clone(f.gh.checks)
+			command := f.command(100, tc.name)
+			command.User.Login = "redhat-chai-bot"
+			f.reconcile(t, command)
+			require.Equal(t, before, f.gh.checks)
+			require.Empty(t, f.gh.comments)
+			require.Zero(t, f.state().lastCommand)
+			require.False(t, hasAgenticLabel(&f.gh.pr, PipelineAutoLabel))
+			require.Equal(t, tc.name == "agentic-mode", hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
+		})
+	}
+}
 
 // TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage covers both arrival orders of the readiness prerequisites.
 func TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage(t *testing.T) {
@@ -574,7 +622,7 @@ func TestAgenticReadinessAndCompletion(t *testing.T) {
 			require.Zero(t, f.gh.statusWrites, "agentic handoff must not publish job contexts")
 			mark := f.command(200, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
 			mark.User = ack.User
-			f.gh.member = false // Configured Chai need not be an organization member.
+			f.gh.member, f.gh.repoPermission = false, "" // Allowlisted Chai need not be a repo admin.
 			f.reconcile(t, mark)
 			require.Equal(t, "success", f.gh.checks[0].Conclusion)
 			require.Len(t, f.gh.checks, 1)
@@ -1188,7 +1236,7 @@ func TestAgenticFallbackHumanMarkDoesNotDispatch(t *testing.T) {
 }
 
 func TestAgenticCommandRevisionAndTrust(t *testing.T) {
-	for _, scenario := range []string{"foreign-head", "untrusted", "early", "optional-head", "explicit-head"} {
+	for _, scenario := range []string{"foreign-head", "untrusted", "chai-not-allowlisted", "early", "optional-head", "explicit-head"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newAgenticFixture(t, "auto")
 			if scenario != "early" {
@@ -1200,7 +1248,11 @@ func TestAgenticCommandRevisionAndTrust(t *testing.T) {
 			case "foreign-head":
 				command.Body += " " + strings.Repeat("b", 40)
 			case "untrusted":
-				f.gh.member = false
+				f.gh.repoPermission = "write"
+			case "chai-not-allowlisted":
+				f.gh.repoPermission = ""
+				command.User.Login = "chai[bot]"
+				f.a.checks.authorization.allowedUsers = nil
 			case "explicit-head":
 				command.Body += " " + f.gh.pr.Head.SHA
 			}
@@ -1208,6 +1260,9 @@ func TestAgenticCommandRevisionAndTrust(t *testing.T) {
 			switch scenario {
 			case "early", "optional-head", "explicit-head":
 				require.Equal(t, "success", f.gh.checks[0].Conclusion)
+			case "chai-not-allowlisted":
+				require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
+				require.True(t, f.state().waitingUntil.IsZero(), "the comment is still a Chai response")
 			default:
 				require.NotEqual(t, "success", f.gh.checks[0].Conclusion)
 				require.False(t, f.state().waitingUntil.IsZero())
@@ -1433,11 +1488,11 @@ func TestAgenticRetiredGateCannotAuthorizeChaiReadinessAfterRestart(t *testing.T
 
 func TestAgenticHumanMarkMissingOrRunningGate(t *testing.T) {
 	for _, mode := range []string{"auto", "manual", "lgtm"} {
-		for _, scenario := range []string{"missing-member", "missing-collaborator", "running", "missing-traditional", "lost-create-response"} {
+		for _, scenario := range []string{"missing-admin", "missing-allowlisted-user", "running", "missing-traditional", "lost-create-response"} {
 			t.Run(mode+"/"+scenario, func(t *testing.T) {
 				f := newAgenticFixture(t, mode)
-				if scenario == "missing-collaborator" {
-					f.gh.member, f.gh.collaborator = false, true
+				if scenario == "missing-allowlisted-user" {
+					f.gh.member, f.gh.repoPermission = false, ""
 				}
 				if scenario == "running" {
 					gate := traditionalCheck(pullRefs(f.work.org, f.work.repo, &f.gh.pr), "in_progress", "", "dispatching")
@@ -1449,6 +1504,9 @@ func TestAgenticHumanMarkMissingOrRunningGate(t *testing.T) {
 					f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
 				}
 				command := f.command(100, "mark-pipeline-gate "+f.gh.pr.Head.SHA)
+				if scenario == "missing-allowlisted-user" {
+					command.User.Login = "redhat-chai-bot"
+				}
 				if scenario == "lost-create-response" {
 					f.gh.failCheckAfterCreate = true
 					require.Error(t, f.a.reconcilePull(context.Background(), f.work, command))
@@ -1489,11 +1547,11 @@ func TestAgenticMissingGateMarkRequiresTrustedHuman(t *testing.T) {
 			command := f.command(100, "mark-pipeline-gate")
 			switch scenario {
 			case "untrusted":
-				f.gh.member = false
+				f.gh.repoPermission = "write"
 			case "stale-head":
 				command.Body += " " + strings.Repeat("b", 40)
 			case "chai", "chai-stale-memory":
-				command.User.Login, f.gh.member = "chai[bot]", false
+				command.User.Login, f.gh.member, f.gh.repoPermission = "chai[bot]", false, ""
 				if scenario == "chai-stale-memory" {
 					f.state().ready = true
 				}
@@ -1534,7 +1592,7 @@ func TestAgenticChaiCannotMarkChangedGateWithStaleReadiness(t *testing.T) {
 			gate := f.gh.checks[0]
 			attempts := f.gh.checkAttempts
 			mark := f.command(100, "mark-pipeline-gate")
-			mark.User.Login, f.gh.member = "chai[bot]", false
+			mark.User.Login, f.gh.member, f.gh.repoPermission = "chai[bot]", false, ""
 			require.Error(t, f.a.reconcilePull(context.Background(), f.work, mark))
 			require.Equal(t, attempts, f.gh.checkAttempts)
 			require.Equal(t, []github.CheckRun{gate}, f.gh.checks)

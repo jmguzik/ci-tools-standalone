@@ -19,7 +19,7 @@ type agenticOptions struct {
 
 func (o *agenticOptions) addFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&o.timeout, "agentic-timeout", defaultAgenticTimeout, "Time to wait for any Chai comment after publishing readiness before traditional dispatch.")
-	fs.Var(&o.trustedAuthors, "agentic-trusted-author", "Exact GitHub login whose comments cancel the agentic response timeout and may mark its gate. Repeat for multiple authors; no default.")
+	fs.Var(&o.trustedAuthors, "agentic-trusted-author", "Exact GitHub login whose comments cancel the agentic response timeout. Marking the gate requires separate authorization. Repeat for multiple authors; no default.")
 }
 
 func (o *agenticOptions) validate() error {
