@@ -84,9 +84,26 @@ func TestAgenticModeCRLFCommentEvents(t *testing.T) {
 	}
 }
 
+// gatePermissionProbe verifies the handler lock is available during permission lookup.
+type gatePermissionProbe struct {
+	*fakeAgenticGitHub
+	t      *testing.T
+	cw     *clientWrapper
+	repush bool
+}
+
+func (g gatePermissionProbe) HasPermission(org, repo, user string, roles ...string) (bool, error) {
+	require.True(g.t, g.cw.mu.TryLock(), "permission lookups must not hold the webhook lock")
+	defer g.cw.mu.Unlock()
+	if g.repush {
+		g.pr.Head.SHA = strings.Repeat("b", 40)
+	}
+	return g.fakeAgenticGitHub.HasPermission(org, repo, user, roles...)
+}
+
 // TestTraditionalMarkPipelineGate constrains gate mutation to authorized commands on the current PR.
 func TestTraditionalMarkPipelineGate(t *testing.T) {
-	for _, scenario := range []string{"admin", "member", "collaborator", "untrusted", "stale-head", "explicit-head", "missing-gate", "disabled", "edited", "suffix", "multiple", "no-app", "write-error", "allowlisted"} {
+	for _, scenario := range []string{"admin", "member", "collaborator", "untrusted", "stale-head", "explicit-head", "missing-gate", "disabled", "edited", "suffix", "multiple", "no-app", "write-error", "allowlisted", "repush-during-authorization"} {
 		t.Run(scenario, func(t *testing.T) {
 			refs := makeTriggerPJ(strings.Repeat("a", 40)).Spec.Refs
 			foreign := traditionalCheck(refs, "completed", "success", "another app")
@@ -104,6 +121,7 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 			}
 			cw := &clientWrapper{ghc: gh, checks: checks, watcher: &watcher{config: mustEnabledConfig(t)}, lgtmWatcher: &watcher{},
 				configDataProvider: &ConfigDataProvider{updatedPresubmits: map[string]presubmitTests{}}}
+			checks.gh = gatePermissionProbe{fakeAgenticGitHub: gh, t: t, cw: cw, repush: scenario == "repush-during-authorization"}
 			event := github.IssueCommentEvent{Action: github.IssueCommentActionCreated, Repo: gh.pr.Base.Repo,
 				Issue:   github.Issue{Number: gh.pr.Number, PullRequest: &struct{}{}},
 				Comment: github.IssueComment{ID: 500, Body: "/pipeline mark-pipeline-gate", User: github.User{Login: "maintainer"}}}
@@ -146,6 +164,7 @@ func TestTraditionalMarkPipelineGate(t *testing.T) {
 				require.Equal(t, "success", gh.checks[1].Conclusion)
 				require.Contains(t, gh.checks[1].Output.Summary, "comment 500")
 			default:
+				require.Len(t, gh.checks, 2, "a rejected command must not create a check")
 				require.NotEqual(t, "success", gh.checks[1].Conclusion)
 			}
 			require.Zero(t, gh.statusWrites)

@@ -363,8 +363,13 @@ func (cw *clientWrapper) handleLabelAddition(l *logrus.Entry, event github.PullR
 }
 
 func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueCommentEvent) {
-	cw.mu.Lock()
-	defer cw.mu.Unlock()
+	command, commandValid := parsePipelineCommand(event.Comment.Body)
+	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 && commandValid && command.name == "mark-pipeline-gate"
+	// A slow permission lookup must not hold up other webhook handlers.
+	if !matchesDispatched {
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+	}
 	if event.Action == github.IssueCommentActionCreated && event.Issue.IsPullRequest() && pipelineHelpRE.MatchString(normalizePipelineComment(event.Comment.Body)) {
 		if cw.agentic != nil && cw.agentic.trustedChai(event.Comment.User.Login) {
 			cw.agentic.handleIssueComment(l, event)
@@ -401,8 +406,6 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 	matchesRequired := pipelineRequiredRegex.MatchString(event.Comment.Body)
 	matchesRemaining := pipelineRemainingRegex.MatchString(event.Comment.Body)
 	matchesAuto := pipelineAutoRegex.MatchString(event.Comment.Body)
-	command, commandValid := parsePipelineCommand(event.Comment.Body)
-	matchesDispatched := event.Action == github.IssueCommentActionCreated && event.Comment.ID > 0 && commandValid && command.name == "mark-pipeline-gate"
 	matchesMode := event.Action == github.IssueCommentActionCreated && commandValid && (command.name == "agentic-mode" || command.name == "skip-agentic-mode")
 
 	if !matchesRequired && !matchesRemaining && !matchesAuto && !matchesDispatched && !matchesMode {
@@ -512,6 +515,28 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 		if !allowed {
 			return
 		}
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+		// Do not apply an authorization for a revision that changed during the lookup.
+		latest, err := cw.ghc.GetPullRequest(org, repo, number)
+		if err != nil {
+			logger.WithError(err).Error("Failed to verify PR after pipeline gate authorization")
+			return
+		}
+		if latest.State != github.PullRequestStateOpen || latest.Base.Ref != pr.Base.Ref || latest.Head.SHA != pr.Head.SHA {
+			logger.Info("PR changed during pipeline gate authorization; ignoring command")
+			return
+		}
+		pr = latest
+		cfg, enrolled := cw.watcher.getConfig()[org][repo]
+		if !enrolled {
+			cfg, enrolled = cw.lgtmWatcher.getConfig()[org][repo]
+			cfg.Trigger = "lgtm"
+		}
+		if !enrolled || !isBranchEnabled(cfg.Branches, pr.Base.Ref) || cfg.Agentic.enabled() {
+			return
+		}
+		cfg.ProgressComment = cfg.ProgressComment && !pr.Draft
 		if command.head != "" && command.head != pr.Head.SHA {
 			if err := cw.ghc.CreateComment(org, repo, number, fmt.Sprintf("Command rejected: HEAD `%s` is not the current PR HEAD `%s`.", command.head, pr.Head.SHA)); err != nil {
 				logger.WithError(err).Error("failed to explain outdated completion command")
@@ -523,9 +548,9 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			logger.WithError(err).Error("failed to mark pipeline gate")
 			return
 		}
-		v := waitingProgress(progressCfg, pr, false)
+		v := waitingProgress(cfg, pr, false)
 		v.phase = progressMarked
-		cw.progress.submitProgress(progressCfg, refs, v, false, false)
+		cw.progress.submitProgress(cfg, refs, v, false, false)
 		return
 	}
 
