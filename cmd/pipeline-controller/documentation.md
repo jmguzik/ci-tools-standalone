@@ -25,28 +25,12 @@ Empty retries leave successful checks unchanged. No additional flags, storage
 or startup scan are needed for traditional mode.
 
 `/pipeline help` lists all commands with short descriptions.
-`/pipeline mark-pipeline-gate [<HEAD>]` makes `ci/pipeline-gate` green, including
-an existing running gate. It follows Prow's `/override` authorization: repository
-admins, members of configured GitHub teams, and top-level OWNERS approvers if
-enabled. Point `--plugin-config` at the same Prow `plugins.yaml` to pick up its
-`override.allowed_github_teams` and `override.allow_top_level_owners` settings;
-without it, only the repository-admin rule and the extra allowlist apply.
-Organization membership or repository collaboration alone is not enough.
-The controller's GitHub App needs organization Members read access to check team
-membership, and repository Contents read access to load OWNERS from the PR's
-base branch. If the plugin config cannot be read, only the admin rule and
-extra allowlist apply. OWNERS authorization uses the resolved base commit and
-requires a successful collaborator check unless Prow disables that check for
-the repository. Only one OWNERS lookup runs at a time. A command waits at most
-10 seconds for it, and can be retried after the lookup finishes.
-
-`--mark-pipeline-gate-allowed-users` also grants permission to the GitHub logins
-in a comma-separated list. It defaults to `redhat-chai-bot` only; an explicit
-list replaces that default, and an empty value disables the extra allowlist.
-An authorized user can also create a missing successful gate for an older PR on
-an enrolled branch. In agentic mode, configured Chai authors can only complete
-an existing active readiness gate, subject to response timing and revision
-ownership checks.
+`/pipeline mark-pipeline-gate [<HEAD>]` marks `ci/pipeline-gate` green. Repository
+admins qualify; `--plugin-config` enables Prow's configured `/override` teams and
+top-level OWNERS rules. `--mark-pipeline-gate-allowed-users` adds a comma-separated
+list of GitHub logins (default `redhat-chai-bot` only; empty disables it).
+Authorized users can backfill a missing gate, except configured Chai authors in
+agentic mode, who must complete an active readiness gate.
 A supplied full HEAD SHA must match the current PR HEAD; without it, the command
 targets the current HEAD when processed. It does not run tests or override their results.
 A new push starts a fresh pipeline.
@@ -302,10 +286,7 @@ Enable Chai in the main or LGTM enrollment configuration:
 
 Requires GitHub App authentication, `--agentic-trusted-author=<chai-login>`
 (repeatable) and optional `--agentic-timeout=20m`. There is no storage requirement.
-`--agentic-trusted-author` identifies Chai's handoff comments; it does not grant
-permission to mark the gate. Include custom Chai logins in
-`--mark-pipeline-gate-allowed-users` unless they already qualify under the
-`/override` rules.
+Custom Chai logins also need separate gate-marking permission.
 
 1. In automatic mode, applicable first-stage tests pass in the shared ProwJob cache
    (including overrides; jobs pruned by sinker are verified from their commit

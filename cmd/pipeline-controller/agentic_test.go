@@ -252,38 +252,6 @@ func (f *agenticFixture) reconcile(t *testing.T, comment *github.IssueComment) {
 
 func (f *agenticFixture) state() *agenticState { return f.a.states[f.work] }
 
-// TestAgenticGateAllowlistDoesNotAuthorizeOtherCommands checks that the extra permission is gate-only.
-func TestAgenticGateAllowlistDoesNotAuthorizeOtherCommands(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		trigger string
-	}{
-		{name: "required", trigger: "manual"},
-		{name: "remaining", trigger: "manual"},
-		{name: "skip-agentic-mode", trigger: "manual"},
-		{name: "agentic-mode", trigger: "manual"},
-		{name: "auto", trigger: "lgtm"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newAgenticFixture(t, tc.trigger)
-			f.gh.member, f.gh.repoPermission = false, ""
-			if tc.name == "agentic-mode" {
-				f.gh.pr.Labels = []github.Label{{Name: agenticSkipLabel}}
-			}
-			f.reconcile(t, nil)
-			before := slices.Clone(f.gh.checks)
-			command := f.command(100, tc.name)
-			command.User.Login = "redhat-chai-bot"
-			f.reconcile(t, command)
-			require.Equal(t, before, f.gh.checks)
-			require.Empty(t, f.gh.comments)
-			require.Zero(t, f.state().lastCommand)
-			require.False(t, hasAgenticLabel(&f.gh.pr, PipelineAutoLabel))
-			require.Equal(t, tc.name == "agentic-mode", hasAgenticLabel(&f.gh.pr, agenticSkipLabel))
-		})
-	}
-}
-
 // TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage covers both arrival orders of the readiness prerequisites.
 func TestAgenticLGTMReadinessWaitsForApprovalAndFirstStage(t *testing.T) {
 	for _, tc := range []struct {

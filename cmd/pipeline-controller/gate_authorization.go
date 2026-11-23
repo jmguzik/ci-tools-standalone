@@ -1,211 +1,73 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/shurcooL/githubv4"
 	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/prow/pkg/config"
-	git "sigs.k8s.io/prow/pkg/git/v2"
 	"sigs.k8s.io/prow/pkg/github"
 	"sigs.k8s.io/prow/pkg/plugins"
-	"sigs.k8s.io/prow/pkg/plugins/ownersconfig"
 	"sigs.k8s.io/prow/pkg/repoowners"
 )
 
-// defaultGateAllowedUser is the only login allowed without Prow override permissions by default.
-const defaultGateAllowedUser = "redhat-chai-bot"
+// gateLoginRE matches exact GitHub user and App bot logins.
+var gateLoginRE = regexp.MustCompile(`(?i)^[a-z0-9]+(-[a-z0-9]+)*(\[bot\])?$`)
 
-// gateOwnersWait bounds the time a shared command handler can wait on Prow's uncancellable Git operations.
-const gateOwnersWait = 10 * time.Second
+// gateCommitRE prevents interpreting a base commit ID as a ref or revision expression.
+var gateCommitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// gateLoginRE accepts GitHub usernames and exact GitHub App bot logins.
-var gateLoginRE = regexp.MustCompile(`^[A-Za-z0-9]+(-[A-Za-z0-9]+)*(\[[Bb][Oo][Tt]\])?$`)
-
-// gateCommitSHARe restricts Git operations to a full GitHub commit ID, not a ref or option.
-var gateCommitSHARe = regexp.MustCompile(`^[0-9a-f]{40}$`)
-
-// gateAuthorizationOptions configures the gate command independently of agentic author trust.
+// gateAuthorizationOptions configures exceptions and optional Prow policy for this command only.
 type gateAuthorizationOptions struct {
 	allowedUsers       string
-	pluginConfigPath   string
 	parsedAllowedUsers []string
+	pluginConfigPath   string
 }
 
 func (o *gateAuthorizationOptions) addFlags(fs *flag.FlagSet) {
-	fs.StringVar(&o.allowedUsers, "mark-pipeline-gate-allowed-users", defaultGateAllowedUser, "Comma-separated GitHub logins additionally allowed to mark the pipeline gate (case-insensitive). An explicit value replaces the default; empty disables the allowlist.")
-	fs.StringVar(&o.pluginConfigPath, "plugin-config", "", "Optional path to Prow's plugin config for team and top-level OWNERS authorization of the pipeline gate command.")
+	fs.StringVar(&o.allowedUsers, "mark-pipeline-gate-allowed-users", "redhat-chai-bot", "Comma-separated GitHub logins allowed to mark the gate in addition to Prow override permissions. Replaces the default; empty disables the list.")
+	fs.StringVar(&o.pluginConfigPath, "plugin-config", "", "Path to Prow's plugin config for team and OWNERS gate authorization.")
 }
 
 func (o *gateAuthorizationOptions) validate() error {
-	users, err := o.parseAllowedUsers()
-	o.parsedAllowedUsers = users
-	return err
-}
-
-func (o *gateAuthorizationOptions) parseAllowedUsers() ([]string, error) {
+	o.parsedAllowedUsers = nil
 	if o.allowedUsers == "" {
-		return nil, nil
+		return nil
 	}
-	users := strings.Split(o.allowedUsers, ",")
-	for i, user := range users {
-		user = strings.TrimSpace(user)
-		if !gateLoginRE.MatchString(user) || len(strings.TrimSuffix(strings.ToLower(user), "[bot]")) > 39 {
-			return nil, fmt.Errorf("invalid --mark-pipeline-gate-allowed-users login %q: use an exact GitHub login", user)
+	for _, user := range strings.Split(o.allowedUsers, ",") {
+		user = strings.ToLower(strings.TrimSpace(user))
+		if !gateLoginRE.MatchString(user) || len(strings.TrimSuffix(user, "[bot]")) > 39 {
+			return fmt.Errorf("invalid --mark-pipeline-gate-allowed-users login %q: use an exact GitHub login", user)
 		}
-		users[i] = user
-	}
-	return users, nil
-}
-
-// gateAuthorizationClient is the GitHub read surface used by Prow's /override authorization.
-type gateAuthorizationClient interface {
-	HasPermission(org, repo, user string, role ...string) (bool, error)
-	ListTeams(org string) ([]github.Team, error)
-	ListTeamMembersBySlug(org, teamSlug, role string) ([]github.TeamMember, error)
-}
-
-// gateOwnersClient loads Prow OWNERS data at the target branch, not the untrusted PR head.
-type gateOwnersClient interface {
-	LoadRepoOwners(org, repo, base, user string, pluginConfig *plugins.Configuration) (repoowners.RepoOwner, error)
-}
-
-// limitedGateOwners bounds concurrent OWNERS work and the time it can hold up command processing.
-type limitedGateOwners struct {
-	loader   gateOwnersClient
-	inFlight chan struct{}
-}
-
-// gateOwnersResult carries the completed lookup without blocking if the caller timed out.
-type gateOwnersResult struct {
-	owners repoowners.RepoOwner
-	err    error
-}
-
-func (l limitedGateOwners) LoadRepoOwners(org, repo, base, user string, pluginConfig *plugins.Configuration) (repoowners.RepoOwner, error) {
-	timer := time.NewTimer(gateOwnersWait)
-	defer timer.Stop()
-	return l.loadBefore(timer.C, org, repo, base, user, pluginConfig)
-}
-
-func (l limitedGateOwners) loadBefore(deadline <-chan time.Time, org, repo, base, user string, pluginConfig *plugins.Configuration) (repoowners.RepoOwner, error) {
-	select {
-	case l.inFlight <- struct{}{}:
-	default:
-		return nil, fmt.Errorf("OWNERS authorization lookup is busy")
-	}
-	result := make(chan gateOwnersResult, 1)
-	go l.lookup(result, org, repo, base, user, pluginConfig)
-	select {
-	case done := <-result:
-		return done.owners, done.err
-	case <-deadline:
-		return nil, fmt.Errorf("OWNERS authorization lookup timed out")
-	}
-}
-
-func (l limitedGateOwners) lookup(result chan<- gateOwnersResult, org, repo, base, user string, pluginConfig *plugins.Configuration) {
-	owners, err := l.loader.LoadRepoOwners(org, repo, base, user, pluginConfig)
-	<-l.inFlight
-	result <- gateOwnersResult{owners: owners, err: err}
-}
-
-// gateOwnersLoader shares the Git object cache, but never reuses parsed owners across grants.
-type gateOwnersLoader struct {
-	gitClient  git.ClientFactory
-	gh         github.Client
-	prowConfig func() *config.Config
-}
-
-func (l gateOwnersLoader) LoadRepoOwners(org, repo, base, user string, pluginConfig *plugins.Configuration) (repoowners.RepoOwner, error) {
-	if pluginConfig == nil {
-		return nil, fmt.Errorf("missing Prow plugin config for OWNERS authorization")
-	}
-	if !pluginConfig.SkipCollaborators(org, repo) {
-		collaborators, err := l.gh.ListCollaborators(org, repo)
-		if err != nil {
-			return nil, fmt.Errorf("listing repository collaborators: %w", err)
-		}
-		if !gateOwnersCollaborator(user, collaborators) {
-			return nil, nil
-		}
-	}
-	sha, err := l.gh.GetRef(org, repo, "heads/"+base)
-	if err != nil {
-		return nil, fmt.Errorf("resolving PR base branch: %w", err)
-	}
-	if !gateCommitSHARe.MatchString(sha) {
-		return nil, fmt.Errorf("PR base branch did not resolve to a full commit SHA")
-	}
-	c := gateOwnersConfig{pluginConfig: pluginConfig}
-	if l.prowConfig != nil {
-		c.prowConfig = l.prowConfig()
-	}
-	factory := gateOwnersGitFactory{ClientFactory: l.gitClient, sha: sha}
-	client := repoowners.NewClient(factory, l.gh, c.mdYAMLEnabled, skipRepoOwnersCollaboratorFilter, c.dirDenylist, c.filenames)
-	return client.LoadRepoOwnersSha(org, repo, base, sha, false)
-}
-
-// gateOwnersCollaborator matches repoowners' normalization for the caller's eligibility.
-func gateOwnersCollaborator(user string, collaborators []github.User) bool {
-	login := github.NormLogin(user)
-	for _, collaborator := range collaborators {
-		if github.NormLogin(collaborator.Login) == login {
-			return true
-		}
-	}
-	return false
-}
-
-// skipRepoOwnersCollaboratorFilter avoids a second check whose error Prow would ignore.
-// The loader has already checked the author unless the Prow configuration opts out.
-func skipRepoOwnersCollaboratorFilter(_, _ string) bool {
-	return true
-}
-
-// gateOwnersGitFactory makes Prow's checkout of a branch name use the resolved commit instead.
-type gateOwnersGitFactory struct {
-	git.ClientFactory
-	sha string
-}
-
-func (f gateOwnersGitFactory) ClientFor(org, repo string) (git.RepoClient, error) {
-	client, err := f.ClientForWithRepoOpts(org, repo, git.RepoOpts{NeededCommits: sets.New(f.sha)})
-	if err != nil {
-		return nil, err
-	}
-	return gateOwnersGitRepo{RepoClient: client, sha: f.sha}, nil
-}
-
-// gateOwnersGitRepo verifies that the files Prow parses come from the resolved commit.
-type gateOwnersGitRepo struct {
-	git.RepoClient
-	sha string
-}
-
-func (r gateOwnersGitRepo) Checkout(_ string) error {
-	if err := r.RepoClient.Checkout(r.sha); err != nil {
-		return fmt.Errorf("checking out PR base commit: %w", err)
-	}
-	head, err := r.RevParse("HEAD")
-	if err != nil {
-		return fmt.Errorf("verifying PR base checkout: %w", err)
-	}
-	if strings.TrimSpace(head) != r.sha {
-		return fmt.Errorf("checkout does not match the resolved PR base commit")
+		o.parsedAllowedUsers = append(o.parsedAllowedUsers, user)
 	}
 	return nil
 }
 
-// gateAuthorization grants only /pipeline mark-pipeline-gate, in either scheduling mode.
+// gateAuthorizationClient is the GitHub read surface for admin and team eligibility.
+type gateAuthorizationClient interface {
+	HasPermission(org, repo, user string, roles ...string) (bool, error)
+	ListTeams(org string) ([]github.Team, error)
+	ListTeamMembersBySlug(org, teamSlug, role string) ([]github.TeamMember, error)
+}
+
+// gateOwnersClient provides cancellable reads for top-level OWNERS authorization.
+type gateOwnersClient interface {
+	GetRefWithContext(ctx context.Context, org, repo, ref string) (string, error)
+	QueryWithGitHubAppsSupport(ctx context.Context, query interface{}, vars map[string]interface{}, org string) error
+}
+
+// gateAuthorization grants only /pipeline mark-pipeline-gate.
 type gateAuthorization struct {
-	allowedUsers []string
-	pluginConfig func() (*plugins.Configuration, error)
-	owners       gateOwnersClient
+	allowedUsers     []string
+	pluginConfigPath string
+	owners           gateOwnersClient
+	prowConfig       func() *config.Config
 }
 
 func (a gateAuthorization) authorized(gh gateAuthorizationClient, log *logrus.Entry, org, repo, user, base string) bool {
@@ -213,61 +75,56 @@ func (a gateAuthorization) authorized(gh gateAuthorizationClient, log *logrus.En
 		return false
 	}
 	for _, allowed := range a.allowedUsers {
-		if strings.EqualFold(allowed, user) {
+		if strings.EqualFold(user, allowed) {
 			return true
 		}
 	}
-	log = log.WithFields(logrus.Fields{"org": org, "repo": repo, "user": user})
 	admin, err := gh.HasPermission(org, repo, user, github.RoleAdmin)
 	if err != nil {
-		log.WithError(err).Warn("Cannot determine whether the pipeline gate command author is a repository administrator")
+		log.WithError(err).Warn("Cannot check repository admin permission for pipeline gate")
 	}
 	if err == nil && admin {
 		return true
 	}
-	if a.pluginConfig == nil {
+	if a.pluginConfigPath == "" {
 		return false
 	}
-	plugConfig, err := a.pluginConfig()
-	if err != nil {
-		// YAML errors can quote configuration values. Do not log them here.
-		log.Warn("Cannot load Prow plugin config to authorize the pipeline gate command")
+	// Re-read policy so a missing or invalid file cannot retain prior grants.
+	var agent plugins.ConfigAgent
+	if err := agent.Load(a.pluginConfigPath, nil, "", false, true); err != nil {
+		log.Warn("Cannot read Prow plugin config for pipeline gate authorization")
 		return false
 	}
-	if plugConfig == nil {
-		return false
-	}
-	options := plugConfig.Override
-	if authorizedGateTeamMember(gh, log, org, repo, user, options.AllowedGitHubTeams) {
+	pc := agent.Config()
+	if gateTeamMember(gh, log, pc.Override.AllowedGitHubTeams, org, repo, user) {
 		return true
 	}
-	if !options.AllowTopLevelOwners || a.owners == nil || base == "" {
+	if !pc.Override.AllowTopLevelOwners || a.owners == nil || base == "" {
 		return false
 	}
-	owners, err := a.owners.LoadRepoOwners(org, repo, base, user, plugConfig)
+	ok, err := a.topLevelOwner(pc, org, repo, user, base)
 	if err != nil {
-		log.WithError(err).Warn("Cannot load OWNERS to authorize the pipeline gate command")
-		return false
+		log.WithError(err).Warn("Cannot verify top-level OWNERS for pipeline gate")
 	}
-	return owners != nil && owners.TopLevelApprovers().Has(github.NormLogin(user))
+	return err == nil && ok
 }
 
-// authorizedGateTeamMember mirrors /override's team eligibility, excluding diagnostic-only slug validation.
-func authorizedGateTeamMember(gh gateAuthorizationClient, log *logrus.Entry, org, repo, user string, teams map[string][]string) bool {
-	repoTeams, orgTeams := teams[org+"/"+repo], teams[org]
-	if len(repoTeams)+len(orgTeams) == 0 {
+// gateTeamMember checks only the org and repository scopes recognized by /override.
+func gateTeamMember(gh gateAuthorizationClient, log *logrus.Entry, teams map[string][]string, org, repo, user string) bool {
+	orgTeams, repoTeams := teams[org], teams[org+"/"+repo]
+	if len(orgTeams)+len(repoTeams) == 0 {
 		return false
 	}
-	// Prow's /override fails this authorization branch if the org team listing fails.
+	// Prow /override requires a successful org team listing before checking membership.
 	if _, err := gh.ListTeams(org); err != nil {
-		log.WithError(err).Warn("Cannot list GitHub teams to authorize the pipeline gate command")
+		log.WithError(err).Warn("Cannot list teams for pipeline gate authorization")
 		return false
 	}
 	for _, scope := range [][]string{repoTeams, orgTeams} {
-		for _, team := range scope {
-			members, err := gh.ListTeamMembersBySlug(org, team, github.RoleAll)
+		for _, slug := range scope {
+			members, err := gh.ListTeamMembersBySlug(org, slug, github.RoleAll)
 			if err != nil {
-				log.WithError(err).WithField("team", team).Warn("Cannot list GitHub team members to authorize the pipeline gate command")
+				log.WithError(err).WithField("team", slug).Warn("Cannot check pipeline gate team membership")
 				continue
 			}
 			for _, member := range members {
@@ -280,54 +137,123 @@ func authorizedGateTeamMember(gh gateAuthorizationClient, log *logrus.Entry, org
 	return false
 }
 
-// gateOwnersConfig adapts the Prow configuration snapshots for a single grant check.
-type gateOwnersConfig struct {
-	pluginConfig *plugins.Configuration
-	prowConfig   *config.Config
+// gateOwnersBlob describes a small, complete GitHub text blob.
+type gateOwnersBlob struct {
+	Text                  *string
+	IsBinary, IsTruncated bool
 }
 
-func (c gateOwnersConfig) mdYAMLEnabled(org, repo string) bool {
-	return c.pluginConfig.MDYAMLEnabled(org, repo)
+// gateOwnersQuery reads only the two policy blobs, root modes, and the caller's collaborator record.
+type gateOwnersQuery struct {
+	Repository struct {
+		Object struct {
+			Commit struct {
+				Tree struct {
+					Entries []struct {
+						Name string
+						Mode int
+					}
+				}
+			} `graphql:"... on Commit"`
+		} `graphql:"object(oid: $sha)"`
+		Owners struct {
+			Blob gateOwnersBlob `graphql:"... on Blob"`
+		} `graphql:"owners: object(expression: $owners)"`
+		Aliases struct {
+			Blob gateOwnersBlob `graphql:"... on Blob"`
+		} `graphql:"aliases: object(expression: $aliases)"`
+		Collaborators struct{ Nodes []struct{ Login string } } `graphql:"collaborators(login: $login, first: 1) @include(if: $checkCollaborator)"`
+	} `graphql:"repository(owner: $org, name: $repo)"`
 }
 
-func (c gateOwnersConfig) dirDenylist() *config.OwnersDirDenylist {
-	if c.prowConfig != nil && c.prowConfig.OwnersDirDenylist != nil {
-		return c.prowConfig.OwnersDirDenylist
+func (a gateAuthorization) topLevelOwner(pc *plugins.Configuration, org, repo, user, base string) (bool, error) {
+	names := pc.OwnersFilenames(org, repo)
+	if names.Owners == "" || strings.ContainsAny(names.Owners+names.OwnersAliases, `/\`) ||
+		(pc.MDYAMLEnabled(org, repo) && strings.HasSuffix(names.Owners, ".md")) {
+		return false, nil
 	}
-	return &config.OwnersDirDenylist{}
-}
-
-func (c gateOwnersConfig) filenames(org, repo string) ownersconfig.Filenames {
-	return c.pluginConfig.OwnersFilenames(org, repo)
-}
-
-// gatePluginConfigFile uses a fresh agent per read so invalid config never retains previous grants.
-type gatePluginConfigFile string
-
-func (path gatePluginConfigFile) load() (*plugins.Configuration, error) {
-	var agent plugins.ConfigAgent
-	// The controller does not register or execute plugins or resolve ConfigUpdater paths.
-	if err := agent.Load(string(path), nil, "", false, true); err != nil {
-		return nil, fmt.Errorf("loading Prow plugin configuration: %w", err)
+	if a.prowConfig != nil {
+		if cfg := a.prowConfig(); cfg != nil && cfg.OwnersDirDenylist != nil {
+			for _, pattern := range cfg.OwnersDirDenylist.ListIgnoredDirs(org, repo) {
+				if matches, err := regexp.MatchString(pattern, "."); err != nil || matches {
+					return false, err
+				}
+			}
+		}
 	}
-	return agent.Config(), nil
-}
-
-// newGateAuthorization wires the plugin config and OWNERS loaders only when configured.
-func (o *options) newGateAuthorization(gh github.Client, prowConfig func() *config.Config) (gateAuthorization, error) {
-	a := gateAuthorization{allowedUsers: o.gateAuthorization.parsedAllowedUsers}
-	path := gatePluginConfigFile(o.gateAuthorization.pluginConfigPath)
-	if path == "" {
-		return a, nil
-	}
-	gitClient, err := o.github.GitClientFactory("", &o.config.InRepoConfigCacheDirBase, o.dryrun, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sha, err := a.owners.GetRefWithContext(ctx, org, repo, "heads/"+base)
 	if err != nil {
-		return gateAuthorization{}, fmt.Errorf("creating git client for gate OWNERS authorization: %w", err)
+		return false, fmt.Errorf("resolving the PR base: %w", err)
 	}
-	a.pluginConfig = path.load
-	a.owners = limitedGateOwners{
-		loader:   gateOwnersLoader{gitClient: gitClient, gh: gh, prowConfig: prowConfig},
-		inFlight: make(chan struct{}, 1),
+	if !gateCommitRE.MatchString(sha) {
+		return false, fmt.Errorf("invalid PR base commit SHA")
 	}
-	return a, nil
+	login := github.NormLogin(user)
+	checkCollaborator := !pc.SkipCollaborators(org, repo)
+	var q gateOwnersQuery
+	vars := map[string]interface{}{
+		"org": githubv4.String(org), "repo": githubv4.String(repo), "sha": githubv4.GitObjectID(sha),
+		"owners": githubv4.String(sha + ":" + names.Owners), "aliases": githubv4.String(sha + ":" + names.OwnersAliases),
+		"login": githubv4.String(login), "checkCollaborator": githubv4.Boolean(checkCollaborator),
+	}
+	if err := a.owners.QueryWithGitHubAppsSupport(ctx, &q, vars, org); err != nil {
+		return false, fmt.Errorf("loading root OWNERS files: %w", err)
+	}
+	if checkCollaborator {
+		nodes := q.Repository.Collaborators.Nodes
+		if len(nodes) != 1 || github.NormLogin(nodes[0].Login) != login {
+			return false, nil
+		}
+	}
+	var ownersFile, aliasesFile bool
+	for _, entry := range q.Repository.Object.Commit.Tree.Entries {
+		regular := entry.Mode == 0o100644 || entry.Mode == 0o100755
+		if entry.Name == names.Owners {
+			ownersFile = regular
+		}
+		if entry.Name == names.OwnersAliases {
+			if !regular {
+				return false, fmt.Errorf("OWNERS_ALIASES is not a regular file")
+			}
+			aliasesFile = true
+		}
+	}
+	if !ownersFile {
+		return false, nil
+	}
+	owners, aliases := q.Repository.Owners.Blob, q.Repository.Aliases.Blob
+	if owners.Text == nil || owners.IsBinary || owners.IsTruncated ||
+		(aliasesFile && (aliases.Text == nil || aliases.IsBinary || aliases.IsTruncated)) {
+		return false, fmt.Errorf("incomplete OWNERS or OWNERS_ALIASES blob")
+	}
+	var aliasText string
+	if aliasesFile {
+		aliasText = *aliases.Text
+	}
+	return eligibleRootApprover(*owners.Text, aliasText, login)
+}
+
+// eligibleRootApprover uses Prow's parsers and matches filters against the root (".").
+func eligibleRootApprover(owners, aliases, login string) (bool, error) {
+	parsedAliases, err := repoowners.ParseAliasesConfig([]byte(aliases))
+	if err != nil {
+		return false, fmt.Errorf("invalid OWNERS_ALIASES: %w", err)
+	}
+	simple, err := repoowners.LoadSimpleConfig([]byte(owners))
+	if err == nil && !simple.Empty() {
+		return parsedAliases.ExpandAliases(repoowners.NormLogins(simple.Approvers)).Has(login), nil
+	}
+	full, err := repoowners.LoadFullConfig([]byte(owners))
+	if err != nil {
+		return false, fmt.Errorf("invalid OWNERS: %w", err)
+	}
+	for pattern, rules := range full.Filters {
+		if match, err := regexp.MatchString(pattern, "."); err == nil && match &&
+			parsedAliases.ExpandAliases(repoowners.NormLogins(rules.Approvers)).Has(login) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

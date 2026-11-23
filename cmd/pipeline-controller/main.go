@@ -896,10 +896,6 @@ func main() {
 	if err != nil {
 		logger.WithError(err).Fatal("error getting GitHub client")
 	}
-	gatePolicy, err := o.newGateAuthorization(githubClient, cfg)
-	if err != nil {
-		logger.WithError(err).Fatal("failed to configure pipeline gate authorization")
-	}
 
 	watcher := newWatcher(o.configFile, logger)
 	if err := watcher.reloadConfig(); err != nil {
@@ -973,7 +969,10 @@ func main() {
 	}
 	var checks *dispatchChecks
 	if appID > 0 {
-		checks = &dispatchChecks{gh: githubClient, appID: appID, authorization: gatePolicy}
+		checks = &dispatchChecks{gh: githubClient, appID: appID, authorization: gateAuthorization{
+			allowedUsers: o.gateAuthorization.parsedAllowedUsers, pluginConfigPath: o.gateAuthorization.pluginConfigPath,
+			owners: githubClient, prowConfig: cfg,
+		}}
 	}
 	reconciler.checks = checks
 	agentic := &agenticController{gh: githubClient, reader: mgr.GetCache(), configDataProvider: configDataProvider, checks: checks,
