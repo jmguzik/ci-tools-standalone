@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/prow/pkg/github"
 )
 
@@ -109,6 +110,7 @@ type gateTestTransport struct {
 	sha, owners, aliases string
 	base, returnedBase   string
 	refFailure           string
+	refStatus            int
 }
 
 func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -128,6 +130,10 @@ func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			return &http.Response{Status: "403 Forbidden", StatusCode: http.StatusForbidden,
 				Header: http.Header{"Retry-After": {"30"}}, Body: io.NopCloser(strings.NewReader("rate limited")), Request: req}, nil
 		}
+		if g.refStatus != 0 {
+			return &http.Response{Status: fmt.Sprintf("%d %s", g.refStatus, http.StatusText(g.refStatus)), StatusCode: g.refStatus,
+				Header: http.Header{}, Body: io.NopCloser(strings.NewReader("lookup failed")), Request: req}, nil
+		}
 		body = fmt.Sprintf(`{"data":{"repository":{"ref":{"name":%q,"prefix":"refs/heads/","target":{"oid":%q}}}}}`, g.returnedBase, g.sha)
 	} else {
 		require.Equal(g.t, g.base, g.returnedBase, "do not read OWNERS after an unexpected ref")
@@ -136,6 +142,52 @@ func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		body = fmt.Sprintf(`{"data":{"repository":{"object":{"tree":{"entries":[{"name":"OWNERS","mode":33188},{"name":"OWNERS_ALIASES","mode":33188}]}},"owners":{"text":%q},"aliases":{"text":%q},"collaborators":{"nodes":[{"login":"owners-team"}]}}}}`, g.owners, g.aliases)
 	}
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+}
+
+// TestAgenticGateGraphQLRetry checks which HTTP failures retain the command in the queue.
+func TestAgenticGateGraphQLRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		delay  time.Duration
+	}{
+		{name: "rate limit", status: http.StatusTooManyRequests, delay: time.Minute},
+		{name: "bad gateway", status: http.StatusBadGateway},
+		{name: "service unavailable", status: http.StatusServiceUnavailable},
+		{name: "gateway timeout", status: http.StatusGatewayTimeout},
+		{name: "permission denied", status: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "plugins.yaml")
+			require.NoError(t, os.WriteFile(path, []byte("override: {allow_top_level_owners: true}"), 0o600))
+			_, _, gh, err := github.NewClientFromOptions(nil, github.ClientOptions{
+				Bases: []string{"https://github.invalid"}, GraphqlEndpoint: "https://github.invalid/graphql",
+				MaxRetries: 2, InitialDelay: time.Nanosecond,
+				BaseRoundTripper: gateTestTransport{t: t, base: "main", refStatus: tc.status},
+			})
+			require.NoError(t, err)
+			f := newAgenticFixture(t, "manual")
+			f.gh.repoPermission = "read"
+			f.a.checks.authorization = gateAuthorization{pluginConfigPath: path, owners: gh}
+			f.a.queue = workqueue.NewTypedRateLimitingQueue(workqueue.NewTypedItemExponentialFailureRateLimiter[agenticWork](time.Second, time.Minute))
+			defer f.a.queue.ShutDown()
+			cmd := f.command(10, "mark-pipeline-gate")
+			f.a.enqueue(f.work.org, f.work.repo, f.work.number, cmd)
+			require.True(t, f.a.processNext(t.Context()))
+			require.Zero(t, f.gh.checkAttempts)
+			input := f.a.inputs[f.work]
+			if tc.status == http.StatusForbidden {
+				require.Nil(t, input)
+				return
+			}
+			require.NotNil(t, input)
+			require.Equal(t, 1, input.retries)
+			require.Equal(t, []github.IssueComment{*cmd}, input.comments)
+			if tc.delay != 0 {
+				require.Equal(t, f.now.Add(tc.delay), input.retryAt)
+			}
+		})
+	}
 }
 
 // TestGateTopLevelOwners covers the bounded base lookup and fail-closed aliases.
