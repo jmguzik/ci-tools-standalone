@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sirupsen/logrus"
 	v1 "sigs.k8s.io/prow/pkg/apis/prowjobs/v1"
 	"sigs.k8s.io/prow/pkg/github"
 )
@@ -166,8 +165,11 @@ func (c *dispatchChecks) dispatch(refs *v1.Refs, hasJobs bool, post func() error
 }
 
 // authorizeMarkGate is shared by the traditional and agentic command handlers.
-func (c *dispatchChecks) authorizeMarkGate(log *logrus.Entry, org, repo, user, base string) bool {
-	return c != nil && c.authorization.authorized(c.gh, log, org, repo, user, base)
+func (c *dispatchChecks) authorizeMarkGate(org, repo, user, base string) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	return c.authorization.authorized(c.gh, org, repo, user, base)
 }
 
 func (c *dispatchChecks) markGate(refs *v1.Refs, commentID int) error {

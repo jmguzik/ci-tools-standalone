@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"regexp"
@@ -10,7 +11,7 @@ import (
 	"time"
 
 	"github.com/shurcooL/githubv4"
-	"github.com/sirupsen/logrus"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/prow/pkg/config"
 	"sigs.k8s.io/prow/pkg/github"
 	"sigs.k8s.io/prow/pkg/plugins"
@@ -59,7 +60,6 @@ type gateAuthorizationClient interface {
 
 // gateOwnersClient provides cancellable reads for top-level OWNERS authorization.
 type gateOwnersClient interface {
-	GetRefWithContext(ctx context.Context, org, repo, ref string) (string, error)
 	QueryWithGitHubAppsSupport(ctx context.Context, query interface{}, vars map[string]interface{}, org string) error
 }
 
@@ -71,71 +71,83 @@ type gateAuthorization struct {
 	prowConfig       func() *config.Config
 }
 
-func (a gateAuthorization) authorized(gh gateAuthorizationClient, log *logrus.Entry, org, repo, user, base string) bool {
+func (a gateAuthorization) authorized(gh gateAuthorizationClient, org, repo, user, base string) (bool, error) {
 	if user == "" {
-		return false
+		return false, nil
 	}
 	for _, allowed := range a.allowedUsers {
 		if strings.EqualFold(user, allowed) {
-			return true
+			return true, nil
 		}
 	}
 	admin, err := gh.HasPermission(org, repo, user, github.RoleAdmin)
-	if err != nil {
-		log.WithError(err).Warn("Cannot check repository admin permission for pipeline gate")
-	}
 	if err == nil && admin {
-		return true
+		return true, nil
+	}
+	if err != nil {
+		err = fmt.Errorf("checking repository admin permission: %w", err)
 	}
 	if a.pluginConfigPath == "" {
-		return false
+		return false, err
 	}
 	// Re-read policy so a missing or invalid file cannot retain prior grants.
 	var agent plugins.ConfigAgent
-	if err := agent.Load(a.pluginConfigPath, nil, "", false, true); err != nil {
-		log.Warn("Cannot read Prow plugin config for pipeline gate authorization")
-		return false
+	if loadErr := agent.Load(a.pluginConfigPath, nil, "", false, true); loadErr != nil {
+		// Parser errors can include raw configuration values.
+		return false, utilerrors.NewAggregate([]error{err, errors.New("cannot read Prow plugin config for pipeline gate authorization")})
 	}
 	pc := agent.Config()
-	if gateTeamMember(gh, log, pc.Override.AllowedGitHubTeams, org, repo, user) {
-		return true
+	member, teamErr := gateTeamMember(gh, pc.Override.AllowedGitHubTeams, org, repo, user)
+	if member {
+		return true, nil
 	}
-	if !pc.Override.AllowTopLevelOwners || a.owners == nil || base == "" {
-		return false
+	var ownerErr error
+	if pc.Override.AllowTopLevelOwners && a.owners != nil && base != "" {
+		var owner bool
+		owner, ownerErr = a.topLevelOwner(pc, org, repo, user, base)
+		if ownerErr == nil && owner {
+			return true, nil
+		}
 	}
-	ok, err := a.topLevelOwner(pc, org, repo, user, base)
-	if err != nil {
-		log.WithError(err).Warn("Cannot verify top-level OWNERS for pipeline gate")
-	}
-	return err == nil && ok
+	return false, utilerrors.NewAggregate([]error{err, teamErr, ownerErr})
 }
 
 // gateTeamMember checks only the org and repository scopes recognized by /override.
-func gateTeamMember(gh gateAuthorizationClient, log *logrus.Entry, teams map[string][]string, org, repo, user string) bool {
+func gateTeamMember(gh gateAuthorizationClient, teams map[string][]string, org, repo, user string) (bool, error) {
 	orgTeams, repoTeams := teams[org], teams[org+"/"+repo]
 	if len(orgTeams)+len(repoTeams) == 0 {
-		return false
+		return false, nil
 	}
 	// Prow /override requires a successful org team listing before checking membership.
 	if _, err := gh.ListTeams(org); err != nil {
-		log.WithError(err).Warn("Cannot list teams for pipeline gate authorization")
-		return false
+		return false, fmt.Errorf("listing teams: %w", err)
 	}
+	var errs []error
 	for _, scope := range [][]string{repoTeams, orgTeams} {
 		for _, slug := range scope {
 			members, err := gh.ListTeamMembersBySlug(org, slug, github.RoleAll)
 			if err != nil {
-				log.WithError(err).WithField("team", slug).Warn("Cannot check pipeline gate team membership")
+				errs = append(errs, fmt.Errorf("checking membership of team %s: %w", slug, err))
 				continue
 			}
 			for _, member := range members {
 				if member.Login == user {
-					return true
+					return true, nil
 				}
 			}
 		}
 	}
-	return false
+	return false, utilerrors.NewAggregate(errs)
+}
+
+// gateBaseQuery resolves a literal branch name without REST path parsing or retry sleeps.
+type gateBaseQuery struct {
+	Repository struct {
+		Ref *struct {
+			Name, Prefix string
+			Target       struct{ OID string }
+		} `graphql:"ref(qualifiedName: $ref)"`
+	} `graphql:"repository(owner: $org, name: $repo)"`
 }
 
 // gateOwnersBlob describes a small, complete GitHub text blob.
@@ -184,10 +196,18 @@ func (a gateAuthorization) topLevelOwner(pc *plugins.Configuration, org, repo, u
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	sha, err := a.owners.GetRefWithContext(ctx, org, repo, "heads/"+base)
-	if err != nil {
+	var baseQuery gateBaseQuery
+	baseVars := map[string]interface{}{
+		"org": githubv4.String(org), "repo": githubv4.String(repo), "ref": githubv4.String("refs/heads/" + base),
+	}
+	if err := a.owners.QueryWithGitHubAppsSupport(ctx, &baseQuery, baseVars, org); err != nil {
 		return false, fmt.Errorf("resolving the PR base: %w", err)
 	}
+	ref := baseQuery.Repository.Ref
+	if ref == nil || ref.Prefix != "refs/heads/" || ref.Name != base {
+		return false, fmt.Errorf("could not verify the requested PR base branch")
+	}
+	sha := ref.Target.OID
 	if !gateCommitRE.MatchString(sha) {
 		return false, fmt.Errorf("invalid PR base commit SHA")
 	}

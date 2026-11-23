@@ -11,8 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/prow/pkg/github"
 )
@@ -39,8 +40,12 @@ func TestGateAllowlist(t *testing.T) {
 	}
 }
 
-// gateTestTeams provides one matching membership for scope tests.
-type gateTestTeams struct{ fakeAgenticGitHub }
+// gateTestTeams provides team membership even when the admin lookup fails.
+type gateTestTeams struct{ *fakeAgenticGitHub }
+
+func (gateTestTeams) HasPermission(_, _, _ string, _ ...string) (bool, error) {
+	return false, context.DeadlineExceeded
+}
 
 func (gateTestTeams) ListTeamMembersBySlug(_, slug, role string) ([]github.TeamMember, error) {
 	if slug == "team" && role == github.RoleAll {
@@ -56,39 +61,79 @@ func TestGateTeamScope(t *testing.T) {
 		want  bool
 	}{{"org", true}, {"org/repo", true}, {"org/other", false}} {
 		t.Run(tc.scope, func(t *testing.T) {
-			got := gateTeamMember(&gateTestTeams{}, logrus.NewEntry(logrus.New()), map[string][]string{tc.scope: {"team"}}, "org", "repo", "alice")
+			got, err := gateTeamMember(&gateTestTeams{}, map[string][]string{tc.scope: {"team"}}, "org", "repo", "alice")
+			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestAgenticGateLookupError retries an indeterminate decision without marking the gate.
+func TestAgenticGateLookupError(t *testing.T) {
+	for _, tc := range []struct {
+		name, user string
+		allowTeam  bool
+		wantRetry  bool
+	}{
+		{name: "lookup error without another grant", user: "maintainer", wantRetry: true},
+		{name: "explicitly allowed author", user: "redhat-chai-bot"},
+		{name: "team grant despite admin lookup failure", user: "alice", allowTeam: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAgenticFixture(t, "manual")
+			f.a.checks.gh = gateTestTeams{fakeAgenticGitHub: f.gh}
+			if tc.allowTeam {
+				path := filepath.Join(t.TempDir(), "plugins.yaml")
+				require.NoError(t, os.WriteFile(path, []byte("override: {allowed_github_teams: {org: [team]}}"), 0o600))
+				f.a.checks.authorization.pluginConfigPath = path
+			}
+			command := f.command(10, "mark-pipeline-gate")
+			command.User.Login = tc.user
+			err := f.a.reconcilePull(t.Context(), f.work, command)
+			if tc.wantRetry {
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				require.True(t, agenticRetryFor(err).transient)
+				require.Zero(t, f.gh.checkAttempts)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, f.gh.checks, 1)
+			require.Equal(t, "success", f.gh.checks[0].Conclusion)
 		})
 	}
 }
 
 // gateTestTransport exercises the real Prow request and GraphQL decoder without network access.
 type gateTestTransport struct {
-	t       *testing.T
-	sha     string
-	owners  string
-	aliases string
-	fail    bool
+	t                    *testing.T
+	sha, owners, aliases string
+	base, returnedBase   string
+	refFailure           string
 }
 
 func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	require.Equal(g.t, "/graphql", req.URL.Path, "OWNERS lookups must not use the REST ref endpoint")
 	_, bounded := req.Context().Deadline()
 	require.True(g.t, bounded)
+	var query struct{ Variables map[string]interface{} }
+	require.NoError(g.t, json.NewDecoder(req.Body).Decode(&query))
 	var body string
-	switch req.URL.Path {
-	case "/repos/org/repo/git/refs/heads/main":
-		body = fmt.Sprintf(`{"object":{"sha":%q}}`, g.sha)
-	case "/graphql":
-		if g.fail {
-			return nil, context.DeadlineExceeded
+	if ref, ok := query.Variables["ref"]; ok {
+		require.Equal(g.t, "refs/heads/"+g.base, ref)
+		switch g.refFailure {
+		case "timeout":
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		case "rate limit":
+			return &http.Response{Status: "403 Forbidden", StatusCode: http.StatusForbidden,
+				Header: http.Header{"Retry-After": {"30"}}, Body: io.NopCloser(strings.NewReader("rate limited")), Request: req}, nil
 		}
-		var query struct{ Variables map[string]interface{} }
-		require.NoError(g.t, json.NewDecoder(req.Body).Decode(&query))
+		body = fmt.Sprintf(`{"data":{"repository":{"ref":{"name":%q,"prefix":"refs/heads/","target":{"oid":%q}}}}}`, g.returnedBase, g.sha)
+	} else {
+		require.Equal(g.t, g.base, g.returnedBase, "do not read OWNERS after an unexpected ref")
 		require.Equal(g.t, g.sha, query.Variables["sha"])
 		require.Equal(g.t, g.sha+":OWNERS_ALIASES", query.Variables["aliases"])
 		body = fmt.Sprintf(`{"data":{"repository":{"object":{"tree":{"entries":[{"name":"OWNERS","mode":33188},{"name":"OWNERS_ALIASES","mode":33188}]}},"owners":{"text":%q},"aliases":{"text":%q},"collaborators":{"nodes":[{"login":"owners-team"}]}}}}`, g.owners, g.aliases)
-	default:
-		g.t.Fatalf("unexpected request path %s", req.URL.Path)
 	}
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 }
@@ -96,18 +141,20 @@ func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 // TestGateTopLevelOwners covers the bounded base lookup and fail-closed aliases.
 func TestGateTopLevelOwners(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		owners  string
-		aliases string
-		fail    bool
-		want    bool
+		name, owners, aliases   string
+		base, returned, failure string
+		want                    bool
+		wantErr                 string
 	}{
 		{name: "root approver", aliases: "aliases: {owners-team: [owners-team]}", want: true},
 		{name: "advisory approver", owners: "advisory_approvers: [owners-team]", want: true},
 		{name: "filtered advisory approver", owners: "filters:\n  '^\\.$': {advisory_approvers: [owners-team]}", want: true},
 		{name: "alias login is not a member", aliases: "aliases: {owners-team: [alice]}"},
-		{name: "malformed aliases cannot grant the literal login", aliases: "aliases: {owners-team: alice}"},
-		{name: "GitHub timeout fails closed", fail: true},
+		{name: "malformed aliases cannot grant the literal login", aliases: "aliases: {owners-team: alice}", wantErr: "invalid OWNERS_ALIASES"},
+		{name: "special characters in the branch are sent literally", base: "release/maint#2026", want: true},
+		{name: "unexpected prefix match is rejected", base: "release#2026", returned: "release", wantErr: "could not verify the requested PR base branch"},
+		{name: "GitHub timeout fails closed", failure: "timeout", wantErr: "context deadline exceeded"},
+		{name: "rate limit does not extend the ref lookup", failure: "rate limit", wantErr: "403 Forbidden"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "plugins.yaml")
@@ -116,14 +163,35 @@ func TestGateTopLevelOwners(t *testing.T) {
 			if owners == "" {
 				owners = "filters:\n  '^\\.$': {approvers: [owners-team]}"
 			}
-			_, _, gh, err := github.NewClientFromOptions(nil, github.ClientOptions{
-				Bases: []string{"https://github.invalid"}, GraphqlEndpoint: "https://github.invalid/graphql", MaxRetries: 1,
-				BaseRoundTripper: gateTestTransport{t: t, sha: strings.Repeat("a", 40), owners: owners, aliases: tc.aliases, fail: tc.fail},
+			base := "main"
+			if tc.base != "" {
+				base = tc.base
+			}
+			returned := base
+			if tc.returned != "" {
+				returned = tc.returned
+			}
+			synctest.Test(t, func(t *testing.T) {
+				_, _, gh, err := github.NewClientFromOptions(nil, github.ClientOptions{
+					Bases: []string{"https://github.invalid"}, GraphqlEndpoint: "https://github.invalid/graphql",
+					BaseRoundTripper: gateTestTransport{t: t, sha: strings.Repeat("a", 40), owners: owners, aliases: tc.aliases,
+						base: base, returnedBase: returned, refFailure: tc.failure},
+				})
+				require.NoError(t, err)
+				policy := gateAuthorization{pluginConfigPath: path, owners: gh}
+				start := time.Now()
+				got, err := policy.authorized(&fakeAgenticGitHub{}, "org", "repo", "owners-team", base)
+				require.LessOrEqual(t, time.Since(start), 10*time.Second)
+				require.Equal(t, tc.want, got)
+				if tc.wantErr != "" {
+					require.ErrorContains(t, err, tc.wantErr)
+					if tc.failure == "timeout" {
+						require.True(t, agenticRetryFor(err).transient)
+					}
+					return
+				}
+				require.NoError(t, err)
 			})
-			require.NoError(t, err)
-			policy := gateAuthorization{pluginConfigPath: path, owners: gh}
-			got := policy.authorized(&fakeAgenticGitHub{}, logrus.NewEntry(logrus.New()), "org", "repo", "owners-team", "main")
-			require.Equal(t, tc.want, got)
 		})
 	}
 }

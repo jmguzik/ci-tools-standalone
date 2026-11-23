@@ -68,6 +68,8 @@ func agenticRetryFor(err error) agenticRetryInfo {
 	switch wrapped := err.(type) {
 	case interface{ Unwrap() []error }:
 		causes = wrapped.Unwrap()
+	case interface{ Errors() []error }:
+		causes = wrapped.Errors()
 	case interface{ Unwrap() error }:
 		causes = []error{wrapped.Unwrap()}
 	}

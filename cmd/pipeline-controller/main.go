@@ -501,8 +501,15 @@ func (cw *clientWrapper) handleIssueComment(l *logrus.Entry, event github.IssueC
 			}
 			return
 		}
-		if pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" ||
-			!cw.checks.authorizeMarkGate(logger, org, repo, event.Comment.User.Login, pr.Base.Ref) {
+		if pr.State != github.PullRequestStateOpen || pr.Head.SHA == "" {
+			return
+		}
+		allowed, err := cw.checks.authorizeMarkGate(org, repo, event.Comment.User.Login, pr.Base.Ref)
+		if err != nil {
+			logger.WithError(err).Error("Failed to authorize pipeline gate command")
+			return
+		}
+		if !allowed {
 			return
 		}
 		if command.head != "" && command.head != pr.Head.SHA {
