@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -243,17 +244,21 @@ func eligibleRootApprover(owners, aliases, login string) (bool, error) {
 	}
 	simple, err := repoowners.LoadSimpleConfig([]byte(owners))
 	if err == nil && !simple.Empty() {
-		return parsedAliases.ExpandAliases(repoowners.NormLogins(simple.Approvers)).Has(login), nil
+		return gateApprover(simple.Config, parsedAliases, login), nil
 	}
 	full, err := repoowners.LoadFullConfig([]byte(owners))
 	if err != nil {
 		return false, fmt.Errorf("invalid OWNERS: %w", err)
 	}
 	for pattern, rules := range full.Filters {
-		if match, err := regexp.MatchString(pattern, "."); err == nil && match &&
-			parsedAliases.ExpandAliases(repoowners.NormLogins(rules.Approvers)).Has(login) {
+		if match, err := regexp.MatchString(pattern, "."); err == nil && match && gateApprover(rules, parsedAliases, login) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// gateApprover includes advisory approvers because Prow counts them in TopLevelApprovers.
+func gateApprover(rules repoowners.Config, aliases repoowners.RepoAliases, login string) bool {
+	return aliases.ExpandAliases(repoowners.NormLogins(slices.Concat(rules.Approvers, rules.AdvisoryApprovers))).Has(login)
 }

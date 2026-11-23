@@ -66,6 +66,7 @@ func TestGateTeamScope(t *testing.T) {
 type gateTestTransport struct {
 	t       *testing.T
 	sha     string
+	owners  string
 	aliases string
 	fail    bool
 }
@@ -85,7 +86,7 @@ func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		require.NoError(g.t, json.NewDecoder(req.Body).Decode(&query))
 		require.Equal(g.t, g.sha, query.Variables["sha"])
 		require.Equal(g.t, g.sha+":OWNERS_ALIASES", query.Variables["aliases"])
-		body = fmt.Sprintf(`{"data":{"repository":{"object":{"tree":{"entries":[{"name":"OWNERS","mode":33188},{"name":"OWNERS_ALIASES","mode":33188}]}},"owners":{"text":"filters:\n  '^\\.$': {approvers: [owners-team]}\n"},"aliases":{"text":%q},"collaborators":{"nodes":[{"login":"owners-team"}]}}}}`, g.aliases)
+		body = fmt.Sprintf(`{"data":{"repository":{"object":{"tree":{"entries":[{"name":"OWNERS","mode":33188},{"name":"OWNERS_ALIASES","mode":33188}]}},"owners":{"text":%q},"aliases":{"text":%q},"collaborators":{"nodes":[{"login":"owners-team"}]}}}}`, g.owners, g.aliases)
 	default:
 		g.t.Fatalf("unexpected request path %s", req.URL.Path)
 	}
@@ -96,11 +97,14 @@ func (g gateTestTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 func TestGateTopLevelOwners(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
+		owners  string
 		aliases string
 		fail    bool
 		want    bool
 	}{
 		{name: "root approver", aliases: "aliases: {owners-team: [owners-team]}", want: true},
+		{name: "advisory approver", owners: "advisory_approvers: [owners-team]", want: true},
+		{name: "filtered advisory approver", owners: "filters:\n  '^\\.$': {advisory_approvers: [owners-team]}", want: true},
 		{name: "alias login is not a member", aliases: "aliases: {owners-team: [alice]}"},
 		{name: "malformed aliases cannot grant the literal login", aliases: "aliases: {owners-team: alice}"},
 		{name: "GitHub timeout fails closed", fail: true},
@@ -108,9 +112,13 @@ func TestGateTopLevelOwners(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "plugins.yaml")
 			require.NoError(t, os.WriteFile(path, []byte("override: {allow_top_level_owners: true}"), 0o600))
+			owners := tc.owners
+			if owners == "" {
+				owners = "filters:\n  '^\\.$': {approvers: [owners-team]}"
+			}
 			_, _, gh, err := github.NewClientFromOptions(nil, github.ClientOptions{
 				Bases: []string{"https://github.invalid"}, GraphqlEndpoint: "https://github.invalid/graphql", MaxRetries: 1,
-				BaseRoundTripper: gateTestTransport{t: t, sha: strings.Repeat("a", 40), aliases: tc.aliases, fail: tc.fail},
+				BaseRoundTripper: gateTestTransport{t: t, sha: strings.Repeat("a", 40), owners: owners, aliases: tc.aliases, fail: tc.fail},
 			})
 			require.NoError(t, err)
 			policy := gateAuthorization{pluginConfigPath: path, owners: gh}
