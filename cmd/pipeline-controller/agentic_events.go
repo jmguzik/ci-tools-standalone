@@ -208,12 +208,13 @@ func (a *agenticController) handlePullRequest(_ *logrus.Entry, event github.Pull
 	}
 }
 
-// Protect mixed-mode branches from delayed webhook and ProwJob snapshots.
-func (a *agenticController) allowSnapshot(org, repo string, number int, head, base string, allowAgentic bool) (bool, error) {
+// allowSnapshot protects mixed-mode branches from delayed snapshots. The opening
+// notification can go to drafts and Chai branches because it does not schedule tests.
+func (a *agenticController) allowSnapshot(org, repo string, number int, head, base string, forWelcome bool) (bool, error) {
 	if !a.hasRepo(org, repo) {
 		return true, nil
 	}
-	if _, enabled := a.repoConfig(org, repo, base); enabled && !allowAgentic {
+	if _, enabled := a.repoConfig(org, repo, base); enabled && !forWelcome {
 		return false, nil // Agentic and fallback events are handled by the worker.
 	}
 	if a.dryRun {
@@ -224,11 +225,13 @@ func (a *agenticController) allowSnapshot(org, repo string, number int, head, ba
 		return false, err
 	}
 	_, enabled := a.repoConfig(org, repo, pr.Base.Ref)
-	return (allowAgentic || !enabled) && pr.State == github.PullRequestStateOpen && !pr.Draft && pr.Head.SHA == head && pr.Base.Ref == base, nil
+	return pr.State == github.PullRequestStateOpen && pr.Head.SHA == head && pr.Base.Ref == base &&
+		(forWelcome || (!enabled && !pr.Draft)), nil
 }
 
-func (cw *clientWrapper) allowPullRequestSnapshot(logger *logrus.Entry, event github.PullRequestEvent, allowAgentic bool) bool {
-	allowed, err := cw.agentic.allowSnapshot(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, event.PullRequest.Head.SHA, event.PullRequest.Base.Ref, allowAgentic)
+// allowPullRequestSnapshot rejects stale webhook snapshots before posting or scheduling.
+func (cw *clientWrapper) allowPullRequestSnapshot(logger *logrus.Entry, event github.PullRequestEvent, forWelcome bool) bool {
+	allowed, err := cw.agentic.allowSnapshot(event.Repo.Owner.Login, event.Repo.Name, event.PullRequest.Number, event.PullRequest.Head.SHA, event.PullRequest.Base.Ref, forWelcome)
 	if err != nil {
 		logger.WithError(err).Error("Cannot safely route pull request event")
 	}
